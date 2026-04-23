@@ -136,11 +136,12 @@ class SileroVAD(RMSGate):
             ) from exc
 
         self._torch = torch
+        effective_silero_silence_ms = max(100, min_silence_ms - speech_pad_ms)
         self._vad_iterator = VADIterator(
             load_silero_vad(),
             threshold=threshold,
             sampling_rate=SAMPLE_RATE,
-            min_silence_duration_ms=min_silence_ms,
+            min_silence_duration_ms=effective_silero_silence_ms,
             speech_pad_ms=speech_pad_ms,
         )
         self._pending = np.zeros(0, dtype=np.float32)
@@ -166,15 +167,27 @@ class SileroVAD(RMSGate):
             if maybe_event:
                 event = maybe_event
 
-        # Let the parent handle buffering, min length, max length, and RMS reporting.
+        # Silero's speech_pad is part of the desired silence gap; flush on its end
+        # event so a 400 ms inter-utterance pause can finalize promptly.
         parent_threshold = self.threshold
+        end_event = bool(event and "end" in event)
         if event and "start" in event:
             self._silero_active = True
-        elif event and "end" in event:
-            self._silero_active = False
-        self.threshold = -1.0 if self._silero_active else 2.0
+        active_for_parent = self._silero_active
+        self.threshold = -1.0 if active_for_parent else 2.0
         result = super().ingest(frame)
         self.threshold = parent_threshold
+        if end_event and not result.speech_ended:
+            audio = self.current_audio()
+            speech_ended = len(self._current) >= self.min_utterance_frames
+            self.reset()
+            return SegmentResult(
+                rms=result.rms,
+                speech_active=False,
+                speech_started=result.speech_started,
+                speech_ended=speech_ended,
+                audio=audio if speech_ended else None,
+            )
         return result
 
 
