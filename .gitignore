@@ -1,0 +1,20 @@
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Frontend
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# Local env overrides
+.env.local
+
+# Generated local smoke-test audio
+app/backend/sample.wav
