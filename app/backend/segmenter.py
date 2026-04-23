@@ -136,20 +136,22 @@ class SileroVAD(RMSGate):
             ) from exc
 
         self._torch = torch
-        effective_silero_silence_ms = max(100, min_silence_ms - speech_pad_ms)
         self._vad_iterator = VADIterator(
             load_silero_vad(),
             threshold=threshold,
             sampling_rate=SAMPLE_RATE,
-            min_silence_duration_ms=effective_silero_silence_ms,
+            min_silence_duration_ms=min_silence_ms,
             speech_pad_ms=speech_pad_ms,
         )
         self._pending = np.zeros(0, dtype=np.float32)
         self._silero_active = False
+        self._silence_flush_frames = max(1, min_silence_ms // 20)
+        self._silent_frames = 0
 
     def reset(self) -> None:
         super().reset()
         self._silero_active = False
+        self._silent_frames = 0
         try:
             self._vad_iterator.reset_states()
         except AttributeError:
@@ -157,6 +159,7 @@ class SileroVAD(RMSGate):
 
     def ingest(self, frame: np.ndarray) -> SegmentResult:
         frame = _coerce_frame(frame)
+        rms = float(sqrt(float(np.mean(np.square(frame)))))
         self._pending = np.concatenate([self._pending, frame])
         event: dict | None = None
         while self._pending.shape[0] >= 512:
@@ -167,12 +170,17 @@ class SileroVAD(RMSGate):
             if maybe_event:
                 event = maybe_event
 
-        # Silero's speech_pad is part of the desired silence gap; flush on its end
-        # event so a 400 ms inter-utterance pause can finalize promptly.
         parent_threshold = self.threshold
-        end_event = bool(event and "end" in event)
         if event and "start" in event:
             self._silero_active = True
+            self._silent_frames = 0
+        if self._silero_active:
+            self._silent_frames = self._silent_frames + 1 if rms <= 0.001 else 0
+        else:
+            self._silent_frames = 0
+        end_event = bool(event and "end" in event) or (
+            self._silero_active and self._silent_frames >= self._silence_flush_frames
+        )
         active_for_parent = self._silero_active
         self.threshold = -1.0 if active_for_parent else 2.0
         result = super().ingest(frame)
