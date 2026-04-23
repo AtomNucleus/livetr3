@@ -266,7 +266,7 @@ class TranscriptionSession:
         ):
             self._last_partial_at = now
             audio = self.segmenter.current_audio()
-            if audio.size:
+            if audio.size and not self.worker.is_busy_or_backlogged:
                 self._schedule_ast("partial", self.state.active_utterance_id, audio)
 
         if result.speech_ended and result.audio is not None:
@@ -313,7 +313,7 @@ class TranscriptionSession:
                 prior_context=self.state.prior_context[-2:],
                 custom_vocab=self.state.config.custom_vocab,
                 code_switching_enabled=self.state.config.code_switching_enabled,
-                max_tokens=256 if priority == "final" else 128,
+                max_tokens=self._max_tokens_for_ast(priority, audio),
             )
         except asyncio.CancelledError:
             raise
@@ -475,6 +475,16 @@ class TranscriptionSession:
             min_silence_ms=min_silence_ms,
             max_utterance_s=max_utterance_seconds,
         )
+
+    def _max_tokens_for_ast(self, priority: str, audio: np.ndarray) -> int:
+        if priority == "partial":
+            return 64
+        duration_seconds = audio.shape[0] / 16_000
+        if duration_seconds <= 8:
+            return 80
+        if duration_seconds <= 15:
+            return 128
+        return 192
 
     def _begin_archive(self) -> None:
         if self._archive_dir is not None:

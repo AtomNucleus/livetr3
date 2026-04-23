@@ -217,6 +217,7 @@ class MLXWorkerService:
         self._process: mp.Process | None = None
         self._request_queue: mp.Queue | None = None
         self._response_queue: mp.Queue | None = None
+        self._active_job_kind: Literal["ast", "polish", "maintenance"] | None = None
         self._mp_context = mp.get_context("spawn")
         self._status = WorkerStatusEvent(state="starting", message="Loading Gemma model worker")
         self._status_listeners: set[Callable[[WorkerStatusEvent], Awaitable[None]]] = set()
@@ -323,6 +324,10 @@ class MLXWorkerService:
     ) -> None:
         self._status_listeners.discard(listener)
 
+    @property
+    def is_busy_or_backlogged(self) -> bool:
+        return self._active_job_kind is not None or self._queue.qsize() > 0
+
     async def _run(self) -> None:
         while not self._closed.is_set():
             job = await self._queue.get()
@@ -330,6 +335,7 @@ class MLXWorkerService:
                 self._queue.task_done()
                 continue
             try:
+                self._active_job_kind = job.kind
                 result = await self._execute_job(job)
                 if not job.future.cancelled():
                     job.future.set_result(result)
@@ -337,6 +343,7 @@ class MLXWorkerService:
                 if not job.future.cancelled():
                     job.future.set_exception(exc)
             finally:
+                self._active_job_kind = None
                 self._queue.task_done()
 
     async def _run_temp_wav_sweeper(self) -> None:
