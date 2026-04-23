@@ -390,17 +390,7 @@ class MLXWorkerService:
             "payload": job.payload,
         }
         await asyncio.to_thread(self._request_queue.put, request)
-        try:
-            response = await asyncio.to_thread(
-                self._response_queue.get,
-                True,
-                timeout_seconds,
-            )
-        except queue.Empty as exc:
-            await self._stop_worker_process(force=True)
-            raise InferenceTimeoutError(
-                f"{job.kind.upper()} timed out after {timeout_seconds:.1f}s"
-            ) from exc
+        response = await self._wait_for_worker_response(job, timeout_seconds)
 
         if response.get("type") == "result" and response.get("job_id") == job.sequence:
             return response["result"]
@@ -408,6 +398,33 @@ class MLXWorkerService:
             await self._stop_worker_process(force=True)
             raise WorkerProcessError(response.get("error", "Unknown worker error"))
         raise WorkerProcessError(f"Unexpected worker response: {response!r}")
+
+    async def _wait_for_worker_response(
+        self,
+        job: _QueuedJob,
+        timeout_seconds: float,
+    ) -> dict:
+        if self._response_queue is None or self._process is None:
+            raise WorkerProcessError("MLX worker process is not started")
+
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            if not self._process.is_alive():
+                raise WorkerProcessError("MLX worker process exited unexpectedly")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                await self._stop_worker_process(force=True)
+                raise InferenceTimeoutError(
+                    f"{job.kind.upper()} timed out after {timeout_seconds:.1f}s"
+                )
+            try:
+                return await asyncio.to_thread(
+                    self._response_queue.get,
+                    True,
+                    min(0.25, remaining),
+                )
+            except queue.Empty:
+                continue
 
     async def _recover_worker(self, message: str) -> bool:
         if self._closed.is_set():
