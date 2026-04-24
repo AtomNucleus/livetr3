@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { MutableRefObject } from "react";
 import type { ClientConfig, ServerMessage } from "../lib/protocol";
 
 interface AudioCaptureOptions {
@@ -22,6 +23,7 @@ export function useAudioCapture({ onServerMessage, onWaveform }: AudioCaptureOpt
   const reconnectAttemptRef = useRef(0);
   const configRef = useRef<ClientConfig | null>(null);
   const sessionIdRef = useRef<string | undefined>(undefined);
+  const testAudioAbortRef = useRef<AbortController | null>(null);
 
   const refreshDevices = useCallback(async () => {
     if (!navigator.mediaDevices?.enumerateDevices) return;
@@ -163,6 +165,8 @@ export function useAudioCapture({ onServerMessage, onWaveform }: AudioCaptureOpt
     sourceRef.current = null;
     nodeRef.current?.disconnect();
     nodeRef.current = null;
+    testAudioAbortRef.current?.abort();
+    testAudioAbortRef.current = null;
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     void contextRef.current?.close();
@@ -184,6 +188,18 @@ export function useAudioCapture({ onServerMessage, onWaveform }: AudioCaptureOpt
       try {
         await refreshDevices();
         await connectSocket("start");
+
+        const testAudioUrl = new URLSearchParams(window.location.search).get("test_audio_url");
+        if (testAudioUrl) {
+          const abort = new AbortController();
+          testAudioAbortRef.current = abort;
+          void streamTestAudio(testAudioUrl, abort.signal, wsRef, pausedRef).catch((exc) => {
+            if (!abort.signal.aborted) {
+              setError(exc instanceof Error ? exc.message : String(exc));
+            }
+          });
+          return;
+        }
 
         const AudioContextClass = window.AudioContext || window.webkitAudioContext;
         const context = new AudioContextClass();
@@ -277,4 +293,95 @@ export function useAudioCapture({ onServerMessage, onWaveform }: AudioCaptureOpt
     commitNow,
     skipNextPolish,
   };
+}
+
+async function streamTestAudio(
+  url: string,
+  signal: AbortSignal,
+  wsRef: MutableRefObject<WebSocket | null>,
+  pausedRef: MutableRefObject<boolean>,
+) {
+  const response = await fetch(url, { signal });
+  if (!response.ok) {
+    throw new Error(`Could not load test audio: ${response.status}`);
+  }
+  const arrayBuffer = await response.arrayBuffer();
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  const context = new AudioContextClass();
+  try {
+    const decoded = await context.decodeAudioData(arrayBuffer.slice(0));
+    const mono = mixToMono(decoded);
+    const audio = resampleLinear(mono, decoded.sampleRate, 16_000);
+    const padded = padToFrame(audio, 320);
+    const silence = new Float32Array(6_400);
+    while (!signal.aborted) {
+      await sendFrames(padded, signal, wsRef, pausedRef);
+      await sendFrames(silence, signal, wsRef, pausedRef);
+    }
+  } finally {
+    void context.close();
+  }
+}
+
+function mixToMono(buffer: AudioBuffer): Float32Array {
+  const output = new Float32Array(buffer.length);
+  for (let channel = 0; channel < buffer.numberOfChannels; channel += 1) {
+    const data = buffer.getChannelData(channel);
+    for (let index = 0; index < data.length; index += 1) {
+      output[index] += data[index] / buffer.numberOfChannels;
+    }
+  }
+  return output;
+}
+
+function resampleLinear(input: Float32Array, fromRate: number, toRate: number): Float32Array {
+  if (fromRate === toRate) return input;
+  const outputLength = Math.floor((input.length * toRate) / fromRate);
+  const output = new Float32Array(outputLength);
+  const ratio = fromRate / toRate;
+  for (let index = 0; index < output.length; index += 1) {
+    const source = index * ratio;
+    const lower = Math.floor(source);
+    const upper = Math.min(lower + 1, input.length - 1);
+    const fraction = source - lower;
+    output[index] = input[lower] + (input[upper] - input[lower]) * fraction;
+  }
+  return output;
+}
+
+function padToFrame(input: Float32Array, frameSize: number): Float32Array {
+  const pad = (frameSize - (input.length % frameSize)) % frameSize;
+  if (!pad) return input;
+  const output = new Float32Array(input.length + pad);
+  output.set(input);
+  return output;
+}
+
+async function sendFrames(
+  audio: Float32Array,
+  signal: AbortSignal,
+  wsRef: MutableRefObject<WebSocket | null>,
+  pausedRef: MutableRefObject<boolean>,
+) {
+  for (let offset = 0; offset < audio.length && !signal.aborted; offset += 320) {
+    if (!pausedRef.current && wsRef.current?.readyState === WebSocket.OPEN) {
+      const frame = audio.slice(offset, offset + 320);
+      wsRef.current.send(frame.buffer);
+    }
+    await sleep(20, signal);
+  }
+}
+
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const timeout = window.setTimeout(resolve, ms);
+    signal.addEventListener(
+      "abort",
+      () => {
+        window.clearTimeout(timeout);
+        resolve();
+      },
+      { once: true },
+    );
+  });
 }

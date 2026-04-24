@@ -9,6 +9,16 @@ import type { CSSProperties } from "react";
 import { useTranscriptStore } from "./hooks/useTranscriptStore";
 import { projectorFontStorageKey, readProjectorFontSize } from "./lib/projector";
 
+declare global {
+  interface Window {
+    __livetr3LastProjectorFinalRender?: {
+      id: number;
+      text: string;
+      at: number;
+    };
+  }
+}
+
 function useProjectorFontSize(sessionId: string) {
   const [fontSize, setFontSize] = useState(() => readProjectorFontSize(sessionId));
 
@@ -77,6 +87,16 @@ export default function ProjectorApp() {
     .join("|");
   const { ref, fontSize } = useAutoFitFont(projectorFontSize, contentKey);
 
+  useLayoutEffect(() => {
+    const finalEntry = [...entries].reverse().find((entry) => entry.state === "final");
+    if (!finalEntry) return;
+    window.__livetr3LastProjectorFinalRender = {
+      id: finalEntry.id,
+      text: finalEntry.translation,
+      at: Date.now(),
+    };
+  }, [entries]);
+
   useEffect(() => {
     if (!sessionId) {
       setConnectionError("Missing projector session token");
@@ -108,7 +128,11 @@ export default function ProjectorApp() {
     (workerStatus && workerStatus.state !== "ready" ? workerStatus.message : null);
 
   return (
-    <main className="flex h-screen flex-col overflow-hidden bg-black text-white">
+    <main
+      data-testid="projector-shell"
+      data-session-id={sessionId}
+      className="flex h-screen flex-col overflow-hidden bg-black text-white"
+    >
       {statusText ? (
         <div className="px-8 pt-6 text-sm uppercase tracking-[0.2em] text-amber-300">
           {statusText}
@@ -128,6 +152,7 @@ export default function ProjectorApp() {
             targetEntries.map((entry) => (
               <p
                 key={entry.id}
+                data-testid={`projector-caption-${entry.id}`}
                 className={[
                   "whitespace-pre-wrap break-words font-semibold leading-[1.08] text-white",
                   entry.state === "partial" ? "opacity-70 italic" : "opacity-100",

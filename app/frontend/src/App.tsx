@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useState } from "react";
 import { DualPane } from "./components/DualPane";
 import { Header } from "./components/Header";
 import { useAudioCapture } from "./hooks/useAudioCapture";
@@ -17,6 +17,11 @@ const CUSTOM_VOCAB_STORAGE_KEY = "livetr3.custom-vocab";
 declare global {
   interface Window {
     webkitAudioContext?: typeof AudioContext;
+    __livetr3LastOperatorFinalRender?: {
+      id: number;
+      text: string;
+      at: number;
+    };
   }
 }
 
@@ -181,10 +186,24 @@ export default function App() {
     window.localStorage.setItem(CUSTOM_VOCAB_STORAGE_KEY, config.custom_vocab.join("\n"));
   }, [config.custom_vocab]);
 
+  useLayoutEffect(() => {
+    const finalEntry = [...entries].reverse().find((entry) => entry.state === "final");
+    if (!finalEntry) return;
+    window.__livetr3LastOperatorFinalRender = {
+      id: finalEntry.id,
+      text: finalEntry.translation,
+      at: Date.now(),
+    };
+  }, [entries]);
+
   const error = useMemo(() => lastError ?? audio.error, [lastError, audio.error]);
 
   return (
-    <div data-testid="app-shell" className="flex h-screen flex-col overflow-hidden bg-ink text-zinc-50">
+    <div
+      data-testid="app-shell"
+      data-session-id={sessionId}
+      className="flex h-screen flex-col overflow-hidden bg-ink text-zinc-50"
+    >
       <Header
         config={config}
         setConfig={setConfig}
