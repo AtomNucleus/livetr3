@@ -1,0 +1,9 @@
+INFO:     Started server process [48998]
+INFO:     Waiting for application startup.
+Fetching 9 files:   0%|          | 0/9 [00:00<?, ?it/s]Fetching 9 files: 100%|██████████| 9/9 [00:00<00:00, 52283.57it/s]
+INFO:     Application startup complete.
+ERROR:    [Errno 48] error while attempting to bind on address ('127.0.0.1', 8765): address already in use
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+/opt/homebrew/Cellar/python@3.13/3.13.13/Frameworks/Python.framework/Versions/3.13/lib/python3.13/multiprocessing/resource_tracker.py:400: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown: {'/mp-2jfjccdv'}
+  warnings.warn(

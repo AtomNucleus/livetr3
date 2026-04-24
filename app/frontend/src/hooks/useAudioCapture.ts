@@ -187,10 +187,10 @@ export function useAudioCapture({ onServerMessage, onWaveform }: AudioCaptureOpt
 
       try {
         await refreshDevices();
-        await connectSocket("start");
 
         const testAudioUrl = new URLSearchParams(window.location.search).get("test_audio_url");
         if (testAudioUrl) {
+          await connectSocket("start");
           const abort = new AbortController();
           testAudioAbortRef.current = abort;
           void streamTestAudio(testAudioUrl, abort.signal, wsRef, pausedRef).catch((exc) => {
@@ -232,9 +232,10 @@ export function useAudioCapture({ onServerMessage, onWaveform }: AudioCaptureOpt
         silent.connect(context.destination);
         nodeRef.current = node;
         await replaceStream(deviceId);
+        await connectSocket("start");
       } catch (exc) {
         stop();
-        setError(exc instanceof Error ? exc.message : String(exc));
+        setError(formatAudioStartError(exc));
       }
     },
     [connectSocket, refreshDevices, replaceStream, status, stop],
@@ -293,6 +294,21 @@ export function useAudioCapture({ onServerMessage, onWaveform }: AudioCaptureOpt
     commitNow,
     skipNextPolish,
   };
+}
+
+function formatAudioStartError(error: unknown): string {
+  if (error instanceof DOMException) {
+    if (error.name === "NotAllowedError") {
+      return "Microphone access was blocked. Allow mic access for this page and try again.";
+    }
+    if (error.name === "NotFoundError") {
+      return "No microphone input is available.";
+    }
+    if (error.name === "NotReadableError") {
+      return "The microphone is busy or unavailable to the browser right now.";
+    }
+  }
+  return error instanceof Error ? error.message : String(error);
 }
 
 async function streamTestAudio(
