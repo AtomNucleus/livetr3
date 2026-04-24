@@ -102,7 +102,7 @@ This sends the WAV as 20 ms little-endian float32 frames over `ws://127.0.0.1:87
 - Shared sessions: producer and viewer sockets join the same session with `?session=<id>`.
 - Viewer handshake: read-only clients send `{"type":"join_viewer"}` after connect.
 - Segmentation: Silero VAD at 16 kHz with 512-sample VAD frames.
-- Partial inference: every about 2 seconds while speech is active by default, configurable per session.
+- Partial inference: every about 0.75 seconds while speech is active by default, configurable per session.
 - Final inference: on Silero utterance end or at the configured max-utterance cap.
 - Context: last two committed utterances are inserted as text-only prior context.
 - Custom vocabulary: injected before the AST prompt per session.
@@ -121,7 +121,7 @@ Measured locally on an M1 Pro with 32 GB RAM, using `backend/sample.wav` looped 
 
 - Finalized caption latency after speech start: median 10.94 seconds, p95 12.05 seconds over a 30 minute run.
 - Late-window latency did not drift upward: median 10.24 seconds at 25-30 minutes versus 11.03 seconds at 0-5 minutes.
-- Partial cadence: about every 2 seconds during speech.
+- Partial cadence: about every 0.75 seconds during speech by default.
 - Worker fault recovery: SIGTERM of the MLX child recovered to ready in 8.73 seconds; first post-fault final arrived 12.20 seconds after injection.
 - Sustained temp files: max 1 file in the 30 minute soak, max 2 files in the worker fault run.
 - Sustained RSS: final RSS stayed below the 1.25x pass threshold versus the 5 minute baseline.

@@ -218,6 +218,7 @@ class MLXWorkerService:
         self._request_queue: mp.Queue | None = None
         self._response_queue: mp.Queue | None = None
         self._active_job_kind: Literal["ast", "polish", "maintenance"] | None = None
+        self._queued_partial_jobs: dict[int, _QueuedJob] = {}
         self._mp_context = mp.get_context("spawn")
         self._status = WorkerStatusEvent(state="starting", message="Loading Gemma model worker")
         self._status_listeners: set[Callable[[WorkerStatusEvent], Awaitable[None]]] = set()
@@ -256,6 +257,7 @@ class MLXWorkerService:
         self,
         *,
         priority: Literal["partial", "final"],
+        utterance_id: int | None,
         audio_f32_16k: np.ndarray,
         src: str,
         tgt: str,
@@ -263,26 +265,37 @@ class MLXWorkerService:
         custom_vocab: list[str],
         code_switching_enabled: bool,
         max_tokens: int,
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str] | None:
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
-        await self._queue.put(
-            _QueuedJob(
-                priority=0 if priority == "final" else 10,
-                sequence=next(self._sequence),
-                kind="ast",
-                future=future,
-                payload={
-                    "audio_f32_16k": audio_f32_16k,
-                    "src": src,
-                    "tgt": tgt,
-                    "prior_context": prior_context,
-                    "custom_vocab": custom_vocab,
-                    "code_switching_enabled": code_switching_enabled,
-                    "max_tokens": max_tokens,
-                },
-            )
+        job = _QueuedJob(
+            priority=0 if priority == "final" else 10,
+            sequence=next(self._sequence),
+            kind="ast",
+            future=future,
+            payload={
+                "priority": priority,
+                "utterance_id": utterance_id,
+                "audio_f32_16k": audio_f32_16k,
+                "src": src,
+                "tgt": tgt,
+                "prior_context": prior_context,
+                "custom_vocab": custom_vocab,
+                "code_switching_enabled": code_switching_enabled,
+                "max_tokens": max_tokens,
+            },
         )
+        if utterance_id is not None:
+            previous = self._queued_partial_jobs.get(utterance_id)
+            if priority == "partial":
+                if previous is not None and not previous.future.done():
+                    previous.future.set_result(None)
+                self._queued_partial_jobs[utterance_id] = job
+            elif previous is not None:
+                self._queued_partial_jobs.pop(utterance_id, None)
+                if not previous.future.done():
+                    previous.future.set_result(None)
+        await self._queue.put(job)
         return await future
 
     async def submit_polish(self, text: str) -> str:
@@ -331,10 +344,13 @@ class MLXWorkerService:
     async def _run(self) -> None:
         while not self._closed.is_set():
             job = await self._queue.get()
-            if job.future.cancelled():
-                self._queue.task_done()
-                continue
             try:
+                if job.future.done():
+                    continue
+                if self._should_skip_job(job):
+                    if not job.future.done():
+                        job.future.set_result(None)
+                    continue
                 self._active_job_kind = job.kind
                 result = await self._execute_job(job)
                 if not job.future.cancelled():
@@ -345,6 +361,20 @@ class MLXWorkerService:
             finally:
                 self._active_job_kind = None
                 self._queue.task_done()
+
+    def _should_skip_job(self, job: _QueuedJob) -> bool:
+        if job.kind != "ast" or job.payload.get("priority") != "partial":
+            return False
+        utterance_id = job.payload.get("utterance_id")
+        if not isinstance(utterance_id, int):
+            return False
+        queued_job = self._queued_partial_jobs.get(utterance_id)
+        if queued_job is None:
+            return False
+        if queued_job.sequence != job.sequence:
+            return True
+        self._queued_partial_jobs.pop(utterance_id, None)
+        return False
 
     async def _run_temp_wav_sweeper(self) -> None:
         while not self._closed.is_set():
@@ -384,10 +414,17 @@ class MLXWorkerService:
         if not self._process.is_alive():
             raise WorkerProcessError("MLX worker process exited unexpectedly")
 
+        payload = job.payload
+        if job.kind == "ast":
+            payload = {
+                key: value
+                for key, value in job.payload.items()
+                if key not in {"priority", "utterance_id"}
+            }
         request = {
             "job_id": job.sequence,
             "kind": job.kind,
-            "payload": job.payload,
+            "payload": payload,
         }
         await asyncio.to_thread(self._request_queue.put, request)
         response = await self._wait_for_worker_response(job, timeout_seconds)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 from collections import deque
@@ -26,6 +27,8 @@ from protocol import (
 )
 from segmenter import FRAME_SAMPLES, RMSGate, make_segmenter
 
+logger = logging.getLogger(__name__)
+
 MAINTENANCE_INTERVAL_SECONDS = max(
     60.0, float(os.getenv("MAINTENANCE_INTERVAL_SECONDS", str(20 * 60)))
 )
@@ -36,6 +39,38 @@ ARCHIVE_AUTOSAVE_SECONDS = max(5, int(os.getenv("SESSION_AUTOSAVE_SECONDS", "60"
 ARCHIVE_ROOT = (
     Path.home() / "Library" / "Application Support" / "LiveTR3" / "sessions"
 )
+PARTIAL_INTERVAL_MIN_SECONDS = 0.3
+PARTIAL_INTERVAL_MAX_SECONDS = 3.0
+
+
+def _bounded_partial_interval_seconds(value: float, *, source: str) -> float:
+    bounded = min(max(value, PARTIAL_INTERVAL_MIN_SECONDS), PARTIAL_INTERVAL_MAX_SECONDS)
+    if bounded != value:
+        logger.warning(
+            "%s %.3fs is outside %.1f-%.1fs; clamping to %.3fs",
+            source,
+            value,
+            PARTIAL_INTERVAL_MIN_SECONDS,
+            PARTIAL_INTERVAL_MAX_SECONDS,
+            bounded,
+        )
+    return bounded
+
+
+def _load_default_partial_interval_seconds() -> float:
+    raw_value = os.getenv("PARTIAL_INTERVAL_SECONDS", "0.75")
+    try:
+        value = float(raw_value)
+    except ValueError:
+        logger.warning(
+            "PARTIAL_INTERVAL_SECONDS=%r is not a float; using default 0.750s",
+            raw_value,
+        )
+        return 0.75
+    return _bounded_partial_interval_seconds(value, source="PARTIAL_INTERVAL_SECONDS")
+
+
+DEFAULT_PARTIAL_INTERVAL_SECONDS = _load_default_partial_interval_seconds()
 
 
 @dataclass(slots=True)
@@ -123,7 +158,6 @@ class TranscriptionSession:
         self._last_partial_at = 0.0
         self._last_level_at = 0.0
         self._finalized: set[int] = set()
-        self._partial_inflight: set[int] = set()
         self._pending_config: ConfigMessage | None = None
         self._skip_next_polish = False
         self.session_id = websocket.query_params.get("session") or str(uuid4())
@@ -253,21 +287,18 @@ class TranscriptionSession:
         if result.speech_started:
             if self._pending_config is not None:
                 await self._apply_config(self._pending_config)
-                self._pending_config = None
+            self._pending_config = None
             self.state.utterance_id += 1
             self.state.active_utterance_id = self.state.utterance_id
-            self._last_partial_at = now
+            self._last_partial_at = now - self._partial_interval_seconds()
             await self._send_and_broadcast(
                 SpeechStartMessage(utterance_id=self.state.utterance_id).model_dump()
             )
 
-        if result.speech_active and now - self._last_partial_at >= float(
-            self.state.config.partial_interval_seconds
-            or float(os.getenv("PARTIAL_INTERVAL_SECONDS", "2"))
-        ):
+        if result.speech_active and now - self._last_partial_at >= self._partial_interval_seconds():
             self._last_partial_at = now
             audio = self.segmenter.current_audio()
-            if audio.size and not self.worker.is_busy_or_backlogged:
+            if audio.size:
                 self._schedule_ast("partial", self.state.active_utterance_id, audio)
 
         if result.speech_ended and result.audio is not None:
@@ -293,10 +324,8 @@ class TranscriptionSession:
     ) -> None:
         if utterance_id is None:
             return
-        if priority == "partial":
-            if utterance_id in self._partial_inflight or utterance_id in self._finalized:
-                return
-            self._partial_inflight.add(utterance_id)
+        if priority == "partial" and utterance_id in self._finalized:
+            return
         task = asyncio.create_task(
             self._run_ast(priority, utterance_id, audio.copy()),
             name=f"{priority}-ast-{utterance_id}",
@@ -306,8 +335,9 @@ class TranscriptionSession:
 
     async def _run_ast(self, priority: str, utterance_id: int, audio: np.ndarray) -> None:
         try:
-            original, translation = await self.worker.submit_ast(
+            result = await self.worker.submit_ast(
                 priority="final" if priority == "final" else "partial",
+                utterance_id=utterance_id,
                 audio_f32_16k=audio,
                 src=self.state.config.source_lang,
                 tgt=self.state.config.target_lang,
@@ -321,9 +351,10 @@ class TranscriptionSession:
         except Exception as exc:
             await self._send_error(f"Inference failed: {exc}")
             return
-        finally:
-            if priority == "partial":
-                self._partial_inflight.discard(utterance_id)
+
+        if result is None:
+            return
+        original, translation = result
 
         if priority == "partial":
             if utterance_id in self._finalized:
@@ -436,7 +467,18 @@ class TranscriptionSession:
         await self._send(payload)
 
     async def _apply_config(self, config: ConfigMessage) -> None:
-        self.state.config = config.model_copy(update={"apply_target": "immediate"})
+        partial_interval_seconds = config.partial_interval_seconds
+        if partial_interval_seconds is not None:
+            partial_interval_seconds = _bounded_partial_interval_seconds(
+                float(partial_interval_seconds),
+                source="config.partial_interval_seconds",
+            )
+        self.state.config = config.model_copy(
+            update={
+                "apply_target": "immediate",
+                "partial_interval_seconds": partial_interval_seconds,
+            }
+        )
         try:
             self.segmenter = self._build_segmenter(self.state.config)
         except Exception as exc:
@@ -479,13 +521,16 @@ class TranscriptionSession:
 
     def _max_tokens_for_ast(self, priority: str, audio: np.ndarray) -> int:
         if priority == "partial":
-            return 64
+            return 32
         duration_seconds = audio.shape[0] / 16_000
         if duration_seconds <= 8:
             return 80
         if duration_seconds <= 15:
             return 128
         return 192
+
+    def _partial_interval_seconds(self) -> float:
+        return self.state.config.partial_interval_seconds or DEFAULT_PARTIAL_INTERVAL_SECONDS
 
     def _begin_archive(self) -> None:
         if self._archive_dir is not None:
