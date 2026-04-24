@@ -43,7 +43,7 @@ export default function App() {
       segmenter: "silero",
       polish_enabled: true,
       code_switching_enabled: false,
-      partial_interval_seconds: 2,
+      partial_interval_seconds: 0.75,
       max_utterance_seconds: 25,
       silero_threshold: 0.5,
       speech_pad_ms: 300,
@@ -54,7 +54,8 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(true);
   const [levels, setLevels] = useState<number[]>(Array(10).fill(0));
   const [projectorFontSize, setProjectorFontSize] = useState(() => readProjectorFontSize(sessionId));
-  const { entries, lastError, workerStatus, handleServerMessage, clear } = useTranscriptStore();
+  const { entries, lastError, partialTickAt, workerStatus, handleServerMessage, clear } =
+    useTranscriptStore();
 
   const onWaveform = useCallback((rms: number) => {
     setLevels((current) => [...current.slice(-9), rms]);
@@ -226,6 +227,7 @@ export default function App() {
         rms={rms}
         projectorFontSize={projectorFontSize}
         setProjectorFontSize={handleProjectorFontSize}
+        partialTickAt={partialTickAt}
         settingsOpen={settingsOpen}
         setSettingsOpen={setSettingsOpen}
       />

@@ -5,6 +5,7 @@ import { longestCommonPrefixLength } from "../lib/protocol";
 export function useTranscriptStore() {
   const [entries, setEntries] = useState<TranscriptUtterance[]>([]);
   const [lastError, setLastError] = useState<string | null>(null);
+  const [partialTickAt, setPartialTickAt] = useState(0);
   const [workerStatus, setWorkerStatus] = useState<{
     state: "starting" | "ready" | "recovering" | "failed";
     message: string;
@@ -44,6 +45,9 @@ export function useTranscriptStore() {
     }
 
     if (message.type === "level") return;
+    if (message.type === "partial") {
+      setPartialTickAt(Date.now());
+    }
 
     setEntries((current) => {
       const existing = current.find((entry) => entry.id === message.utterance_id);
@@ -77,7 +81,14 @@ export function useTranscriptStore() {
   }, []);
 
   return useMemo(
-    () => ({ entries, lastError, workerStatus, handleServerMessage, clear }),
-    [entries, lastError, workerStatus, handleServerMessage, clear],
+    () => ({
+      entries,
+      lastError,
+      partialTickAt,
+      workerStatus,
+      handleServerMessage,
+      clear,
+    }),
+    [entries, lastError, partialTickAt, workerStatus, handleServerMessage, clear],
   );
 }

@@ -70,6 +70,32 @@ function useAutoFitFont(maxFontSize: number, contentKey: string) {
   return { ref, fontSize };
 }
 
+function ProjectorCaption({
+  id,
+  text,
+  stableLength,
+  isPartial,
+}: {
+  id: number;
+  text: string;
+  stableLength: number;
+  isPartial: boolean;
+}) {
+  const stable = isPartial ? text.slice(0, stableLength) : text;
+  const unstable = isPartial ? text.slice(stableLength) : "";
+
+  return (
+    <p
+      data-testid={`projector-caption-${id}`}
+      className="whitespace-pre-wrap break-words font-semibold leading-[1.08] text-white transition-opacity duration-[120ms]"
+      style={{ fontSize: "var(--projector-font-size)", opacity: isPartial ? 0.85 : 1 }}
+    >
+      <span style={{ opacity: 1 }}>{stable}</span>
+      {unstable ? <span style={{ opacity: 0.75 / 0.85 }}>{unstable}</span> : null}
+    </p>
+  );
+}
+
 export default function ProjectorApp() {
   const sessionId = useMemo(
     () => new URLSearchParams(window.location.search).get("session") ?? "",
@@ -150,17 +176,13 @@ export default function ProjectorApp() {
         >
           {targetEntries.length ? (
             targetEntries.map((entry) => (
-              <p
+              <ProjectorCaption
                 key={entry.id}
-                data-testid={`projector-caption-${entry.id}`}
-                className={[
-                  "whitespace-pre-wrap break-words font-semibold leading-[1.08] text-white",
-                  entry.state === "partial" ? "opacity-70 italic" : "opacity-100",
-                ].join(" ")}
-                style={{ fontSize: "var(--projector-font-size)" }}
-              >
-                {entry.translation}
-              </p>
+                id={entry.id}
+                text={entry.translation}
+                stableLength={entry.stableTranslationLength}
+                isPartial={entry.state === "partial"}
+              />
             ))
           ) : (
             <p

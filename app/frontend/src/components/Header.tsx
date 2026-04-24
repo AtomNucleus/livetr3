@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import type { ClientConfig } from "../lib/protocol";
 import { languages } from "../lib/protocol";
 import { WaveformMeter } from "./WaveformMeter";
@@ -27,6 +28,7 @@ interface Props {
   rms: number;
   projectorFontSize: number;
   setProjectorFontSize: (size: number) => void;
+  partialTickAt: number;
   settingsOpen: boolean;
   setSettingsOpen: (open: boolean) => void;
 }
@@ -53,9 +55,19 @@ export function Header({
   rms,
   projectorFontSize,
   setProjectorFontSize,
+  partialTickAt,
   settingsOpen,
   setSettingsOpen,
 }: Props) {
+  const [partialPulseActive, setPartialPulseActive] = useState(false);
+
+  useEffect(() => {
+    if (!partialTickAt) return;
+    setPartialPulseActive(true);
+    const timeout = window.setTimeout(() => setPartialPulseActive(false), 150);
+    return () => window.clearTimeout(timeout);
+  }, [partialTickAt]);
+
   const update = <K extends keyof ClientConfig>(key: K, value: ClientConfig[K]) =>
     setConfig({ ...config, [key]: value });
 
@@ -72,6 +84,18 @@ export function Header({
         </button>
 
         <WaveformMeter levels={levels} rms={rms} />
+
+        <div className="flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-zinc-400">
+          <span
+            data-testid="partial-tick-indicator"
+            aria-label="Partial activity"
+            className={[
+              "h-2.5 w-2.5 rounded-full bg-mint transition-opacity duration-150",
+              partialPulseActive ? "opacity-100" : "opacity-20",
+            ].join(" ")}
+          />
+          Partials
+        </div>
 
         <div className="flex items-center gap-2">
           <button
@@ -233,11 +257,11 @@ export function Header({
             <input
               data-testid="partial-interval-input"
               type="number"
-              min="0.5"
-              max="10"
-              step="0.5"
+              min="0.3"
+              max="3"
+              step="0.05"
               className="rounded-md border border-line bg-ink px-3 py-2 text-zinc-100"
-              value={config.partial_interval_seconds ?? 2}
+              value={config.partial_interval_seconds ?? 0.75}
               onChange={(event) => update("partial_interval_seconds", Number(event.target.value))}
             />
           </label>
