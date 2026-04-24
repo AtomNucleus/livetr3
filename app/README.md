@@ -116,15 +116,29 @@ This sends the WAV as 20 ms little-endian float32 frames over `ws://127.0.0.1:87
 
 ## Latency Expectations
 
-On an M1 Pro with 32 GB RAM:
+Measured locally on an M1 Pro with 32 GB RAM, using `backend/sample.wav` looped through
+`app/backend/scripts/soak.py` on April 23, 2026:
 
-- Finalized caption latency after a pause: target under 3 seconds for typical 15 second utterances.
+- Finalized caption latency after speech start: median 10.94 seconds, p95 12.05 seconds over a 30 minute run.
+- Late-window latency did not drift upward: median 10.24 seconds at 25-30 minutes versus 11.03 seconds at 0-5 minutes.
 - Partial cadence: about every 2 seconds during speech.
-- Model load: target under 30 seconds after the model is already downloaded.
-- Warmup: target under 5 seconds after model cache exists.
-- Sustained use: intended for 60 minute talks without raw audio persistence.
+- Worker fault recovery: SIGTERM of the MLX child recovered to ready in 8.73 seconds; first post-fault final arrived 12.20 seconds after injection.
+- Sustained temp files: max 1 file in the 30 minute soak, max 2 files in the worker fault run.
+- Sustained RSS: final RSS stayed below the 1.25x pass threshold versus the 5 minute baseline.
 
 Actual latency depends on speech length, selected languages, thermal state, and whether polish is enabled. Disable polish for the lowest final-caption latency.
+
+## Verified
+
+These checks were run locally on April 23, 2026:
+
+- Import-time backend gate: `cd app/backend && uv run python -m scripts.check_imports` returned `OK`.
+- Sustained load: `cd app/backend && uv run --extra test python scripts/soak.py --duration-seconds 1800 --metric-interval-seconds 60 --drain-seconds 30` passed with 290 finals, 0 errors, max temp-file count 1, median final latency 10.94 seconds, and no late-window latency drift. Evidence: `backend/scripts/soak_2026-04-23T18-29-50-0400.csv` and `.summary.json`.
+- MLX worker fault injection: `cd app/backend && uv run --extra test python scripts/soak.py --duration-seconds 360 --metric-interval-seconds 60 --drain-seconds 30 --inject-fault --fault-at-seconds 180` passed with 58 finals, 0 errors, max temp-file count 2, and inference resumed within 12.20 seconds after SIGTERM. Evidence: `backend/scripts/soak_2026-04-23T19-01-11-0400.csv` and `.summary.json`.
+- Projector browser smoke: `cd app/frontend && yarn test:projector` passed. It compared 5 consecutive finalized captions between operator and projector DOM, enforced p95 mirror delay <= 300 ms, checked 1280x720 and 1920x1080 projector clipping, and captured screenshots in `docs/evidence/`.
+- Backend kill/reconnect archive test: `cd app/backend && uv run --extra test python scripts/kill_test.py` passed. The archive had strictly monotonic final `utterance_id` values with no duplicate finals and contained both pre-kill and post-kill utterances.
+
+Audio-worklet cumulative drift is not listed as verified. A browser harness was attempted, but it did not collect valid worklet timing samples, so no pass claim is made here.
 
 ## Silero VAD
 
