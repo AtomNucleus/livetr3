@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -27,7 +28,7 @@ from protocol import (
 )
 from segmenter import FRAME_SAMPLES, RMSGate, make_segmenter
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("uvicorn.error")
 
 MAINTENANCE_INTERVAL_SECONDS = max(
     60.0, float(os.getenv("MAINTENANCE_INTERVAL_SECONDS", str(20 * 60)))
@@ -41,6 +42,67 @@ ARCHIVE_ROOT = (
 )
 PARTIAL_INTERVAL_MIN_SECONDS = 0.3
 PARTIAL_INTERVAL_MAX_SECONDS = 3.0
+SOURCE_END_PUNCTUATION = ".?!"
+TRAILING_PUNCTUATION_QUOTES = " \t\r\n\"'“”‘’)]}"
+ABBREVIATIONS_BEFORE_END_PUNCTUATION = {
+    "mr",
+    "mrs",
+    "ms",
+    "dr",
+    "prof",
+    "st",
+    "jr",
+    "sr",
+    "vs",
+    "etc",
+    "ie",
+    "i.e",
+    "eg",
+    "e.g",
+}
+DEFAULT_EARLY_COMMIT_ENABLED = os.getenv("EARLY_COMMIT_ENABLED", "true").lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+DEFAULT_EARLY_COMMIT_MIN_SECONDS = max(
+    0.0, float(os.getenv("EARLY_COMMIT_MIN_SECONDS", "1.5"))
+)
+DEFAULT_EARLY_COMMIT_PUNCTUATION = os.getenv(
+    "EARLY_COMMIT_PUNCTUATION", "true"
+).lower() not in {"0", "false", "no", "off"}
+DEFAULT_EARLY_COMMIT_STABILITY = os.getenv("EARLY_COMMIT_STABILITY", "true").lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+DEFAULT_STABILITY_WINDOW = max(2, int(os.getenv("STABILITY_WINDOW", "2")))
+
+
+CommitReason = Literal["punctuation", "stability", "silero_end", "max_utterance_cap"]
+
+
+@dataclass(slots=True)
+class UtteranceRuntime:
+    partials: deque[str] = field(default_factory=deque)
+    last_audio_frame_unix_seconds: float | None = None
+
+
+def _source_text_ends_sentence(text: str) -> bool:
+    stripped = text.rstrip(TRAILING_PUNCTUATION_QUOTES)
+    if not stripped or stripped[-1] not in SOURCE_END_PUNCTUATION:
+        return False
+    before_punctuation = stripped[:-1].rstrip(TRAILING_PUNCTUATION_QUOTES)
+    match = re.search(r"([A-Za-z](?:[A-Za-z]|\.)*)$", before_punctuation)
+    if match and match.group(1).rstrip(".").lower() in ABBREVIATIONS_BEFORE_END_PUNCTUATION:
+        return False
+    return True
+
+
+def _normalize_stability_text(text: str) -> str:
+    return text.strip().rstrip(TRAILING_PUNCTUATION_QUOTES + SOURCE_END_PUNCTUATION).lower()
 
 
 def _bounded_partial_interval_seconds(value: float, *, source: str) -> float:
@@ -158,6 +220,9 @@ class TranscriptionSession:
         self._last_partial_at = 0.0
         self._last_level_at = 0.0
         self._finalized: set[int] = set()
+        self._finalizing: dict[int, CommitReason] = {}
+        self._finalize_lock = asyncio.Lock()
+        self._utterance_runtime: dict[int, UtteranceRuntime] = {}
         self._pending_config: ConfigMessage | None = None
         self._skip_next_polish = False
         self.session_id = websocket.query_params.get("session") or str(uuid4())
@@ -230,12 +295,16 @@ class TranscriptionSession:
                 await self._resume_archive_from_disk()
                 self.state.running = True
                 self.segmenter.reset()
+                self._finalizing.clear()
+                self._utterance_runtime.clear()
             return
 
         if msg.type == "start":
             self._begin_archive()
             self.state.running = True
             self.segmenter.reset()
+            self._finalizing.clear()
+            self._utterance_runtime.clear()
             self._last_partial_at = 0.0
             self.state.last_maintenance_at = time.monotonic()
             self.state.utterances_since_maintenance = 0
@@ -290,10 +359,19 @@ class TranscriptionSession:
             self._pending_config = None
             self.state.utterance_id += 1
             self.state.active_utterance_id = self.state.utterance_id
+            self._utterance_runtime[self.state.utterance_id] = UtteranceRuntime(
+                partials=deque(maxlen=self._stability_window())
+            )
             self._last_partial_at = now - self._partial_interval_seconds()
             await self._send_and_broadcast(
                 SpeechStartMessage(utterance_id=self.state.utterance_id).model_dump()
             )
+
+        if result.speech_active and self.state.active_utterance_id is not None and result.rms > 0.001:
+            self._utterance_runtime.setdefault(
+                self.state.active_utterance_id,
+                UtteranceRuntime(partials=deque(maxlen=self._stability_window())),
+            ).last_audio_frame_unix_seconds = time.time()
 
         if result.speech_active and now - self._last_partial_at >= self._partial_interval_seconds():
             self._last_partial_at = now
@@ -303,18 +381,43 @@ class TranscriptionSession:
 
         if result.speech_ended and result.audio is not None:
             utterance_id = self.state.active_utterance_id
-            self.state.active_utterance_id = None
-            self._schedule_ast("final", utterance_id, result.audio)
+            reason: CommitReason = "max_utterance_cap" if result.force_flushed else "silero_end"
+            await self._commit_utterance(utterance_id, result.audio, reason=reason, reset_segmenter=False)
 
     async def _flush_active_final(self) -> None:
         if not self.segmenter.speech_active or self.state.active_utterance_id is None:
             return
         audio = self.segmenter.current_audio()
         utterance_id = self.state.active_utterance_id
-        self.state.active_utterance_id = None
-        self.segmenter.reset()
         if audio.size:
+            await self._commit_utterance(utterance_id, audio, reason="silero_end", reset_segmenter=True)
+
+    async def _commit_utterance(
+        self,
+        utterance_id: int | None,
+        audio: np.ndarray,
+        *,
+        reason: CommitReason,
+        reset_segmenter: bool,
+    ) -> bool:
+        if utterance_id is None or not audio.size:
+            return False
+        async with self._finalize_lock:
+            if utterance_id in self._finalized or utterance_id in self._finalizing:
+                return False
+            self._finalizing[utterance_id] = reason
+            if self.state.active_utterance_id == utterance_id:
+                self.state.active_utterance_id = None
+            if reset_segmenter:
+                self.segmenter.reset()
+            logger.info(
+                "final_commit reason=%s utterance_id=%s audio_seconds=%.3f",
+                reason,
+                utterance_id,
+                audio.shape[0] / 16_000,
+            )
             self._schedule_ast("final", utterance_id, audio)
+            return True
 
     def _schedule_ast(
         self,
@@ -324,7 +427,9 @@ class TranscriptionSession:
     ) -> None:
         if utterance_id is None:
             return
-        if priority == "partial" and utterance_id in self._finalized:
+        if priority == "partial" and (
+            utterance_id in self._finalized or utterance_id in self._finalizing
+        ):
             return
         task = asyncio.create_task(
             self._run_ast(priority, utterance_id, audio.copy()),
@@ -357,7 +462,7 @@ class TranscriptionSession:
         original, translation = result
 
         if priority == "partial":
-            if utterance_id in self._finalized:
+            if utterance_id in self._finalized or utterance_id in self._finalizing:
                 return
             await self._send_and_broadcast(
                 TranscriptMessage(
@@ -365,11 +470,14 @@ class TranscriptionSession:
                     utterance_id=utterance_id,
                     original=original,
                     translation=translation,
-                ).model_dump()
+                ).model_dump(exclude_none=True)
             )
+            await self._maybe_commit_early(utterance_id, original)
             return
 
         self._finalized.add(utterance_id)
+        commit_reason = self._finalizing.pop(utterance_id, "silero_end")
+        runtime = self._utterance_runtime.pop(utterance_id, None)
         self.state.prior_context.append((original, translation))
         self.state.prior_context = self.state.prior_context[-2:]
         self.state.utterances_since_maintenance += 1
@@ -379,7 +487,11 @@ class TranscriptionSession:
                 utterance_id=utterance_id,
                 original=original,
                 translation=translation,
-            ).model_dump()
+                commit_reason=commit_reason,
+                last_audio_frame_unix_seconds=(
+                    runtime.last_audio_frame_unix_seconds if runtime is not None else None
+                ),
+            ).model_dump(exclude_none=True)
         )
 
         skip_polish = self._skip_next_polish
@@ -392,6 +504,36 @@ class TranscriptionSession:
             self._jobs.add(task)
             task.add_done_callback(self._jobs.discard)
         await self._maybe_run_maintenance()
+
+    async def _maybe_commit_early(self, utterance_id: int, original: str) -> None:
+        if not self._early_commit_enabled():
+            return
+        if self.state.active_utterance_id != utterance_id:
+            return
+        audio = self.segmenter.current_audio()
+        if audio.shape[0] / 16_000 < self._early_commit_min_seconds():
+            return
+        if self._early_commit_punctuation() and _source_text_ends_sentence(original):
+            await self._commit_utterance(utterance_id, audio, reason="punctuation", reset_segmenter=True)
+            return
+        if self._early_commit_stability() and self._source_text_is_stable(utterance_id, original):
+            await self._commit_utterance(utterance_id, audio, reason="stability", reset_segmenter=True)
+
+    def _source_text_is_stable(self, utterance_id: int, original: str) -> bool:
+        normalized = _normalize_stability_text(original)
+        if not normalized:
+            return False
+        runtime = self._utterance_runtime.setdefault(
+            utterance_id,
+            UtteranceRuntime(partials=deque(maxlen=self._stability_window())),
+        )
+        if runtime.partials.maxlen != self._stability_window():
+            runtime.partials = deque(runtime.partials, maxlen=self._stability_window())
+        runtime.partials.append(normalized)
+        return (
+            len(runtime.partials) >= self._stability_window()
+            and len(set(runtime.partials)) == 1
+        )
 
     async def _run_polish(self, utterance_id: int, original: str, translation: str) -> None:
         try:
@@ -408,7 +550,7 @@ class TranscriptionSession:
                 utterance_id=utterance_id,
                 original=polished_original,
                 translation=polished_translation,
-            ).model_dump()
+            ).model_dump(exclude_none=True)
         )
 
     async def _send_error(self, message: str) -> None:
@@ -493,6 +635,8 @@ class TranscriptionSession:
             (item[0], item[1]) for item in snapshot.get("prior_context", [])
         ]
         self._finalized = set(snapshot.get("finalized_ids", []))
+        self._finalizing.clear()
+        self._utterance_runtime.clear()
         self.segmenter.reset()
 
     def export_session_snapshot(self) -> dict:
@@ -531,6 +675,31 @@ class TranscriptionSession:
 
     def _partial_interval_seconds(self) -> float:
         return self.state.config.partial_interval_seconds or DEFAULT_PARTIAL_INTERVAL_SECONDS
+
+    def _early_commit_enabled(self) -> bool:
+        if self.state.config.early_commit_enabled is not None:
+            return self.state.config.early_commit_enabled
+        return DEFAULT_EARLY_COMMIT_ENABLED
+
+    def _early_commit_min_seconds(self) -> float:
+        if self.state.config.early_commit_min_seconds is not None:
+            return max(0.0, self.state.config.early_commit_min_seconds)
+        return DEFAULT_EARLY_COMMIT_MIN_SECONDS
+
+    def _early_commit_punctuation(self) -> bool:
+        if self.state.config.early_commit_punctuation is not None:
+            return self.state.config.early_commit_punctuation
+        return DEFAULT_EARLY_COMMIT_PUNCTUATION
+
+    def _early_commit_stability(self) -> bool:
+        if self.state.config.early_commit_stability is not None:
+            return self.state.config.early_commit_stability
+        return DEFAULT_EARLY_COMMIT_STABILITY
+
+    def _stability_window(self) -> int:
+        if self.state.config.stability_window is not None:
+            return max(2, self.state.config.stability_window)
+        return DEFAULT_STABILITY_WINDOW
 
     def _begin_archive(self) -> None:
         if self._archive_dir is not None:
@@ -597,6 +766,8 @@ class TranscriptionSession:
         utterance["original"] = payload["original"]
         utterance["translation"] = payload["translation"]
         utterance["state"] = payload_type
+        if payload.get("commit_reason") is not None:
+            utterance["commit_reason"] = payload["commit_reason"]
         if payload_type != "partial":
             utterance["ended_at"] = elapsed_seconds
 
@@ -777,6 +948,8 @@ class TranscriptionSession:
             utterance["original"] = payload.get("original", "")
             utterance["translation"] = payload.get("translation", "")
             utterance["state"] = payload_type
+            if payload.get("commit_reason") is not None:
+                utterance["commit_reason"] = payload["commit_reason"]
             if payload_type != "partial":
                 utterance["ended_at"] = elapsed_seconds
         return utterances

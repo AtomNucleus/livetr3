@@ -44,10 +44,19 @@ class SoakEvent:
 
 
 @dataclass
+class FinalEvent:
+    elapsed_seconds: float
+    utterance_id: int
+    latency_seconds: float
+    commit_reason: str
+    silence_to_final_seconds: float | None
+
+
+@dataclass
 class SoakState:
     started_at: float = field(default_factory=time.monotonic)
     speech_started_at: dict[int, float] = field(default_factory=dict)
-    final_latencies: list[tuple[float, int, float]] = field(default_factory=list)
+    final_latencies: list[FinalEvent] = field(default_factory=list)
     errors: list[dict] = field(default_factory=list)
     status_events: list[dict] = field(default_factory=list)
     events: list[SoakEvent] = field(default_factory=list)
@@ -137,7 +146,21 @@ async def reader(ws: websockets.ClientConnection, state: SoakState) -> None:
             utterance_id = int(payload["utterance_id"])
             started_at = state.speech_started_at.get(utterance_id)
             if started_at is not None:
-                state.final_latencies.append((now, utterance_id, now - started_at))
+                last_audio_frame_unix_seconds = payload.get("last_audio_frame_unix_seconds")
+                silence_to_final_seconds = (
+                    max(0.0, time.time() - float(last_audio_frame_unix_seconds))
+                    if last_audio_frame_unix_seconds is not None
+                    else None
+                )
+                state.final_latencies.append(
+                    FinalEvent(
+                        elapsed_seconds=now,
+                        utterance_id=utterance_id,
+                        latency_seconds=now - started_at,
+                        commit_reason=str(payload.get("commit_reason") or "unknown"),
+                        silence_to_final_seconds=silence_to_final_seconds,
+                    )
+                )
         elif msg_type == "error":
             state.errors.append({"elapsed_seconds": now, "payload": payload})
         elif msg_type == "status":
@@ -205,6 +228,9 @@ async def collect_metrics(
         "temp_file_count",
         "archive_entry_count",
         "latest_final_latency_seconds",
+        "latest_silence_to_final_seconds",
+        "latest_commit_reason",
+        "new_finals",
         "final_count",
         "error_count",
         "worker_state",
@@ -212,9 +238,16 @@ async def collect_metrics(
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
+        last_final_index = 0
         while state.elapsed() < duration_seconds:
             await asyncio.sleep(interval_seconds)
-            latest_latency = state.final_latencies[-1][2] if state.final_latencies else None
+            latest_final = state.final_latencies[-1] if state.final_latencies else None
+            latest_latency = latest_final.latency_seconds if latest_final is not None else None
+            latest_silence_latency = (
+                latest_final.silence_to_final_seconds if latest_final is not None else None
+            )
+            new_finals = state.final_latencies[last_final_index:]
+            last_final_index = len(state.final_latencies)
             row = {
                 "elapsed_seconds": round(state.elapsed(), 3),
                 "rss_bytes": process_tree_rss_bytes(process.pid),
@@ -223,6 +256,17 @@ async def collect_metrics(
                 "latest_final_latency_seconds": round(latest_latency, 3)
                 if latest_latency is not None
                 else "",
+                "latest_silence_to_final_seconds": round(latest_silence_latency, 3)
+                if latest_silence_latency is not None
+                else "",
+                "latest_commit_reason": latest_final.commit_reason if latest_final else "",
+                "new_finals": ";".join(
+                    f"{item.utterance_id}:{item.commit_reason}:"
+                    f"{item.silence_to_final_seconds:.3f}"
+                    if item.silence_to_final_seconds is not None
+                    else f"{item.utterance_id}:{item.commit_reason}:"
+                    for item in new_finals
+                ),
                 "final_count": len(state.final_latencies),
                 "error_count": len(state.errors),
                 "worker_state": state.latest_worker_state,
@@ -291,14 +335,31 @@ def summarize(
     rss_values = [float(row["rss_bytes"]) for row in rows]
     temp_counts = [float(row["temp_file_count"]) for row in rows]
     archive_counts = [float(row["archive_entry_count"]) for row in rows]
-    latencies = [item[2] for item in state.final_latencies]
+    latencies = [item.latency_seconds for item in state.final_latencies]
+    silence_latencies = [
+        item.silence_to_final_seconds
+        for item in state.final_latencies
+        if item.silence_to_final_seconds is not None
+    ]
+    reason_counts: dict[str, int] = {}
+    for item in state.final_latencies:
+        reason_counts[item.commit_reason] = reason_counts.get(item.commit_reason, 0) + 1
+    total_reasons = sum(reason_counts.values())
+    reason_percentages = {
+        reason: (count / total_reasons * 100.0 if total_reasons else 0.0)
+        for reason, count in sorted(reason_counts.items())
+    }
     early_latencies = [
-        latency for elapsed, _, latency in state.final_latencies if 0 <= elapsed <= 5 * 60
+        item.latency_seconds
+        for item in state.final_latencies
+        if 0 <= item.elapsed_seconds <= 5 * 60
     ]
     late_latencies = [
-        latency
-        for elapsed, _, latency in state.final_latencies
-        if max(0.0, duration_seconds - 5 * 60) <= elapsed <= duration_seconds + 60
+        item.latency_seconds
+        for item in state.final_latencies
+        if max(0.0, duration_seconds - 5 * 60)
+        <= item.elapsed_seconds
+        <= duration_seconds + 60
     ]
     summary = {
         "duration_seconds": duration_seconds,
@@ -308,6 +369,9 @@ def summarize(
         "temp_file_count": stats(temp_counts),
         "archive_entry_count": stats(archive_counts),
         "final_latency_seconds": stats(latencies),
+        "silence_to_final_seconds": stats(silence_latencies),
+        "commit_reason_counts": reason_counts,
+        "commit_reason_percentages": reason_percentages,
         "early_final_latency_seconds": stats(early_latencies),
         "late_final_latency_seconds": stats(late_latencies),
         "status_events": state.status_events,
@@ -349,7 +413,9 @@ def summarize(
         resumed_latency = None
         if state.fault_sent_at is not None:
             finals_after_fault = [
-                elapsed for elapsed, _, _ in state.final_latencies if elapsed >= state.fault_sent_at
+                item.elapsed_seconds
+                for item in state.final_latencies
+                if item.elapsed_seconds >= state.fault_sent_at
             ]
             if finals_after_fault:
                 resumed_latency = finals_after_fault[0] - state.fault_sent_at
@@ -415,7 +481,7 @@ async def run(args: argparse.Namespace) -> int:
                         state,
                         csv_path,
                         args.metric_interval_seconds,
-                        args.duration_seconds,
+                        args.duration_seconds + args.drain_seconds,
                     )
                 ),
             ]

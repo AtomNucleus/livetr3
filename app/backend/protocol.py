@@ -37,6 +37,11 @@ class ConfigMessage(BaseModel):
     silero_threshold: float | None = None
     speech_pad_ms: int | None = None
     min_silence_ms: int | None = None
+    early_commit_enabled: bool | None = None
+    early_commit_min_seconds: float | None = None
+    early_commit_punctuation: bool | None = None
+    early_commit_stability: bool | None = None
+    stability_window: int | None = None
 
 
 class StartMessage(BaseModel):
@@ -84,6 +89,8 @@ class TranscriptMessage(BaseModel):
     utterance_id: int
     original: str
     translation: str
+    commit_reason: Literal["punctuation", "stability", "silero_end", "max_utterance_cap"] | None = None
+    last_audio_frame_unix_seconds: float | None = None
 
 
 class LevelMessage(BaseModel):

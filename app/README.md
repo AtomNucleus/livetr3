@@ -103,7 +103,7 @@ This sends the WAV as 20 ms little-endian float32 frames over `ws://127.0.0.1:87
 - Viewer handshake: read-only clients send `{"type":"join_viewer"}` after connect.
 - Segmentation: Silero VAD at 16 kHz with 512-sample VAD frames.
 - Partial inference: every about 0.75 seconds while speech is active by default, configurable per session.
-- Final inference: on Silero utterance end or at the configured max-utterance cap.
+- Final inference: dynamic early-commit races punctuation, partial stability, and Silero end-of-speech. Punctuation commits when the source partial ends in `.`, `?`, or `!`; stability commits when normalized source partials stop changing; Silero remains the fallback and max-utterance cap safety net.
 - Context: last two committed utterances are inserted as text-only prior context.
 - Custom vocabulary: injected before the AST prompt per session.
 - Code-switch mode: optional prompt hint to let the model handle source/target language switching within one utterance.
@@ -113,13 +113,15 @@ This sends the WAV as 20 ms little-endian float32 frames over `ws://127.0.0.1:87
 - Maintenance: MLX cache clear + Silero reset run periodically by time or utterance count.
 - Mid-session controls: pause/resume capture, commit-now flush, skip-next-polish, queued language-direction swap, and live mic hot-swap.
 - Reconnect/resume: the operator client reconnects to the same session token and restores the utterance counter when the backend stays alive.
+- Early-commit env tunables: `EARLY_COMMIT_ENABLED` default `true`, `EARLY_COMMIT_MIN_SECONDS` default `1.5`, `EARLY_COMMIT_PUNCTUATION` default `true`, `EARLY_COMMIT_STABILITY` default `true`, and `STABILITY_WINDOW` default `2`.
 
 ## Latency Expectations
 
 Measured locally on an M1 Pro with 32 GB RAM, using `backend/sample.wav` looped through
-`app/backend/scripts/soak.py` on April 23, 2026:
+`app/backend/scripts/soak.py` on April 23-24, 2026:
 
-- Finalized caption latency after speech start: median 10.94 seconds, p95 12.05 seconds over a 30 minute run.
+- Finalized caption latency after speech start: median 10.94 seconds, p95 12.05 seconds over a 30 minute run. This includes the full utterance duration.
+- Silence-to-final inference latency after dynamic early-commit: median 5.74 seconds, p95 8.87 seconds over a 5 minute run. The Silero-only baseline on the same harness was median 7.81 seconds, p95 10.08 seconds.
 - Late-window latency did not drift upward: median 10.24 seconds at 25-30 minutes versus 11.03 seconds at 0-5 minutes.
 - Partial cadence: about every 0.75 seconds during speech by default.
 - Worker fault recovery: SIGTERM of the MLX child recovered to ready in 8.73 seconds; first post-fault final arrived 12.20 seconds after injection.
@@ -130,9 +132,11 @@ Actual latency depends on speech length, selected languages, thermal state, and 
 
 ## Verified
 
-These checks were run locally on April 23, 2026:
+These checks were run locally on April 23-24, 2026:
 
 - Import-time backend gate: `cd app/backend && uv run python -m scripts.check_imports` returned `OK`.
+- Dynamic early-commit soak: `cd app/backend && uv run --extra test python scripts/soak.py --duration-seconds 300 --metric-interval-seconds 30 --drain-seconds 15` passed with 56 finals, 0 errors, median silence-to-final 5.74 seconds, p95 8.87 seconds, and commit reasons 17.86% punctuation / 0.00% stability / 82.14% Silero end. Evidence: `backend/scripts/soak_2026-04-24T12-48-18-0400.csv` and `.summary.json`.
+- Silero-only early-commit baseline: `cd app/backend && EARLY_COMMIT_ENABLED=false uv run --extra test python scripts/soak.py --duration-seconds 300 --metric-interval-seconds 30 --drain-seconds 15` passed with 47 finals, 0 errors, median silence-to-final 7.81 seconds, p95 10.08 seconds, and 100% Silero end commits. Evidence: `backend/scripts/soak_2026-04-24T12-35-23-0400.csv` and `.summary.json`.
 - Sustained load: `cd app/backend && uv run --extra test python scripts/soak.py --duration-seconds 1800 --metric-interval-seconds 60 --drain-seconds 30` passed with 290 finals, 0 errors, max temp-file count 1, median final latency 10.94 seconds, and no late-window latency drift. Evidence: `backend/scripts/soak_2026-04-23T18-29-50-0400.csv` and `.summary.json`.
 - MLX worker fault injection: `cd app/backend && uv run --extra test python scripts/soak.py --duration-seconds 360 --metric-interval-seconds 60 --drain-seconds 30 --inject-fault --fault-at-seconds 180` passed with 58 finals, 0 errors, max temp-file count 2, and inference resumed within 12.20 seconds after SIGTERM. Evidence: `backend/scripts/soak_2026-04-23T19-01-11-0400.csv` and `.summary.json`.
 - Projector browser smoke: `cd app/frontend && yarn test:projector` passed. It compared 5 consecutive finalized captions between operator and projector DOM, enforced p95 mirror delay <= 300 ms, checked 1280x720 and 1920x1080 projector clipping, and captured screenshots in `docs/evidence/`.
