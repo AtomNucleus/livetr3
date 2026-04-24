@@ -193,6 +193,7 @@ class TranscriptionSession:
             if snapshot is not None:
                 await self._restore_from_snapshot(snapshot)
             else:
+                await self._resume_archive_from_disk()
                 self.state.running = True
                 self.segmenter.reset()
             return
@@ -584,6 +585,39 @@ class TranscriptionSession:
             meta,
         )
 
+    async def _resume_archive_from_disk(self) -> None:
+        archive_dir = await asyncio.to_thread(self._find_latest_archive_dir, self.session_id)
+        if archive_dir is None:
+            self._begin_archive()
+            return
+
+        self._archive_dir = archive_dir
+        self._archive_events = self._load_archive_events(archive_dir)
+        self._archive_utterances = self._utterances_from_events(self._archive_events)
+        meta = self._load_archive_meta(archive_dir)
+        started_at = meta.get("started_at")
+        try:
+            self._archive_started_at = datetime.fromisoformat(started_at)
+        except (TypeError, ValueError):
+            self._archive_started_at = datetime.now().astimezone()
+        elapsed_seconds = max(
+            [float(event.get("timestamp_seconds", 0.0)) for event in self._archive_events],
+            default=0.0,
+        )
+        self._archive_started_at_monotonic = time.monotonic() - elapsed_seconds
+        if self._archive_utterances:
+            self.state.utterance_id = max(self.state.utterance_id, max(self._archive_utterances))
+            self._finalized = {
+                utterance["utterance_id"]
+                for utterance in self._archive_utterances.values()
+                if utterance.get("state") in {"final", "polished"}
+            }
+        if self._archive_autosave_task is None:
+            self._archive_autosave_task = asyncio.create_task(
+                self._run_archive_autosave(),
+                name=f"archive-autosave-{self.session_id}",
+            )
+
     async def _finalize_archive(self) -> None:
         if self._archive_dir is None:
             return
@@ -621,6 +655,86 @@ class TranscriptionSession:
             json.dumps(meta, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+
+    def _find_latest_archive_dir(self, session_id: str) -> Path | None:
+        if not ARCHIVE_ROOT.exists():
+            return None
+        matches: list[Path] = []
+        for meta_path in ARCHIVE_ROOT.glob("*/meta.json"):
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if meta.get("session_id") == session_id:
+                matches.append(meta_path.parent)
+        if not matches:
+            return None
+        return max(matches, key=lambda path: path.stat().st_mtime)
+
+    def _load_archive_events(self, archive_dir: Path) -> list[dict]:
+        try:
+            raw_events = json.loads((archive_dir / "transcript.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        events: list[dict] = []
+        seen_finals: set[int] = set()
+        for event in raw_events:
+            payload = event.get("payload", {})
+            if payload.get("type") == "final":
+                utterance_id = int(payload.get("utterance_id", 0))
+                if utterance_id in seen_finals:
+                    continue
+                seen_finals.add(utterance_id)
+            events.append(event)
+        return events
+
+    def _load_archive_meta(self, archive_dir: Path) -> dict:
+        try:
+            return json.loads((archive_dir / "meta.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _utterances_from_events(self, events: list[dict]) -> dict[int, dict]:
+        utterances: dict[int, dict] = {}
+        for event in events:
+            elapsed_seconds = float(event.get("timestamp_seconds", 0.0))
+            payload = event.get("payload", {})
+            payload_type = payload.get("type")
+            utterance_id = payload.get("utterance_id")
+            if not isinstance(utterance_id, int):
+                continue
+            if payload_type == "speech_start":
+                utterances.setdefault(
+                    utterance_id,
+                    {
+                        "utterance_id": utterance_id,
+                        "started_at": elapsed_seconds,
+                        "ended_at": elapsed_seconds,
+                        "original": "",
+                        "translation": "",
+                        "state": "partial",
+                    },
+                )
+                continue
+            if payload_type not in {"partial", "final", "polished"}:
+                continue
+            utterance = utterances.setdefault(
+                utterance_id,
+                {
+                    "utterance_id": utterance_id,
+                    "started_at": elapsed_seconds,
+                    "ended_at": elapsed_seconds,
+                    "original": "",
+                    "translation": "",
+                    "state": payload_type,
+                },
+            )
+            utterance["original"] = payload.get("original", "")
+            utterance["translation"] = payload.get("translation", "")
+            utterance["state"] = payload_type
+            if payload_type != "partial":
+                utterance["ended_at"] = elapsed_seconds
+        return utterances
 
     def _render_srt(self, utterances: list[dict]) -> str:
         cues: list[str] = []
