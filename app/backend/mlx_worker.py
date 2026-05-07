@@ -29,6 +29,7 @@ TEMP_WAV_SWEEP_INTERVAL_SECONDS = max(
 PARTIAL_TIMEOUT_SECONDS = max(1.0, float(os.getenv("PARTIAL_TIMEOUT_SECONDS", "8")))
 FINAL_TIMEOUT_SECONDS = max(1.0, float(os.getenv("FINAL_TIMEOUT_SECONDS", "15")))
 POLISH_TIMEOUT_SECONDS = max(1.0, float(os.getenv("POLISH_TIMEOUT_SECONDS", "10")))
+TRANSLATE_TIMEOUT_SECONDS = max(1.0, float(os.getenv("TRANSLATE_TIMEOUT_SECONDS", "12")))
 MAINTENANCE_TIMEOUT_SECONDS = max(1.0, float(os.getenv("MAINTENANCE_TIMEOUT_SECONDS", "5")))
 MLX_WORKER_START_TIMEOUT_SECONDS = max(
     10.0, float(os.getenv("MLX_WORKER_START_TIMEOUT_SECONDS", "180"))
@@ -49,6 +50,11 @@ POLISH_PROMPT = (
     "(um, uh, er, you know, like), fix punctuation, fix capitalization, "
     "and keep the exact meaning and wording. Return ONLY the cleaned text "
     "with no preamble.\n\nTranscription: {text}"
+)
+
+TRANSLATE_PROMPT = (
+    "Translate the following text from {src} to {tgt}. Return ONLY the translation "
+    "with no preamble.\n\nText: {text}"
 )
 
 
@@ -160,6 +166,26 @@ class MLXWorker:
         )
         return out.strip()
 
+    def translate_text(self, text: str, src: str, tgt: str, max_tokens: int = 256) -> str:
+        from mlx_vlm import generate
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        prompt = TRANSLATE_PROMPT.format(text=text, src=src, tgt=tgt)
+        formatted = apply_chat_template(self.processor, self.config, prompt, num_audios=0)
+        out = _generation_text(
+            generate(
+                self.model,
+                self.processor,
+                formatted,
+                max_tokens=max_tokens,
+                temperature=1.0,
+                top_p=0.95,
+                top_k=64,
+                verbose=False,
+            )
+        )
+        return out.strip()
+
     def clear_caches(self) -> None:
         import gc
 
@@ -199,7 +225,7 @@ class WorkerStatusEvent:
 class _QueuedJob:
     priority: int
     sequence: int
-    kind: Literal["ast", "polish", "maintenance"] = field(compare=False)
+    kind: Literal["ast", "polish", "translate", "maintenance"] = field(compare=False)
     future: asyncio.Future = field(compare=False)
     payload: dict = field(compare=False)
 
@@ -212,29 +238,42 @@ class MLXWorkerService:
         self._sequence = itertools.count()
         self._runner: asyncio.Task | None = None
         self._sweeper: asyncio.Task | None = None
+        self._start_lock = asyncio.Lock()
+        self._started = False
         self._closed = asyncio.Event()
         self._temp_wav_root = TEMP_WAV_ROOT
         self._process: mp.Process | None = None
         self._request_queue: mp.Queue | None = None
         self._response_queue: mp.Queue | None = None
-        self._active_job_kind: Literal["ast", "polish", "maintenance"] | None = None
+        self._active_job_kind: Literal["ast", "polish", "translate", "maintenance"] | None = None
         self._queued_partial_jobs: dict[int, _QueuedJob] = {}
+        self._queued_partial_translation_jobs: dict[int, _QueuedJob] = {}
+        self._final_utterance_ids: set[int] = set()
         self._mp_context = mp.get_context("spawn")
         self._status = WorkerStatusEvent(state="starting", message="Loading Gemma model worker")
         self._status_listeners: set[Callable[[WorkerStatusEvent], Awaitable[None]]] = set()
 
     async def start(self) -> None:
-        self._temp_wav_root.mkdir(parents=True, exist_ok=True)
-        await asyncio.to_thread(sweep_stale_temp_wavs, self._temp_wav_root, TEMP_WAV_STALE_SECONDS)
-        try:
-            await self._start_worker_process()
-        except Exception as exc:
-            await self._emit_status(
-                WorkerStatusEvent(state="failed", message=f"Model worker failed to start: {exc}")
+        async with self._start_lock:
+            if self._started:
+                return
+            self._closed.clear()
+            self._temp_wav_root.mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(
+                sweep_stale_temp_wavs, self._temp_wav_root, TEMP_WAV_STALE_SECONDS
             )
-            raise
-        self._runner = asyncio.create_task(self._run(), name="mlx-worker-queue")
-        self._sweeper = asyncio.create_task(self._run_temp_wav_sweeper(), name="mlx-temp-wav-sweeper")
+            try:
+                await self._start_worker_process()
+            except Exception as exc:
+                await self._emit_status(
+                    WorkerStatusEvent(state="failed", message=f"Model worker failed to start: {exc}")
+                )
+                raise
+            self._runner = asyncio.create_task(self._run(), name="mlx-worker-queue")
+            self._sweeper = asyncio.create_task(
+                self._run_temp_wav_sweeper(), name="mlx-temp-wav-sweeper"
+            )
+            self._started = True
 
     async def stop(self) -> None:
         self._closed.set()
@@ -252,6 +291,7 @@ class MLXWorkerService:
                 pass
         await self._stop_worker_process(force=True)
         await asyncio.to_thread(sweep_stale_temp_wavs, self._temp_wav_root, 0)
+        self._started = False
 
     async def submit_ast(
         self,
@@ -288,13 +328,18 @@ class MLXWorkerService:
         if utterance_id is not None:
             previous = self._queued_partial_jobs.get(utterance_id)
             if priority == "partial":
+                if utterance_id in self._final_utterance_ids:
+                    future.set_result(None)
+                    return await future
                 if previous is not None and not previous.future.done():
                     previous.future.set_result(None)
                 self._queued_partial_jobs[utterance_id] = job
-            elif previous is not None:
-                self._queued_partial_jobs.pop(utterance_id, None)
-                if not previous.future.done():
-                    previous.future.set_result(None)
+            else:
+                self._final_utterance_ids.add(utterance_id)
+                if previous is not None:
+                    self._queued_partial_jobs.pop(utterance_id, None)
+                    if not previous.future.done():
+                        previous.future.set_result(None)
         await self._queue.put(job)
         return await future
 
@@ -310,6 +355,48 @@ class MLXWorkerService:
                 payload={"text": text},
             )
         )
+        return await future
+
+    async def submit_translate_text(
+        self,
+        text: str,
+        src: str,
+        tgt: str,
+        *,
+        priority: Literal["partial", "final"] = "final",
+        utterance_id: int | None = None,
+    ) -> str | None:
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        job = _QueuedJob(
+            priority=5 if priority == "final" else 12,
+            sequence=next(self._sequence),
+            kind="translate",
+            future=future,
+            payload={
+                "priority": priority,
+                "utterance_id": utterance_id,
+                "text": text,
+                "src": src,
+                "tgt": tgt,
+            },
+        )
+        if utterance_id is not None:
+            previous = self._queued_partial_translation_jobs.get(utterance_id)
+            if priority == "partial":
+                if utterance_id in self._final_utterance_ids:
+                    future.set_result(None)
+                    return await future
+                if previous is not None and not previous.future.done():
+                    previous.future.set_result(None)
+                self._queued_partial_translation_jobs[utterance_id] = job
+            else:
+                self._final_utterance_ids.add(utterance_id)
+                if previous is not None:
+                    self._queued_partial_translation_jobs.pop(utterance_id, None)
+                    if not previous.future.done():
+                        previous.future.set_result(None)
+        await self._queue.put(job)
         return await future
 
     async def submit_maintenance(self) -> None:
@@ -363,17 +450,26 @@ class MLXWorkerService:
                 self._queue.task_done()
 
     def _should_skip_job(self, job: _QueuedJob) -> bool:
-        if job.kind != "ast" or job.payload.get("priority") != "partial":
+        if job.payload.get("priority") != "partial":
             return False
         utterance_id = job.payload.get("utterance_id")
         if not isinstance(utterance_id, int):
             return False
-        queued_job = self._queued_partial_jobs.get(utterance_id)
+        if utterance_id in self._final_utterance_ids:
+            return True
+        if job.kind == "ast":
+            queued_job = self._queued_partial_jobs.get(utterance_id)
+            queued_jobs = self._queued_partial_jobs
+        elif job.kind == "translate":
+            queued_job = self._queued_partial_translation_jobs.get(utterance_id)
+            queued_jobs = self._queued_partial_translation_jobs
+        else:
+            return False
         if queued_job is None:
             return False
         if queued_job.sequence != job.sequence:
             return True
-        self._queued_partial_jobs.pop(utterance_id, None)
+        queued_jobs.pop(utterance_id, None)
         return False
 
     async def _run_temp_wav_sweeper(self) -> None:
@@ -415,7 +511,7 @@ class MLXWorkerService:
             raise WorkerProcessError("MLX worker process exited unexpectedly")
 
         payload = job.payload
-        if job.kind == "ast":
+        if job.kind in {"ast", "translate"}:
             payload = {
                 key: value
                 for key, value in job.payload.items()
@@ -560,6 +656,8 @@ class MLXWorkerService:
             return MAINTENANCE_TIMEOUT_SECONDS
         if job.kind == "polish":
             return POLISH_TIMEOUT_SECONDS
+        if job.kind == "translate":
+            return TRANSLATE_TIMEOUT_SECONDS
         return FINAL_TIMEOUT_SECONDS if job.priority == 0 else PARTIAL_TIMEOUT_SECONDS
 
 
@@ -590,8 +688,10 @@ def _worker_process_main(
                 result = worker.ast(**request["payload"])
             elif request["kind"] == "maintenance":
                 result = worker.clear_caches()
-            else:
+            elif request["kind"] == "polish":
                 result = worker.polish(**request["payload"])
+            else:
+                result = worker.translate_text(**request["payload"])
         except Exception:
             response_queue.put(
                 {

@@ -36,15 +36,15 @@ export function DualPane({ entries, sourceLanguage, targetLanguage }: Props) {
   const translationDir = isRtlLanguage(targetLanguage) ? "rtl" : "ltr";
 
   return (
-    <main data-testid="dual-pane" className="grid min-h-0 flex-1 grid-rows-2">
+    <main data-testid="dual-pane" className="grid min-h-0 flex-1 grid-rows-2 bg-ink">
       <section
         data-testid="source-pane"
         className="min-h-0 border-b border-line bg-ink"
         aria-label={`${sourceLanguage} transcript`}
       >
         <div className="flex h-full flex-col">
-          <div className="flex items-center justify-between border-b border-line px-5 py-3">
-            <h2 data-testid="source-language-label" className="text-sm font-semibold text-mint">
+          <div className="flex min-h-11 items-center justify-between border-b border-line bg-shell px-5 py-2.5">
+            <h2 data-testid="source-language-label" className="text-sm font-semibold text-zinc-100">
               {sourceLanguage}
             </h2>
             {originalPane.pinned ? (
@@ -68,12 +68,12 @@ export function DualPane({ entries, sourceLanguage, targetLanguage }: Props) {
 
       <section
         data-testid="target-pane"
-        className="min-h-0 bg-panel"
+        className="min-h-0 bg-ink"
         aria-label={`${targetLanguage} translation`}
       >
         <div className="flex h-full flex-col">
-          <div className="flex items-center justify-between border-b border-line px-5 py-3">
-            <h2 data-testid="target-language-label" className="text-sm font-semibold text-mint">
+          <div className="flex min-h-11 items-center justify-between border-b border-line bg-shell px-5 py-2.5">
+            <h2 data-testid="target-language-label" className="text-sm font-semibold text-zinc-100">
               {targetLanguage}
             </h2>
             {translationPane.pinned ? (
@@ -102,4 +102,3 @@ export function DualPane({ entries, sourceLanguage, targetLanguage }: Props) {
     </main>
   );
 }
-

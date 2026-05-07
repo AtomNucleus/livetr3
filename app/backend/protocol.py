@@ -26,7 +26,7 @@ class ConfigMessage(BaseModel):
     target_lang: str = "Spanish"
     custom_vocab: list[str] = Field(default_factory=list)
     segmenter: Literal["silero"] = "silero"
-    polish_enabled: bool = True
+    polish_enabled: bool = False
     rms_threshold: float | None = None
     apply_target: Literal["immediate", "next_utterance"] = "immediate"
     input_device_id: str | None = None

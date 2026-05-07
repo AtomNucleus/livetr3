@@ -13,6 +13,27 @@ import {
 import type { ClientConfig } from "./lib/protocol";
 
 const CUSTOM_VOCAB_STORAGE_KEY = "livetr3.custom-vocab";
+const LEGACY_DEFAULT_CUSTOM_VOCAB = ["surreal", "amy", "morgan"];
+
+function readCustomVocab(): string[] {
+  const storedVocab = window.localStorage.getItem(CUSTOM_VOCAB_STORAGE_KEY);
+  if (!storedVocab) return [];
+
+  const customVocab = storedVocab
+    .split("\n")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const normalized = customVocab.map((item) => item.toLowerCase()).sort();
+  const isLegacyDefault =
+    normalized.length === LEGACY_DEFAULT_CUSTOM_VOCAB.length &&
+    normalized.every((item, index) => item === [...LEGACY_DEFAULT_CUSTOM_VOCAB].sort()[index]);
+  if (isLegacyDefault) {
+    window.localStorage.removeItem(CUSTOM_VOCAB_STORAGE_KEY);
+    return [];
+  }
+
+  return customVocab;
+}
 
 declare global {
   interface Window {
@@ -28,30 +49,24 @@ declare global {
 export default function App() {
   const [sessionId] = useState(() => getOrCreateSessionId());
   const [config, setConfigState] = useState<ClientConfig>(() => {
-    const storedVocab = window.localStorage.getItem(CUSTOM_VOCAB_STORAGE_KEY);
-    const customVocab = storedVocab
-      ? storedVocab
-          .split("\n")
-          .map((item) => item.trim())
-          .filter(Boolean)
-      : ["Surreal", "Amy", "Morgan"];
+    const customVocab = readCustomVocab();
     return {
       version: 2,
       source_lang: "English",
       target_lang: "Spanish",
       custom_vocab: customVocab,
       segmenter: "silero",
-      polish_enabled: true,
+      polish_enabled: false,
       code_switching_enabled: false,
       partial_interval_seconds: 0.75,
-      max_utterance_seconds: 25,
+      max_utterance_seconds: 12,
       silero_threshold: 0.5,
       speech_pad_ms: 300,
-      min_silence_ms: 400,
+      min_silence_ms: 150,
     };
   });
   const [selectedDeviceId, setSelectedDeviceId] = useState("");
-  const [settingsOpen, setSettingsOpen] = useState(true);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [levels, setLevels] = useState<number[]>(Array(10).fill(0));
   const [projectorFontSize, setProjectorFontSize] = useState(() => readProjectorFontSize(sessionId));
   const { entries, lastError, partialTickAt, workerStatus, handleServerMessage, clear } =
@@ -203,7 +218,7 @@ export default function App() {
     <div
       data-testid="app-shell"
       data-session-id={sessionId}
-      className="flex h-screen flex-col overflow-hidden bg-ink text-zinc-50"
+      className="operator-glass-app flex h-screen flex-col overflow-hidden text-zinc-50"
     >
       <Header
         config={config}

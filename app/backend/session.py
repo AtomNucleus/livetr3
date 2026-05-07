@@ -17,6 +17,7 @@ import numpy as np
 from fastapi import WebSocket
 
 from mlx_worker import MLXWorkerService, WorkerStatusEvent
+from parakeet_worker import ASRResult, ParakeetASRService
 from protocol import (
     ConfigMessage,
     ErrorMessage,
@@ -79,6 +80,31 @@ DEFAULT_EARLY_COMMIT_STABILITY = os.getenv("EARLY_COMMIT_STABILITY", "true").low
     "off",
 }
 DEFAULT_STABILITY_WINDOW = max(2, int(os.getenv("STABILITY_WINDOW", "2")))
+DEFAULT_PRIOR_CONTEXT_ENABLED = os.getenv(
+    "PRIOR_CONTEXT_ENABLED", "false"
+).lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+DEFAULT_PARTIAL_MIN_AUDIO_SECONDS = max(
+    0.0, float(os.getenv("PARTIAL_MIN_AUDIO_SECONDS", "0.8"))
+)
+DEFAULT_PARTIAL_AST_ENABLED = os.getenv("PARTIAL_AST_ENABLED", "true").lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+MIN_TRANSCRIBABLE_RMS = max(0.0, float(os.getenv("MIN_TRANSCRIBABLE_RMS", "0.0004")))
+MIN_TRANSCRIBABLE_PEAK = max(0.0, float(os.getenv("MIN_TRANSCRIBABLE_PEAK", "0.003")))
+MIN_TRANSCRIBABLE_FRAME_RMS = max(
+    0.0, float(os.getenv("MIN_TRANSCRIBABLE_FRAME_RMS", "0.0006"))
+)
+MIN_TRANSCRIBABLE_VOICED_MS = max(
+    0, int(os.getenv("MIN_TRANSCRIBABLE_VOICED_MS", "60"))
+)
 
 
 CommitReason = Literal["punctuation", "stability", "silero_end", "max_utterance_cap"]
@@ -133,6 +159,34 @@ def _load_default_partial_interval_seconds() -> float:
 
 
 DEFAULT_PARTIAL_INTERVAL_SECONDS = _load_default_partial_interval_seconds()
+
+
+def _audio_energy_stats(audio: np.ndarray) -> tuple[float, float, int, int]:
+    audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if audio.size < FRAME_SAMPLES:
+        return 0.0, 0.0, 0, max(1, int(np.ceil(MIN_TRANSCRIBABLE_VOICED_MS / 20)))
+
+    rms = float(np.sqrt(float(np.mean(np.square(audio)))))
+    peak = float(np.max(np.abs(audio)))
+
+    frame_count = audio.size // FRAME_SAMPLES
+    if frame_count <= 0:
+        return rms, peak, 0, max(1, int(np.ceil(MIN_TRANSCRIBABLE_VOICED_MS / 20)))
+    framed = audio[: frame_count * FRAME_SAMPLES].reshape(frame_count, FRAME_SAMPLES)
+    frame_rms = np.sqrt(np.mean(np.square(framed), axis=1))
+    voiced_frames = int(np.count_nonzero(frame_rms >= MIN_TRANSCRIBABLE_FRAME_RMS))
+    required_frames = max(1, int(np.ceil(MIN_TRANSCRIBABLE_VOICED_MS / 20)))
+    return rms, peak, voiced_frames, required_frames
+
+
+def _audio_has_transcribable_energy(audio: np.ndarray) -> bool:
+    audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if audio.size < FRAME_SAMPLES:
+        return False
+    rms, peak, voiced_frames, required_frames = _audio_energy_stats(audio)
+    if rms < MIN_TRANSCRIBABLE_RMS or peak < MIN_TRANSCRIBABLE_PEAK:
+        return False
+    return voiced_frames >= required_frames
 
 
 @dataclass(slots=True)
@@ -208,10 +262,20 @@ class SessionHub:
 
 
 class TranscriptionSession:
-    def __init__(self, websocket: WebSocket, worker: MLXWorkerService, hub: SessionHub) -> None:
+    def __init__(
+        self,
+        websocket: WebSocket,
+        worker: MLXWorkerService,
+        hub: SessionHub,
+        *,
+        transcription_engine: str = "gemma",
+        asr_worker: ParakeetASRService | None = None,
+    ) -> None:
         self.websocket = websocket
         self.worker = worker
+        self.asr_worker = asr_worker
         self.hub = hub
+        self.transcription_engine = transcription_engine
         self.state = SessionState()
         self.segmenter: RMSGate = self._build_segmenter(self.state.config)
         self.ring: deque[np.ndarray] = deque(maxlen=int(30 / 0.02))
@@ -236,7 +300,10 @@ class TranscriptionSession:
 
     async def run(self) -> None:
         await self.websocket.accept()
-        await self.worker.add_status_listener(self._handle_worker_status)
+        if self.transcription_engine == "gemma":
+            await self.worker.add_status_listener(self._handle_worker_status)
+        if self.asr_worker is not None:
+            await self.asr_worker.add_status_listener(self._handle_worker_status)
         try:
             while True:
                 message = await self.websocket.receive()
@@ -247,7 +314,10 @@ class TranscriptionSession:
                 elif message.get("text") is not None:
                     await self._receive_text(message["text"])
         finally:
-            self.worker.remove_status_listener(self._handle_worker_status)
+            if self.transcription_engine == "gemma":
+                self.worker.remove_status_listener(self._handle_worker_status)
+            if self.asr_worker is not None:
+                self.asr_worker.remove_status_listener(self._handle_worker_status)
             await self.hub.detach(self.session_id, self)
             await self._finalize_archive()
             for task in self._jobs:
@@ -373,10 +443,19 @@ class TranscriptionSession:
                 UtteranceRuntime(partials=deque(maxlen=self._stability_window())),
             ).last_audio_frame_unix_seconds = time.time()
 
-        if result.speech_active and now - self._last_partial_at >= self._partial_interval_seconds():
+        if (
+            result.speech_active
+            and DEFAULT_PARTIAL_AST_ENABLED
+            and not self._partial_inference_is_busy_or_backlogged()
+            and now - self._last_partial_at >= self._partial_interval_seconds()
+        ):
             self._last_partial_at = now
             audio = self.segmenter.current_audio()
-            if audio.size:
+            if (
+                audio.size
+                and audio.shape[0] / 16_000 >= DEFAULT_PARTIAL_MIN_AUDIO_SECONDS
+                and _audio_has_transcribable_energy(audio)
+            ):
                 self._schedule_ast("partial", self.state.active_utterance_id, audio)
 
         if result.speech_ended and result.audio is not None:
@@ -401,6 +480,28 @@ class TranscriptionSession:
         reset_segmenter: bool,
     ) -> bool:
         if utterance_id is None or not audio.size:
+            return False
+        if not _audio_has_transcribable_energy(audio):
+            rms, peak, voiced_frames, required_frames = _audio_energy_stats(audio)
+            if reset_segmenter:
+                self.segmenter.reset()
+            if self.state.active_utterance_id == utterance_id:
+                self.state.active_utterance_id = None
+            self._finalized.add(utterance_id)
+            self._finalizing.pop(utterance_id, None)
+            self._utterance_runtime.pop(utterance_id, None)
+            logger.info(
+                (
+                    "final_commit skipped reason=low_energy utterance_id=%s "
+                    "audio_seconds=%.3f rms=%.6f peak=%.6f voiced_frames=%s required_frames=%s"
+                ),
+                utterance_id,
+                audio.shape[0] / 16_000,
+                rms,
+                peak,
+                voiced_frames,
+                required_frames,
+            )
             return False
         async with self._finalize_lock:
             if utterance_id in self._finalized or utterance_id in self._finalizing:
@@ -439,6 +540,10 @@ class TranscriptionSession:
         task.add_done_callback(self._jobs.discard)
 
     async def _run_ast(self, priority: str, utterance_id: int, audio: np.ndarray) -> None:
+        if self.transcription_engine == "parakeet":
+            await self._run_parakeet_asr(priority, utterance_id, audio)
+            return
+
         try:
             result = await self.worker.submit_ast(
                 priority="final" if priority == "final" else "partial",
@@ -446,8 +551,10 @@ class TranscriptionSession:
                 audio_f32_16k=audio,
                 src=self.state.config.source_lang,
                 tgt=self.state.config.target_lang,
-                prior_context=self.state.prior_context[-2:],
-                custom_vocab=self.state.config.custom_vocab,
+                prior_context=self.state.prior_context[-2:]
+                if DEFAULT_PRIOR_CONTEXT_ENABLED
+                else [],
+                custom_vocab=[] if priority == "partial" else self.state.config.custom_vocab,
                 code_switching_enabled=self.state.config.code_switching_enabled,
                 max_tokens=self._max_tokens_for_ast(priority, audio),
             )
@@ -504,6 +611,132 @@ class TranscriptionSession:
             self._jobs.add(task)
             task.add_done_callback(self._jobs.discard)
         await self._maybe_run_maintenance()
+
+    async def _run_parakeet_asr(self, priority: str, utterance_id: int, audio: np.ndarray) -> None:
+        if self.asr_worker is None:
+            await self._send_error("Parakeet ASR is not configured; set TRANSCRIPTION_ENGINE=gemma to use Gemma AST fallback")
+            return
+        try:
+            result = await self.asr_worker.submit_asr(
+                priority="final" if priority == "final" else "partial",
+                utterance_id=utterance_id,
+                audio_f32_16k=audio,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._send_error(f"Parakeet ASR failed: {exc}")
+            return
+
+        if result is None:
+            return
+
+        original = result.text.strip() if isinstance(result, ASRResult) else str(result).strip()
+        if not original:
+            return
+
+        if priority == "partial":
+            if utterance_id in self._finalized or utterance_id in self._finalizing:
+                return
+            translation = await self._translate_partial(utterance_id, original)
+            if translation is None:
+                return
+            await self._send_and_broadcast(
+                TranscriptMessage(
+                    type="partial",
+                    utterance_id=utterance_id,
+                    original=original,
+                    translation=translation,
+                ).model_dump(exclude_none=True)
+            )
+            await self._maybe_commit_early(utterance_id, original)
+            return
+
+        translation = await self._translate_final(utterance_id, original)
+        if translation is None:
+            return
+        self._finalized.add(utterance_id)
+        commit_reason = self._finalizing.pop(utterance_id, "silero_end")
+        runtime = self._utterance_runtime.pop(utterance_id, None)
+        self.state.prior_context.append((original, translation))
+        self.state.prior_context = self.state.prior_context[-2:]
+        self.state.utterances_since_maintenance += 1
+        last_audio_frame_unix_seconds = (
+            runtime.last_audio_frame_unix_seconds if runtime is not None else None
+        )
+        await self._send_and_broadcast(
+            TranscriptMessage(
+                type="final",
+                utterance_id=utterance_id,
+                original=original,
+                translation=translation,
+                commit_reason=commit_reason,
+                last_audio_frame_unix_seconds=last_audio_frame_unix_seconds,
+            ).model_dump(exclude_none=True)
+        )
+
+        skip_polish = self._skip_next_polish
+        self._skip_next_polish = False
+        if self.state.config.polish_enabled and not skip_polish:
+            task = asyncio.create_task(
+                self._run_polish(utterance_id, original, translation),
+                name=f"polish-{utterance_id}",
+            )
+            self._jobs.add(task)
+            task.add_done_callback(self._jobs.discard)
+        await self._maybe_run_maintenance()
+
+    def _should_translate_final(self, original: str) -> bool:
+        return (
+            bool(original.strip())
+            and self.state.config.source_lang.strip().lower()
+            != self.state.config.target_lang.strip().lower()
+        )
+
+    async def _translate_partial(self, utterance_id: int, original: str) -> str | None:
+        if not self._should_translate_final(original):
+            return original
+        try:
+            await self.worker.start()
+            translation = await self.worker.submit_translate_text(
+                original,
+                self.state.config.source_lang,
+                self.state.config.target_lang,
+                priority="partial",
+                utterance_id=utterance_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._send_error(f"Partial translation failed: {exc}")
+            return None
+        if utterance_id in self._finalized or utterance_id in self._finalizing:
+            return None
+        return translation
+
+    async def _translate_final(self, utterance_id: int, original: str) -> str | None:
+        if not self._should_translate_final(original):
+            return original
+        try:
+            await self.worker.start()
+            translation = await self.worker.submit_translate_text(
+                original,
+                self.state.config.source_lang,
+                self.state.config.target_lang,
+                priority="final",
+                utterance_id=utterance_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._send_error(f"Translation failed: {exc}")
+            return None
+        return translation
+
+    def _partial_inference_is_busy_or_backlogged(self) -> bool:
+        if self.transcription_engine == "parakeet" and self.asr_worker is not None:
+            return self.asr_worker.is_busy_or_backlogged
+        return self.worker.is_busy_or_backlogged
 
     async def _maybe_commit_early(self, utterance_id: int, original: str) -> None:
         if not self._early_commit_enabled():
@@ -652,8 +885,8 @@ class TranscriptionSession:
         rms_threshold = config.rms_threshold or float(os.getenv("RMS_THRESHOLD", "0.01"))
         silero_threshold = min(max(config.silero_threshold or 0.5, 0.1), 0.95)
         speech_pad_ms = min(max(config.speech_pad_ms or 300, 0), 2000)
-        min_silence_ms = min(max(config.min_silence_ms or 400, 100), 5000)
-        max_utterance_seconds = min(max(config.max_utterance_seconds or 25.0, 5.0), 29.0)
+        min_silence_ms = min(max(config.min_silence_ms or 150, 100), 5000)
+        max_utterance_seconds = min(max(config.max_utterance_seconds or 12.0, 5.0), 29.0)
         return make_segmenter(
             config.segmenter,
             rms_threshold,

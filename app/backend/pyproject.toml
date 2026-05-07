@@ -11,7 +11,7 @@ dependencies = [
   "numpy>=2.1.0",
   "soundfile>=0.12.1",
   "mlx>=0.22.0",
-  "mlx-vlm>=0.1.20",
+  "mlx-vlm>=0.4.3",
   "python-dotenv>=1.0.1",
   "silero-vad>=5.1.2",
 ]
@@ -19,6 +19,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "ruff>=0.9.0",
+]
+parakeet = [
+  "parakeet-mlx>=0.3.0",
 ]
 test = [
     "psutil>=7.0.0",
@@ -30,4 +33,3 @@ package = false
 [tool.ruff]
 line-length = 100
 target-version = "py313"
-

@@ -13,6 +13,9 @@ dist/
 .vite/
 *.tsbuildinfo
 
+# macOS
+macos/**/.build/
+
 # Local env overrides
 .env.local
 

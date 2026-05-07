@@ -56,6 +56,7 @@ class FinalEvent:
 class SoakState:
     started_at: float = field(default_factory=time.monotonic)
     speech_started_at: dict[int, float] = field(default_factory=dict)
+    finalized_ids: set[int] = field(default_factory=set)
     final_latencies: list[FinalEvent] = field(default_factory=list)
     errors: list[dict] = field(default_factory=list)
     status_events: list[dict] = field(default_factory=list)
@@ -144,6 +145,9 @@ async def reader(ws: websockets.ClientConnection, state: SoakState) -> None:
             state.speech_started_at[int(payload["utterance_id"])] = now
         elif msg_type == "final":
             utterance_id = int(payload["utterance_id"])
+            if utterance_id in state.finalized_ids:
+                continue
+            state.finalized_ids.add(utterance_id)
             started_at = state.speech_started_at.get(utterance_id)
             if started_at is not None:
                 last_audio_frame_unix_seconds = payload.get("last_audio_frame_unix_seconds")
