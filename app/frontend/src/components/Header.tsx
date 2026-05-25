@@ -164,7 +164,9 @@ export function Header({
                   onChange={(event) => update("source_lang", event.target.value)}
                 >
                   {languages.map((language) => (
-                    <option key={language} value={language} />
+                    <option key={language} value={language}>
+                      {language}
+                    </option>
                   ))}
                 </select>
               </label>
@@ -186,7 +188,9 @@ export function Header({
                   onChange={(event) => update("target_lang", event.target.value)}
                 >
                   {languages.map((language) => (
-                    <option key={language} value={language} />
+                    <option key={language} value={language}>
+                      {language}
+                    </option>
                   ))}
                 </select>
               </label>
@@ -226,6 +230,33 @@ export function Header({
                   onChange={(event) => update("polish_enabled", event.target.checked)}
                 />
                 Polish finals
+              </label>
+              <label data-testid="asr-correction-toggle-control" className="flex items-end gap-2 pb-2 text-sm text-zinc-300">
+                <input
+                  data-testid="asr-correction-toggle"
+                  type="checkbox"
+                  checked={config.asr_correction_enabled ?? true}
+                  onChange={(event) => update("asr_correction_enabled", event.target.checked)}
+                />
+                Correct finalized ASR
+              </label>
+              <label data-testid="bilingual-context-toggle-control" className="flex items-end gap-2 pb-2 text-sm text-zinc-300">
+                <input
+                  data-testid="bilingual-context-toggle"
+                  type="checkbox"
+                  checked={Boolean(config.bilingual_context_enabled)}
+                  onChange={(event) => update("bilingual_context_enabled", event.target.checked)}
+                />
+                Learn bilingual context
+              </label>
+              <label data-testid="transcript-learning-toggle-control" className="flex items-end gap-2 pb-2 text-sm text-zinc-300">
+                <input
+                  data-testid="transcript-learning-toggle"
+                  type="checkbox"
+                  checked={config.transcript_learning_enabled ?? true}
+                  onChange={(event) => update("transcript_learning_enabled", event.target.checked)}
+                />
+                Learn from transcript
               </label>
             </div>
           </section>

@@ -37,6 +37,16 @@ export function useAudioCapture({ onServerMessage, onWaveform }: AudioCaptureOpt
     }
   }, []);
 
+  const resumeAudioContext = useCallback(() => {
+    const context = contextRef.current;
+    if (!context || context.state === "closed") return;
+    if (context.state === "suspended" || context.state === "interrupted") {
+      void context.resume().catch(() => {
+        setError("Audio capture was interrupted. Click Resume or restart capture if captions do not continue.");
+      });
+    }
+  }, []);
+
   const clearReconnectTimer = useCallback(() => {
     if (reconnectTimerRef.current !== null) {
       window.clearTimeout(reconnectTimerRef.current);
@@ -248,8 +258,9 @@ export function useAudioCapture({ onServerMessage, onWaveform }: AudioCaptureOpt
 
   const resume = useCallback(() => {
     pausedRef.current = false;
+    resumeAudioContext();
     setPaused(false);
-  }, []);
+  }, [resumeAudioContext]);
 
   const switchDevice = useCallback(
     async (deviceId?: string) => {
@@ -278,6 +289,17 @@ export function useAudioCapture({ onServerMessage, onWaveform }: AudioCaptureOpt
     void refreshDevices();
     return stop;
   }, [refreshDevices, stop]);
+
+  useEffect(() => {
+    window.addEventListener("focus", resumeAudioContext);
+    window.addEventListener("pageshow", resumeAudioContext);
+    document.addEventListener("visibilitychange", resumeAudioContext);
+    return () => {
+      window.removeEventListener("focus", resumeAudioContext);
+      window.removeEventListener("pageshow", resumeAudioContext);
+      document.removeEventListener("visibilitychange", resumeAudioContext);
+    };
+  }, [resumeAudioContext]);
 
   return {
     status,

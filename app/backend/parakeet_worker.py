@@ -21,7 +21,7 @@ from mlx_worker import TEMP_WAV_ROOT, _safe_unlink, sweep_stale_temp_wavs
 
 load_dotenv()
 
-PARAKEET_MODEL = os.getenv("PARAKEET_MODEL", "mlx-community/parakeet-tdt-0.6b-v2")
+PARAKEET_MODEL = os.getenv("PARAKEET_MODEL", "mlx-community/parakeet-tdt-0.6b-v3")
 PARAKEET_WORKER_START_TIMEOUT_SECONDS = max(
     10.0, float(os.getenv("PARAKEET_WORKER_START_TIMEOUT_SECONDS", "240"))
 )

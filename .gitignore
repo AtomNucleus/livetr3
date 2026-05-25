@@ -12,6 +12,7 @@ node_modules/
 dist/
 .vite/
 *.tsbuildinfo
+app/frontend/test-results/
 
 # macOS
 macos/**/.build/
@@ -21,3 +22,8 @@ macos/**/.build/
 
 # Generated local smoke-test audio
 app/backend/sample.wav
+
+# Generated backend validation artifacts
+app/backend/scripts/soak_*.backend.log
+app/backend/scripts/soak_*.csv
+app/backend/scripts/soak_*.summary.json

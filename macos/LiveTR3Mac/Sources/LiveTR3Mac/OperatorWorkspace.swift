@@ -2,6 +2,7 @@ import SwiftUI
 
 struct OperatorWorkspace: View {
     @EnvironmentObject private var runtime: LiveTR3Runtime
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         VStack(spacing: 0) {
@@ -12,7 +13,9 @@ struct OperatorWorkspace: View {
 
             Group {
                 if runtime.state == .ready {
-                    WebOperatorView(url: runtime.operatorURL, reloadToken: runtime.webReloadToken)
+                    WebOperatorView(url: runtime.operatorURL, reloadToken: runtime.webReloadToken) {
+                        openWindow(id: "projector")
+                    }
                 } else {
                     RuntimeOverlay(state: runtime.state, message: runtime.statusMessage)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)

@@ -1,9 +1,131 @@
-INFO:     Started server process [48998]
+INFO:     Started server process [34899]
 INFO:     Waiting for application startup.
-Fetching 9 files:   0%|          | 0/9 [00:00<?, ?it/s]Fetching 9 files: 100%|██████████| 9/9 [00:00<00:00, 52283.57it/s]
 INFO:     Application startup complete.
-ERROR:    [Errno 48] error while attempting to bind on address ('127.0.0.1', 8765): address already in use
+INFO:     Uvicorn running on http://127.0.0.1:8765 (Press CTRL+C to quit)
+INFO:     127.0.0.1:58609 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58618 - "WebSocket /?session=2b519d7f-14c7-40a9-883d-77da23c1af3a" [accepted]
+INFO:     connection open
+INFO:     127.0.0.1:58626 - "WebSocket /?session=2b519d7f-14c7-40a9-883d-77da23c1af3a" [accepted]
+INFO:     connection open
+ERROR:    Exception in ASGI application
+Traceback (most recent call last):
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/.venv/lib/python3.13/site-packages/websockets/legacy/protocol.py", line 940, in transfer_data
+    message = await self.read_message()
+              ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/.venv/lib/python3.13/site-packages/websockets/legacy/protocol.py", line 1010, in read_message
+    frame = await self.read_data_frame(max_size=self.max_size)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/.venv/lib/python3.13/site-packages/websockets/legacy/protocol.py", line 1087, in read_data_frame
+    frame = await self.read_frame(max_size)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/.venv/lib/python3.13/site-packages/websockets/legacy/protocol.py", line 1144, in read_frame
+    frame = await Frame.read(
+            ^^^^^^^^^^^^^^^^^
+    ...<4 lines>...
+    )
+    ^
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/.venv/lib/python3.13/site-packages/websockets/legacy/framing.py", line 70, in read
+    data = await reader(2)
+           ^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.13/3.13.13/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/streams.py", line 767, in readexactly
+    raise exceptions.IncompleteReadError(incomplete, n)
+asyncio.exceptions.IncompleteReadError: 0 bytes read on a total of 2 expected bytes
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/.venv/lib/python3.13/site-packages/uvicorn/protocols/websockets/websockets_impl.py", line 317, in asgi_send
+    await self.send(data)  # type: ignore[arg-type]
+    ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/.venv/lib/python3.13/site-packages/websockets/legacy/protocol.py", line 618, in send
+    await self.ensure_open()
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/.venv/lib/python3.13/site-packages/websockets/legacy/protocol.py", line 916, in ensure_open
+    raise self.connection_closed_exc()
+websockets.exceptions.ConnectionClosedError: no close frame received or sent
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/.venv/lib/python3.13/site-packages/starlette/websockets.py", line 86, in send
+    await self._send(message)
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/.venv/lib/python3.13/site-packages/starlette/_exception_handler.py", line 39, in sender
+    await send(message)
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/.venv/lib/python3.13/site-packages/uvicorn/protocols/websockets/websockets_impl.py", line 330, in asgi_send
+    raise ClientDisconnected from exc
+uvicorn.protocols.utils.ClientDisconnected
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/.venv/lib/python3.13/site-packages/uvicorn/protocols/websockets/websockets_impl.py", line 239, in run_asgi
+    result = await self.app(self.scope, self.asgi_receive, self.asgi_send)  # type: ignore[func-returns-value]
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/.venv/lib/python3.13/site-packages/uvicorn/middleware/proxy_headers.py", line 60, in __call__
+    return await self.app(scope, receive, send)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/.venv/lib/python3.13/site-packages/fastapi/applications.py", line 1159, in __call__
+    await super().__call__(scope, receive, send)
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/.venv/lib/python3.13/site-packages/starlette/applications.py", line 90, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/.venv/lib/python3.13/site-packages/starlette/middleware/errors.py", line 151, in __call__
+    await self.app(scope, receive, send)
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/.venv/lib/python3.13/site-packages/starlette/middleware/cors.py", line 80, in __call__
+    await self.app(scope, receive, send)
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/.venv/lib/python3.13/site-packages/starlette/middleware/exceptions.py", line 63, in __call__
+    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/.venv/lib/python3.13/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/.venv/lib/python3.13/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/.venv/lib/python3.13/site-packages/fastapi/middleware/asyncexitstack.py", line 18, in __call__
+    await self.app(scope, receive, send)
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/.venv/lib/python3.13/site-packages/starlette/routing.py", line 660, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/.venv/lib/python3.13/site-packages/starlette/routing.py", line 680, in app
+    await route.handle(scope, receive, send)
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/.venv/lib/python3.13/site-packages/starlette/routing.py", line 350, in handle
+    await self.app(scope, receive, send)
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/.venv/lib/python3.13/site-packages/fastapi/routing.py", line 160, in app
+    await wrap_app_handling_exceptions(app, session)(scope, receive, send)
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/.venv/lib/python3.13/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/.venv/lib/python3.13/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/.venv/lib/python3.13/site-packages/fastapi/routing.py", line 157, in app
+    await func(session)
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/.venv/lib/python3.13/site-packages/fastapi/routing.py", line 764, in app
+    await dependant.call(**solved_result.values)
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/server.py", line 58, in websocket_root
+    await TranscriptionSession(
+    ...<5 lines>...
+    ).run()
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/session.py", line 337, in run
+    await self.asr_worker.add_status_listener(self._handle_worker_status)
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/parakeet_worker.py", line 181, in add_status_listener
+    await listener(self._status)
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/session.py", line 948, in _handle_worker_status
+    await self._send(
+    ...<4 lines>...
+    )
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/session.py", line 940, in _send
+    await self.websocket.send_json(payload)
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/.venv/lib/python3.13/site-packages/starlette/websockets.py", line 176, in send_json
+    await self.send({"type": "websocket.send", "text": text})
+  File "/Users/ed/Documents/GitHub/livetr3/app/backend/.venv/lib/python3.13/site-packages/starlette/websockets.py", line 89, in send
+    raise WebSocketDisconnect(code=1006)
+starlette.websockets.WebSocketDisconnect
+INFO:     connection closed
+INFO:     127.0.0.1:58627 - "WebSocket /?session=2b519d7f-14c7-40a9-883d-77da23c1af3a" [accepted]
+INFO:     connection open
+INFO:     final_commit reason=punctuation utterance_id=1 audio_seconds=1.700
+INFO:     final_commit reason=punctuation utterance_id=2 audio_seconds=1.940
+INFO:     final_commit reason=punctuation utterance_id=3 audio_seconds=1.960
+INFO:     final_commit reason=punctuation utterance_id=4 audio_seconds=1.840
+INFO:     final_commit reason=punctuation utterance_id=5 audio_seconds=1.960
+INFO:     final_commit reason=silero_end utterance_id=6 audio_seconds=1.180
+INFO:     connection closed
+INFO:     Shutting down
+INFO:     connection closed
 INFO:     Waiting for application shutdown.
 INFO:     Application shutdown complete.
-/opt/homebrew/Cellar/python@3.13/3.13.13/Frameworks/Python.framework/Versions/3.13/lib/python3.13/multiprocessing/resource_tracker.py:400: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown: {'/mp-2jfjccdv'}
-  warnings.warn(
+INFO:     Finished server process [34899]

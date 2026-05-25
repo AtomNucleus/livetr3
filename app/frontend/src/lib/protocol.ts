@@ -24,6 +24,9 @@ export interface ClientConfig {
   input_device_id?: string | null;
   input_device_label?: string | null;
   code_switching_enabled?: boolean;
+  asr_correction_enabled?: boolean;
+  bilingual_context_enabled?: boolean;
+  transcript_learning_enabled?: boolean;
   partial_interval_seconds?: number | null;
   max_utterance_seconds?: number | null;
   silero_threshold?: number | null;

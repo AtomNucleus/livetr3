@@ -19,6 +19,8 @@ declare global {
   }
 }
 
+const PROJECTOR_RECONNECT_DELAYS_MS = [250, 500, 1000, 2000, 5000];
+
 function useProjectorFontSize(sessionId: string) {
   const [fontSize, setFontSize] = useState(() => readProjectorFontSize(sessionId));
 
@@ -58,7 +60,7 @@ function useAutoFitFont(maxFontSize: number, contentKey: string) {
     let next = maxFontSize;
     node.style.setProperty("--projector-font-size", `${next}px`);
     while (
-      next > 36 &&
+      next > 24 &&
       (node.scrollHeight > node.clientHeight || node.scrollWidth > node.clientWidth)
     ) {
       next -= 2;
@@ -75,23 +77,31 @@ function ProjectorCaption({
   text,
   stableLength,
   isPartial,
+  isCurrent,
 }: {
   id: number;
   text: string;
   stableLength: number;
   isPartial: boolean;
+  isCurrent: boolean;
 }) {
   const stable = isPartial ? text.slice(0, stableLength) : text;
   const unstable = isPartial ? text.slice(stableLength) : "";
+  const opacity = isPartial ? 0.92 : isCurrent ? 1 : 0.72;
+  const scale = isCurrent ? 1 : 0.82;
 
   return (
     <p
       data-testid={`projector-caption-${id}`}
-      className="whitespace-pre-wrap break-words font-semibold leading-[1.08] text-white transition-opacity duration-[120ms]"
-      style={{ fontSize: "var(--projector-font-size)", opacity: isPartial ? 0.85 : 1 }}
+      className="max-w-[min(18ch,100%)] self-center whitespace-pre-wrap break-words text-center font-bold leading-[1.14] text-white transition-opacity duration-[90ms]"
+      style={{
+        fontSize: `calc(var(--projector-font-size) * ${scale})`,
+        opacity,
+        textShadow: "0 2px 0 rgb(0 0 0 / 0.88), 0 0 28px rgb(0 0 0 / 0.92)",
+      }}
     >
       <span style={{ opacity: 1 }}>{stable}</span>
-      {unstable ? <span style={{ opacity: 0.75 / 0.85 }}>{unstable}</span> : null}
+      {unstable ? <span style={{ opacity: 0.82 }}>{unstable}</span> : null}
     </p>
   );
 }
@@ -129,23 +139,47 @@ export default function ProjectorApp() {
       return;
     }
 
-    const wsUrl = new URL("ws://127.0.0.1:8765/");
-    wsUrl.searchParams.set("session", sessionId);
-    const ws = new WebSocket(wsUrl);
+    let closedByEffect = false;
+    let reconnectAttempt = 0;
+    let reconnectTimer: number | undefined;
+    let ws: WebSocket | undefined;
 
-    ws.onopen = () => {
-      setConnectionError(null);
-      ws.send(JSON.stringify({ type: "join_viewer" }));
-    };
-    ws.onmessage = (event) => {
-      const message = JSON.parse(event.data);
-      handleServerMessage(message);
-    };
-    ws.onerror = () => setConnectionError("Projector connection failed");
-    ws.onclose = () =>
-      setConnectionError((current) => current ?? "Projector connection closed");
+    const connect = () => {
+      const wsUrl = new URL("ws://127.0.0.1:8765/");
+      wsUrl.searchParams.set("session", sessionId);
+      ws = new WebSocket(wsUrl);
 
-    return () => ws.close();
+      ws.onopen = () => {
+        reconnectAttempt = 0;
+        setConnectionError(null);
+        ws?.send(JSON.stringify({ type: "join_viewer" }));
+      };
+      ws.onmessage = (event) => {
+        const message = JSON.parse(event.data);
+        handleServerMessage(message);
+      };
+      ws.onerror = () => {
+        setConnectionError("Projector connection failed");
+      };
+      ws.onclose = () => {
+        if (closedByEffect) return;
+        const delay =
+          PROJECTOR_RECONNECT_DELAYS_MS[
+            Math.min(reconnectAttempt, PROJECTOR_RECONNECT_DELAYS_MS.length - 1)
+          ];
+        reconnectAttempt += 1;
+        setConnectionError(`Projector reconnecting in ${Math.round(delay / 1000)}s`);
+        reconnectTimer = window.setTimeout(connect, delay);
+      };
+    };
+
+    connect();
+
+    return () => {
+      closedByEffect = true;
+      if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
+      ws?.close();
+    };
   }, [handleServerMessage, sessionId]);
 
   const statusText =
@@ -164,10 +198,10 @@ export default function ProjectorApp() {
           {statusText}
         </div>
       ) : null}
-      <div className="min-h-0 flex-1 px-10 pb-10 pt-6">
+      <div className="min-h-0 flex-1 bg-[radial-gradient(circle_at_center,rgba(39,39,42,0.44),rgba(0,0,0,1)_70%)] px-[clamp(28px,5vw,96px)] py-[clamp(26px,5vh,72px)]">
         <div
           ref={ref}
-          className="flex h-full flex-col justify-end gap-6 overflow-hidden rounded-[32px] border border-white/10 bg-white/[0.03] px-10 py-10"
+          className="flex h-full flex-col justify-end gap-[clamp(18px,3vh,42px)] overflow-hidden"
           style={
             {
               ["--projector-font-size" as string]: `${fontSize}px`,
@@ -175,18 +209,19 @@ export default function ProjectorApp() {
           }
         >
           {targetEntries.length ? (
-            targetEntries.map((entry) => (
+            targetEntries.map((entry, index) => (
               <ProjectorCaption
                 key={entry.id}
                 id={entry.id}
                 text={entry.translation}
                 stableLength={entry.stableTranslationLength}
                 isPartial={entry.state === "partial"}
+                isCurrent={index === targetEntries.length - 1}
               />
             ))
           ) : (
             <p
-              className="text-center font-semibold uppercase tracking-[0.24em] text-white/35"
+              className="text-center font-semibold uppercase tracking-[0.24em] text-white/40"
               style={{ fontSize: "calc(var(--projector-font-size) * 0.5)" }}
             >
               Waiting for live captions

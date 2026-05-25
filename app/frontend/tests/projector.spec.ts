@@ -68,9 +68,13 @@ test("projector mirrors finalized captions without console errors or clipping", 
   collectConsoleErrors(projector, consoleErrors);
 
   await operator.goto(`${frontendUrl}?test_audio_url=/__livetr3-test-audio.wav`);
+  await operator.getByTestId("settings-toggle").click();
+  await operator.getByTestId("target-language-input").selectOption("English");
   await operator.getByTestId("polish-toggle").setChecked(false);
+  await operator.getByTestId("asr-correction-toggle").setChecked(false);
+  await operator.getByTestId("settings-toggle").click();
   await operator.getByTestId("start-stop-button").click();
-  await expect(operator.getByTestId("start-stop-button")).toHaveText("Stop", { timeout: 30_000 });
+  await expect(operator.getByTestId("start-stop-button")).toHaveText(/^(End|Stop)$/, { timeout: 30_000 });
   await expect(operator.getByTestId("error-banner")).toHaveCount(0);
 
   const sessionId = await operator.getByTestId("app-shell").getAttribute("data-session-id");
@@ -123,7 +127,7 @@ async function waitForOperatorFinal(page: Page, lastId: number): Promise<FinalRe
   const handle = await page.waitForFunction(
     (id) => {
       const event = window.__livetr3LastOperatorFinalRender;
-      return event && event.id > id ? event : null;
+      return event && event.id > id && event.text.trim() ? event : null;
     },
     lastId,
     { timeout: 180_000 },

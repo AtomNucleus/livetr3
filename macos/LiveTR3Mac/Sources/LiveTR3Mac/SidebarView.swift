@@ -8,15 +8,17 @@ struct SidebarView: View {
         List(selection: $selection) {
             Section {
                 ForEach(LiveTR3Section.primary) { section in
-                    SidebarRow(section: section)
-                        .tag(section as LiveTR3Section?)
+                    NavigationLink(value: section) {
+                        SidebarRow(section: section)
+                    }
                 }
             }
 
             Section("System") {
                 ForEach(LiveTR3Section.system) { section in
-                    SidebarRow(section: section)
-                        .tag(section as LiveTR3Section?)
+                    NavigationLink(value: section) {
+                        SidebarRow(section: section)
+                    }
                 }
             }
 

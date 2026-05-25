@@ -57,6 +57,25 @@ TRANSLATE_PROMPT = (
     "with no preamble.\n\nText: {text}"
 )
 
+CONTEXTUAL_TRANSLATE_PROMPT = (
+    "Translate the following text from {src} to {tgt}. Return ONLY the translation "
+    "with no preamble.\n\n"
+    "Use these recent bilingual reference pairs only to preserve names, recurring "
+    "church terms, scripture wording, tone, and phrase choices when they clearly "
+    "apply. Do not copy a reference pair unless it matches the text being translated.\n\n"
+    "{context}\n\nText: {text}"
+)
+
+ASR_CORRECTION_PROMPT = (
+    "You will receive a finalized ASR transcript in {src}. Correct likely speech "
+    "recognition errors, punctuation, capitalization, and spacing. Preserve the "
+    "speaker's wording and meaning. Do not summarize, translate, add commentary, "
+    "or censor. Never translate the transcript; if the transcript is actually in "
+    "another language, keep that language and only fix recognition mistakes. "
+    "Use the optional context only when it plausibly matches what was "
+    "said. Return ONLY the corrected {src} transcript.\n\n{context}Transcript: {text}"
+)
+
 
 class MLXWorker:
     def __init__(self, temp_wav_root: Path | None = None) -> None:
@@ -166,11 +185,27 @@ class MLXWorker:
         )
         return out.strip()
 
-    def translate_text(self, text: str, src: str, tgt: str, max_tokens: int = 256) -> str:
+    def translate_text(
+        self,
+        text: str,
+        src: str,
+        tgt: str,
+        max_tokens: int = 256,
+        bilingual_context: list[tuple[str, str]] | None = None,
+    ) -> str:
         from mlx_vlm import generate
         from mlx_vlm.prompt_utils import apply_chat_template
 
-        prompt = TRANSLATE_PROMPT.format(text=text, src=src, tgt=tgt)
+        context = _format_bilingual_context(bilingual_context or [])
+        if context:
+            prompt = CONTEXTUAL_TRANSLATE_PROMPT.format(
+                text=text,
+                src=src,
+                tgt=tgt,
+                context=context,
+            )
+        else:
+            prompt = TRANSLATE_PROMPT.format(text=text, src=src, tgt=tgt)
         formatted = apply_chat_template(self.processor, self.config, prompt, num_audios=0)
         out = _generation_text(
             generate(
@@ -181,6 +216,62 @@ class MLXWorker:
                 temperature=1.0,
                 top_p=0.95,
                 top_k=64,
+                verbose=False,
+            )
+        )
+        return out.strip()
+
+    def correct_asr_text(
+        self,
+        text: str,
+        src: str,
+        custom_vocab: list[str] | None = None,
+        prior_context: list[tuple[str, str]] | None = None,
+        learned_corrections: list[tuple[str, str]] | None = None,
+        code_switching_enabled: bool = False,
+        max_tokens: int = 192,
+    ) -> str:
+        from mlx_vlm import generate
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        context_parts: list[str] = []
+        if custom_vocab:
+            context_parts.append(
+                "Known names, terms, or phrases: "
+                + ", ".join(item.strip() for item in custom_vocab if item.strip())
+                + "."
+            )
+        if prior_context:
+            recent = "\n".join(
+                f"- {original}" for original, _ in prior_context[-3:] if original.strip()
+            )
+            if recent:
+                context_parts.append("Recent transcript context:\n" + recent)
+        learned = _format_learned_corrections(learned_corrections or [])
+        if learned:
+            context_parts.append(
+                "Previously corrected ASR mistakes. If a similar mistake appears, "
+                "prefer the corrected wording when it plausibly matches the audio:\n"
+                + learned
+            )
+        if code_switching_enabled:
+            context_parts.append(
+                f"The speaker may code-switch while primarily speaking {src}."
+            )
+        context = "\n\n".join(context_parts)
+        if context:
+            context += "\n\n"
+        prompt = ASR_CORRECTION_PROMPT.format(text=text, src=src, context=context)
+        formatted = apply_chat_template(self.processor, self.config, prompt, num_audios=0)
+        out = _generation_text(
+            generate(
+                self.model,
+                self.processor,
+                formatted,
+                max_tokens=max_tokens,
+                temperature=0.2,
+                top_p=0.9,
+                top_k=32,
                 verbose=False,
             )
         )
@@ -207,6 +298,36 @@ def _generation_text(result: object) -> str:
     return str(result)
 
 
+def _translation_max_tokens(text: str, priority: Literal["partial", "final"]) -> int:
+    word_count = len(text.split())
+    buffer = 18 if priority == "partial" else 28
+    minimum = 32 if priority == "partial" else 48
+    maximum = 96 if priority == "partial" else 160
+    return min(maximum, max(minimum, word_count * 3 + buffer))
+
+
+def _format_bilingual_context(pairs: list[tuple[str, str]]) -> str:
+    lines: list[str] = []
+    for original, translation in pairs[-5:]:
+        original = " ".join(original.strip().split())
+        translation = " ".join(translation.strip().split())
+        if not original or not translation:
+            continue
+        lines.append(f"- Source: {original}\n  Translation: {translation}")
+    return "\n".join(lines)
+
+
+def _format_learned_corrections(pairs: list[tuple[str, str]]) -> str:
+    lines: list[str] = []
+    for heard, corrected in pairs[-8:]:
+        heard = " ".join(heard.strip().split())
+        corrected = " ".join(corrected.strip().split())
+        if not heard or not corrected or heard == corrected:
+            continue
+        lines.append(f"- Heard: {heard}\n  Corrected: {corrected}")
+    return "\n".join(lines)
+
+
 class InferenceTimeoutError(RuntimeError):
     pass
 
@@ -225,7 +346,7 @@ class WorkerStatusEvent:
 class _QueuedJob:
     priority: int
     sequence: int
-    kind: Literal["ast", "polish", "translate", "maintenance"] = field(compare=False)
+    kind: Literal["ast", "polish", "translate", "correct", "maintenance"] = field(compare=False)
     future: asyncio.Future = field(compare=False)
     payload: dict = field(compare=False)
 
@@ -245,7 +366,7 @@ class MLXWorkerService:
         self._process: mp.Process | None = None
         self._request_queue: mp.Queue | None = None
         self._response_queue: mp.Queue | None = None
-        self._active_job_kind: Literal["ast", "polish", "translate", "maintenance"] | None = None
+        self._active_job_kind: Literal["ast", "polish", "translate", "correct", "maintenance"] | None = None
         self._queued_partial_jobs: dict[int, _QueuedJob] = {}
         self._queued_partial_translation_jobs: dict[int, _QueuedJob] = {}
         self._final_utterance_ids: set[int] = set()
@@ -365,11 +486,12 @@ class MLXWorkerService:
         *,
         priority: Literal["partial", "final"] = "final",
         utterance_id: int | None = None,
+        bilingual_context: list[tuple[str, str]] | None = None,
     ) -> str | None:
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
         job = _QueuedJob(
-            priority=5 if priority == "final" else 12,
+            priority=5 if priority == "final" else 3,
             sequence=next(self._sequence),
             kind="translate",
             future=future,
@@ -379,6 +501,8 @@ class MLXWorkerService:
                 "text": text,
                 "src": src,
                 "tgt": tgt,
+                "max_tokens": _translation_max_tokens(text, priority),
+                "bilingual_context": bilingual_context or [],
             },
         )
         if utterance_id is not None:
@@ -397,6 +521,36 @@ class MLXWorkerService:
                     if not previous.future.done():
                         previous.future.set_result(None)
         await self._queue.put(job)
+        return await future
+
+    async def submit_correct_asr_text(
+        self,
+        text: str,
+        src: str,
+        *,
+        custom_vocab: list[str] | None = None,
+        prior_context: list[tuple[str, str]] | None = None,
+        learned_corrections: list[tuple[str, str]] | None = None,
+        code_switching_enabled: bool = False,
+    ) -> str:
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        await self._queue.put(
+            _QueuedJob(
+                priority=4,
+                sequence=next(self._sequence),
+                kind="correct",
+                future=future,
+                payload={
+                    "text": text,
+                    "src": src,
+                    "custom_vocab": custom_vocab or [],
+                    "prior_context": prior_context or [],
+                    "learned_corrections": learned_corrections or [],
+                    "code_switching_enabled": code_switching_enabled,
+                },
+            )
+        )
         return await future
 
     async def submit_maintenance(self) -> None:
@@ -654,6 +808,8 @@ class MLXWorkerService:
     def _job_timeout_seconds(self, job: _QueuedJob) -> float:
         if job.kind == "maintenance":
             return MAINTENANCE_TIMEOUT_SECONDS
+        if job.kind == "correct":
+            return POLISH_TIMEOUT_SECONDS
         if job.kind == "polish":
             return POLISH_TIMEOUT_SECONDS
         if job.kind == "translate":
@@ -690,6 +846,8 @@ def _worker_process_main(
                 result = worker.clear_caches()
             elif request["kind"] == "polish":
                 result = worker.polish(**request["payload"])
+            elif request["kind"] == "correct":
+                result = worker.correct_asr_text(**request["payload"])
             else:
                 result = worker.translate_text(**request["payload"])
         except Exception:

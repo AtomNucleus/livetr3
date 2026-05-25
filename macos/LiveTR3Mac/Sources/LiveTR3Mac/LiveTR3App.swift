@@ -4,7 +4,7 @@ import SwiftUI
 struct LiveTR3App: App {
     @StateObject private var runtime = LiveTR3Runtime()
     @AppStorage("LiveTR3.startsRuntimeAutomatically") private var startsRuntimeAutomatically = true
-    @Environment(\.openURL) private var openURL
+    @Environment(\.openWindow) private var openWindow
 
     var body: some Scene {
         WindowGroup {
@@ -15,9 +15,13 @@ struct LiveTR3App: App {
                     guard startsRuntimeAutomatically else { return }
                     await runtime.start()
                 }
-                .onDisappear {
-                    runtime.stop()
-                }
+        }
+        .windowStyle(.titleBar)
+
+        Window("Projector", id: "projector") {
+            ProjectorWindow()
+                .environmentObject(runtime)
+                .frame(minWidth: 960, minHeight: 540)
         }
         .windowStyle(.titleBar)
         .commands {
@@ -28,10 +32,9 @@ struct LiveTR3App: App {
                 .keyboardShortcut("r", modifiers: [.command, .shift])
 
                 Button("Open Projector") {
-                    openURL(LiveTR3Routes.projectorURL)
+                    openWindow(id: "projector")
                 }
                 .keyboardShortcut("p", modifiers: [.command, .shift])
-                .disabled(runtime.state != .ready)
             }
         }
 
