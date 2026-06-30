@@ -2,6 +2,8 @@ import SwiftUI
 
 struct OperatorWorkspace: View {
     @EnvironmentObject private var runtime: LiveTR3Runtime
+    @EnvironmentObject private var session: SessionController
+    @EnvironmentObject private var sessionManager: SessionManager
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -13,9 +15,11 @@ struct OperatorWorkspace: View {
 
             Group {
                 if runtime.state == .ready {
-                    WebOperatorView(url: runtime.operatorURL, reloadToken: runtime.webReloadToken) {
-                        openWindow(id: "projector")
-                    }
+                    NativeOperatorView(
+                        session: session,
+                        sessionManager: sessionManager,
+                        onOpenProjector: openProjector
+                    )
                 } else {
                     RuntimeOverlay(state: runtime.state, message: runtime.statusMessage)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -24,6 +28,10 @@ struct OperatorWorkspace: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .background(.background)
+    }
+
+    private func openProjector() {
+        openWindow(id: LiveTR3WindowID.projector)
     }
 }
 
@@ -43,7 +51,7 @@ private struct OperatorStatusBar: View {
 
             Spacer(minLength: 16)
 
-            Text(runtime.operatorURL.host(percentEncoded: false) ?? "127.0.0.1")
+            Text("ws://127.0.0.1:8765")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 

@@ -2,6 +2,8 @@ import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject private var runtime: LiveTR3Runtime
+    @EnvironmentObject private var sessionManager: SessionManager
+    @EnvironmentObject private var sessionController: SessionController
     @SceneStorage("LiveTR3.selectedSection") private var selectedSectionRaw = LiveTR3Section.operatorPanel.rawValue
 
     private var selectedSection: LiveTR3Section {
@@ -26,6 +28,8 @@ struct ContentView: View {
         } detail: {
             DetailRoot(selection: selectedSection)
                 .environmentObject(runtime)
+                .environmentObject(sessionManager)
+                .environmentObject(sessionController)
         }
         .navigationSplitViewStyle(.balanced)
         .toolbar {

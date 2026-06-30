@@ -20,7 +20,7 @@ struct SettingsView: View {
                     Toggle(isOn: $startsRuntimeAutomatically) {
                         SettingLabel(
                             title: "Start Local Runtime",
-                            detail: "Launch the backend and operator UI when LiveTR3 opens."
+                            detail: "Launch the backend when LiveTR3 opens."
                         )
                     }
                 } header: {

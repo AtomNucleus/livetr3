@@ -1,8 +1,9 @@
 import Foundation
 
-enum LiveTR3Routes {
-    private static let nativeSessionID = "native"
+enum LiveTR3WindowID {
+    static let projector = "projector"
+}
 
-    static let operatorURL = URL(string: "http://127.0.0.1:5173/?session=\(nativeSessionID)")!
-    static let projectorURL = URL(string: "http://127.0.0.1:5173/projector?session=\(nativeSessionID)")!
+enum LiveTR3Routes {
+    static let backendHealth = URL(string: "http://127.0.0.1:8765/health")!
 }
