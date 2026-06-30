@@ -15,7 +15,7 @@ struct RuntimeWorkspace: View {
 
                 HStack(spacing: 12) {
                     RuntimeMetric(title: "Backend", value: "8765", detail: runtime.state == .ready ? "Healthy" : runtime.state.label)
-                    RuntimeMetric(title: "Operator UI", value: "5173", detail: runtime.state == .ready ? "Serving" : "Waiting")
+                    RuntimeMetric(title: "Operator UI", value: "Native", detail: runtime.state == .ready ? "SwiftUI" : "Waiting")
                     RuntimeMetric(title: "Engine", value: "Parakeet", detail: "Local speech")
                 }
 
@@ -25,7 +25,7 @@ struct RuntimeWorkspace: View {
                             .font(.headline)
                         Text("Backend: http://127.0.0.1:8765")
                             .textSelection(.enabled)
-                        Text("Operator: http://127.0.0.1:5173")
+                        Text("WebSocket: ws://127.0.0.1:8765")
                             .textSelection(.enabled)
                     }
                     .font(.callout.monospaced())

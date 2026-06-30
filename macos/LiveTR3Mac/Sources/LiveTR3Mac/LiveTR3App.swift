@@ -3,13 +3,23 @@ import SwiftUI
 @main
 struct LiveTR3App: App {
     @StateObject private var runtime = LiveTR3Runtime()
+    @StateObject private var sessionManager: SessionManager
+    @StateObject private var sessionController: SessionController
     @AppStorage("LiveTR3.startsRuntimeAutomatically") private var startsRuntimeAutomatically = true
-    @Environment(\.openURL) private var openURL
+    @Environment(\.openWindow) private var openWindow
+
+    init() {
+        let manager = SessionManager()
+        _sessionManager = StateObject(wrappedValue: manager)
+        _sessionController = StateObject(wrappedValue: SessionController(sessionManager: manager))
+    }
 
     var body: some Scene {
         WindowGroup {
             ContentView()
                 .environmentObject(runtime)
+                .environmentObject(sessionManager)
+                .environmentObject(sessionController)
                 .frame(minWidth: 1120, minHeight: 760)
                 .task {
                     guard startsRuntimeAutomatically else { return }
@@ -28,12 +38,18 @@ struct LiveTR3App: App {
                 .keyboardShortcut("r", modifiers: [.command, .shift])
 
                 Button("Open Projector") {
-                    openURL(LiveTR3Routes.projectorURL)
+                    openWindow(id: LiveTR3WindowID.projector)
                 }
                 .keyboardShortcut("p", modifiers: [.command, .shift])
                 .disabled(runtime.state != .ready)
             }
         }
+
+        Window("Projector", id: LiveTR3WindowID.projector) {
+            ProjectorWindowRoot()
+                .environmentObject(sessionManager)
+        }
+        .defaultSize(width: 1440, height: 900)
 
         Settings {
             SettingsView()

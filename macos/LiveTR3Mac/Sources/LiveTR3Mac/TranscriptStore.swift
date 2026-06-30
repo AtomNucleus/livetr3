@@ -1,0 +1,72 @@
+import Foundation
+
+@MainActor
+final class TranscriptStore: ObservableObject {
+    @Published private(set) var entries: [TranscriptUtterance] = []
+    @Published private(set) var lastError: String?
+    @Published private(set) var partialTickAt: Date?
+    @Published private(set) var workerStatus: (state: WorkerState, message: String)?
+
+    func handle(_ message: LiveTR3ServerMessage) {
+        switch message {
+        case .error(let message):
+            lastError = message
+        case .status(let state, let message):
+            workerStatus = (state, message)
+            if state == .ready {
+                lastError = nil
+            }
+        case .speechStart(let utteranceID):
+            guard !entries.contains(where: { $0.id == utteranceID }) else { return }
+            entries.append(
+                TranscriptUtterance(
+                    id: utteranceID,
+                    original: "",
+                    translation: "",
+                    state: .partial,
+                    stableOriginalLength: 0,
+                    stableTranslationLength: 0,
+                    startedAt: Date()
+                )
+            )
+        case .level:
+            break
+        case .caption(let type, let utteranceID, let original, let translation):
+            if type == .partial {
+                partialTickAt = Date()
+            }
+
+            let existing = entries.first(where: { $0.id == utteranceID })
+            let previousOriginal = existing?.original ?? ""
+            let previousTranslation = existing?.translation ?? ""
+
+            let updated = TranscriptUtterance(
+                id: utteranceID,
+                original: original,
+                translation: translation,
+                state: type,
+                stableOriginalLength: type == .partial
+                    ? longestCommonPrefixLength(previousOriginal, original)
+                    : original.count,
+                stableTranslationLength: type == .partial
+                    ? longestCommonPrefixLength(previousTranslation, translation)
+                    : translation.count,
+                startedAt: existing?.startedAt ?? Date(),
+                endedAt: type == .partial ? existing?.endedAt : Date()
+            )
+
+            if let index = entries.firstIndex(where: { $0.id == utteranceID }) {
+                entries[index] = updated
+            } else {
+                entries.append(updated)
+            }
+        }
+    }
+
+    func clear() {
+        entries = []
+        lastError = nil
+        workerStatus = nil
+        partialTickAt = nil
+    }
+}

@@ -23,17 +23,13 @@ stop_repo_process_on_port() {
     [[ -n "$pid" ]] || continue
     local command
     command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
-    if [[ "$command" == *"$ROOT"* ]] || [[ "$command" == *"server:app --host 127.0.0.1 --port 8765"* ]] || [[ "$command" == *"http.server 5173"* ]]; then
+    if [[ "$command" == *"$ROOT"* ]] || [[ "$command" == *"server:app --host 127.0.0.1 --port 8765"* ]]; then
       kill "$pid" >/dev/null 2>&1 || true
     fi
   done <<< "$pids"
 }
 
 stop_repo_process_on_port 8765
-stop_repo_process_on_port 5173
-
-cd "$ROOT/app/frontend"
-npm run build
 
 cd "$PACKAGE_DIR"
 swift build -c debug
