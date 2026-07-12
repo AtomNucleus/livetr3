@@ -23,8 +23,8 @@ struct WaveformMeterView: View {
 
     private func barColor(for index: Int, level: Float) -> Color {
         if index == levels.count - 1 {
-            return Color(red: 0.45, green: 0.95, blue: 0.78)
+            return .accentColor
         }
-        return Color.white.opacity(0.18 + Double(min(level, 1)) * 0.35)
+        return Color.secondary.opacity(0.4 + Double(min(level, 1)) * 0.4)
     }
 }

@@ -12,14 +12,14 @@ struct DualPaneView: View {
                 field: .original,
                 layoutDirection: isRtlLanguage(sourceLanguage) ? .rightToLeft : .leftToRight
             )
-            Divider().overlay(Color.white.opacity(0.08))
+            Divider()
             transcriptPane(
                 title: targetLanguage,
                 field: .translation,
                 layoutDirection: isRtlLanguage(targetLanguage) ? .rightToLeft : .leftToRight
             )
         }
-        .background(Color(red: 0.07, green: 0.07, blue: 0.08))
+        .background(.background)
     }
 
     @ViewBuilder
@@ -37,12 +37,12 @@ struct DualPaneView: View {
             }
             .padding(.horizontal, 20)
             .padding(.vertical, 10)
-            .background(Color(red: 0.1, green: 0.1, blue: 0.11))
+            .background(.bar)
 
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 2) {
-                        ForEach(entries) { entry in
+                        ForEach(entries.filter { !field.text(from: $0).isEmpty }) { entry in
                             TranscriptLineView(
                                 entry: entry,
                                 field: field,
@@ -62,6 +62,11 @@ struct DualPaneView: View {
                     }
                 }
                 .onChange(of: entries.last?.translation) { _, _ in
+                    if let last = entries.last {
+                        proxy.scrollTo(last.id, anchor: .bottom)
+                    }
+                }
+                .onChange(of: entries.last?.original) { _, _ in
                     if let last = entries.last {
                         proxy.scrollTo(last.id, anchor: .bottom)
                     }

@@ -19,23 +19,26 @@ final class SessionController: ObservableObject {
     let transcript = TranscriptStore()
 
     private let sessionManager: SessionManager
-    private let webSocket = LiveTR3WebSocket()
+    private let runtime: LiveTR3Runtime
+    private let engine: CaptionEngine
     private let audio = AudioCaptureEngine()
 
     private var manualStop = false
     private var reconnectAttempt = 0
     private var reconnectTask: Task<Void, Never>?
 
-    init(sessionManager: SessionManager) {
+    init(sessionManager: SessionManager, runtime: LiveTR3Runtime) {
         self.sessionManager = sessionManager
+        self.runtime = runtime
+        self.engine = Self.makeEngine()
         self.config = Self.loadConfig()
 
-        webSocket.onMessage = { [weak self] message in
+        engine.onMessage = { [weak self] message in
             Task { @MainActor in
                 self?.handleServerMessage(message)
             }
         }
-        webSocket.onDisconnect = { [weak self] in
+        engine.onDisconnect = { [weak self] in
             Task { @MainActor in
                 self?.handleDisconnect()
             }
@@ -70,11 +73,11 @@ final class SessionController: ObservableObject {
     }
 
     func commitNow() {
-        webSocket.sendJSON(["type": "commit_now"])
+        engine.sendJSON(["type": "commit_now"])
     }
 
     func skipNextPolish() {
-        webSocket.sendJSON(["type": "skip_polish"])
+        engine.sendJSON(["type": "skip_polish"])
     }
 
     func swapDirection() {
@@ -93,7 +96,12 @@ final class SessionController: ObservableObject {
             max_utterance_seconds: config.max_utterance_seconds,
             silero_threshold: config.silero_threshold,
             speech_pad_ms: config.speech_pad_ms,
-            min_silence_ms: config.min_silence_ms
+            min_silence_ms: config.min_silence_ms,
+            early_commit_enabled: config.early_commit_enabled,
+            early_commit_min_seconds: config.early_commit_min_seconds,
+            early_commit_punctuation: config.early_commit_punctuation,
+            early_commit_stability: config.early_commit_stability,
+            stability_window: config.stability_window
         )
         persistConfig()
         if status == .running {
@@ -135,11 +143,13 @@ final class SessionController: ObservableObject {
 
         do {
             try await requestMicrophoneAccess()
+            try await ensureRuntimeReady()
+            try await connectEngine(mode: .start)
             try audio.start(
                 deviceID: selectedDeviceID.nilIfEmpty,
                 onFrame: { [weak self] data in
                     Task { @MainActor in
-                        self?.webSocket.sendBinary(data)
+                        self?.engine.sendBinary(data)
                     }
                 },
                 onLevel: { [weak self] rms in
@@ -148,9 +158,8 @@ final class SessionController: ObservableObject {
                     }
                 }
             )
-            try await connectSocket(mode: .start)
             sendConfig(applyTarget: "immediate")
-            webSocket.sendJSON(["type": "start"])
+            engine.sendJSON(["type": "start"])
             reconnectAttempt = 0
             status = .running
             paused = false
@@ -165,15 +174,15 @@ final class SessionController: ObservableObject {
         manualStop = true
         reconnectTask?.cancel()
         reconnectTask = nil
-        webSocket.sendJSON(["type": "stop"])
-        webSocket.disconnect()
+        engine.sendJSON(["type": "stop"])
+        engine.disconnect()
         audio.stop()
         paused = false
         status = .idle
     }
 
-    private func connectSocket(mode: WebSocketConnectionMode) async throws {
-        try await webSocket.connect(sessionID: sessionManager.sessionID, mode: mode)
+    private func connectEngine(mode: CaptionEngineConnectionMode) async throws {
+        try await engine.connect(sessionID: sessionManager.sessionID, mode: mode)
         if mode == .resume {
             sendConfig(applyTarget: "immediate")
         }
@@ -185,7 +194,7 @@ final class SessionController: ObservableObject {
         live.apply_target = applyTarget
         live.input_device_id = selectedDeviceID.nilIfEmpty
         live.input_device_label = selectedDeviceLabel
-        webSocket.sendConfig(live)
+        engine.sendConfig(live)
     }
 
     private func handleServerMessage(_ message: LiveTR3ServerMessage) {
@@ -204,7 +213,7 @@ final class SessionController: ObservableObject {
             return
         }
         status = .connecting
-        error = "Backend connection lost. Reconnecting..."
+        error = "Local engine connection interrupted. Reconnecting to local engine..."
         scheduleReconnect()
     }
 
@@ -216,7 +225,7 @@ final class SessionController: ObservableObject {
             try? await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000)
             guard let self, !Task.isCancelled, !self.manualStop else { return }
             do {
-                try await self.connectSocket(mode: .resume)
+                try await self.connectEngine(mode: .resume)
                 self.reconnectAttempt = 0
                 self.status = .running
                 self.error = nil
@@ -252,6 +261,36 @@ final class SessionController: ObservableObject {
         }
     }
 
+    private func ensureRuntimeReady() async throws {
+        switch runtime.state {
+        case .ready:
+            return
+        case .idle, .failed:
+            await runtime.start()
+        case .starting:
+            break
+        }
+
+        for _ in 0..<80 {
+            if runtime.state == .ready {
+                return
+            }
+            if runtime.state == .failed {
+                throw LiveTR3SessionError(message: runtime.statusMessage)
+            }
+            try await Task.sleep(nanoseconds: 250_000_000)
+        }
+
+        throw LiveTR3SessionError(message: "Local engine did not become ready.")
+    }
+
+    private static func makeEngine() -> CaptionEngine {
+        if ProcessInfo.processInfo.environment["LIVETR3_DEBUG_WEBSOCKET"] == "1" {
+            return LiveTR3WebSocket()
+        }
+        return LocalEngineConnection()
+    }
+
     private func persistConfig() {
         if let data = try? JSONEncoder().encode(config) {
             UserDefaults.standard.set(data, forKey: "LiveTR3.clientConfig")
@@ -263,7 +302,30 @@ final class SessionController: ObservableObject {
               let config = try? JSONDecoder().decode(ClientConfig.self, from: data) else {
             return .default
         }
-        return config
+        return optimizedConfig(config)
+    }
+
+    private static func optimizedConfig(_ config: ClientConfig) -> ClientConfig {
+        var next = config
+        if next.partial_interval_seconds == nil
+            || next.partial_interval_seconds == 0.75
+            || next.partial_interval_seconds == 0.45 {
+            next.partial_interval_seconds = 0.25
+        }
+        next.early_commit_enabled = false
+        if next.early_commit_min_seconds == nil {
+            next.early_commit_min_seconds = 1.0
+        }
+        if next.early_commit_punctuation == nil {
+            next.early_commit_punctuation = true
+        }
+        if next.early_commit_stability == nil {
+            next.early_commit_stability = true
+        }
+        if next.stability_window == nil {
+            next.stability_window = 2
+        }
+        return next
     }
 }
 
@@ -273,11 +335,14 @@ final class ProjectorConnection: ObservableObject {
     let transcript = TranscriptStore()
 
     private let sessionID: String
-    private let webSocket = LiveTR3WebSocket()
+    private let engine: CaptionEngine
 
     init(sessionID: String) {
         self.sessionID = sessionID
-        webSocket.onMessage = { [weak self] message in
+        self.engine = ProcessInfo.processInfo.environment["LIVETR3_DEBUG_WEBSOCKET"] == "1"
+            ? LiveTR3WebSocket()
+            : LocalEngineConnection()
+        engine.onMessage = { [weak self] message in
             Task { @MainActor in
                 self?.transcript.handle(message)
                 if case .error(let message) = message {
@@ -285,9 +350,9 @@ final class ProjectorConnection: ObservableObject {
                 }
             }
         }
-        webSocket.onDisconnect = { [weak self] in
+        engine.onDisconnect = { [weak self] in
             Task { @MainActor in
-                self?.connectionError = self?.connectionError ?? "Projector connection closed"
+                self?.connectionError = self?.connectionError ?? "Projector local engine connection closed"
             }
         }
     }
@@ -295,16 +360,16 @@ final class ProjectorConnection: ObservableObject {
     func connect() {
         Task {
             do {
-                try await webSocket.connect(sessionID: sessionID, mode: .viewer)
+                try await engine.connect(sessionID: sessionID, mode: .viewer)
                 connectionError = nil
             } catch {
-                connectionError = "Projector connection failed"
+                connectionError = "Projector local engine connection failed"
             }
         }
     }
 
     func disconnect() {
-        webSocket.disconnect()
+        engine.disconnect()
     }
 }
 

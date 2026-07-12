@@ -8,24 +8,22 @@ struct RuntimeWorkspace: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 SectionHero(
-                    title: "Runtime",
+                    title: "Local Engine",
                     subtitle: runtime.statusMessage,
                     symbolName: runtime.state.symbolName
                 )
 
                 HStack(spacing: 12) {
-                    RuntimeMetric(title: "Backend", value: "8765", detail: runtime.state == .ready ? "Healthy" : runtime.state.label)
+                    RuntimeMetric(title: "Transport", value: "UDS", detail: runtime.state == .ready ? "Ready" : runtime.state.label)
                     RuntimeMetric(title: "Operator UI", value: "Native", detail: runtime.state == .ready ? "SwiftUI" : "Waiting")
-                    RuntimeMetric(title: "Engine", value: "Parakeet", detail: "Local speech")
+                    RuntimeMetric(title: "Engine", value: "Gemma", detail: "Local speech")
                 }
 
                 if showsAdvancedRuntimeDetails {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Local Endpoints")
+                        Text("Local Engine IPC")
                             .font(.headline)
-                        Text("Backend: http://127.0.0.1:8765")
-                            .textSelection(.enabled)
-                        Text("WebSocket: ws://127.0.0.1:8765")
+                        Text("Unix socket: \(LiveTR3Runtime.engineSocketPath.path)")
                             .textSelection(.enabled)
                     }
                     .font(.callout.monospaced())
@@ -38,7 +36,7 @@ struct RuntimeWorkspace: View {
                 Button {
                     Task { await runtime.restart() }
                 } label: {
-                    Label("Restart local runtime", systemImage: "arrow.clockwise")
+                    Label("Restart Local Engine", systemImage: "arrow.clockwise")
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(runtime.state == .starting)

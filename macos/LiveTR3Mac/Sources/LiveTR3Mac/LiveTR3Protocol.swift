@@ -31,6 +31,11 @@ struct ClientConfig: Codable, Equatable {
     var silero_threshold: Double?
     var speech_pad_ms: Double?
     var min_silence_ms: Double?
+    var early_commit_enabled: Bool?
+    var early_commit_min_seconds: Double?
+    var early_commit_punctuation: Bool?
+    var early_commit_stability: Bool?
+    var stability_window: Int?
 
     static let `default` = ClientConfig(
         source_lang: LiveTR3Language.english.rawValue,
@@ -38,11 +43,16 @@ struct ClientConfig: Codable, Equatable {
         custom_vocab: [],
         polish_enabled: false,
         code_switching_enabled: false,
-        partial_interval_seconds: 0.75,
+        partial_interval_seconds: 0.25,
         max_utterance_seconds: 12,
         silero_threshold: 0.5,
         speech_pad_ms: 300,
-        min_silence_ms: 150
+        min_silence_ms: 150,
+        early_commit_enabled: false,
+        early_commit_min_seconds: 1.0,
+        early_commit_punctuation: true,
+        early_commit_stability: true,
+        stability_window: 2
     )
 }
 

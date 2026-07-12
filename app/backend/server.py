@@ -6,12 +6,12 @@ import os
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 
-from mlx_worker import MLXWorkerService
+from mlx_worker import MLXWorkerService, MODEL_PATH
 from parakeet_worker import PARAKEET_MODEL, ParakeetASRService
 from session import SessionHub, TranscriptionSession
 
 
-TRANSCRIPTION_ENGINE = os.getenv("TRANSCRIPTION_ENGINE", "parakeet").lower()
+TRANSCRIPTION_ENGINE = os.getenv("TRANSCRIPTION_ENGINE", "gemma").lower()
 worker = MLXWorkerService()
 asr_worker = ParakeetASRService() if TRANSCRIPTION_ENGINE == "parakeet" else None
 hub = SessionHub()
@@ -48,7 +48,7 @@ async def health() -> dict:
         "transcription_engine": TRANSCRIPTION_ENGINE,
         "asr_model": PARAKEET_MODEL if asr_worker is not None else None,
         "asr_state": asr_worker.status.state if asr_worker is not None else None,
-        "translation_model": "mlx-community/gemma-4-e4b-it-8bit",
+        "translation_model": MODEL_PATH,
         "translation_state": "lazy" if TRANSCRIPTION_ENGINE == "parakeet" else "ready",
     }
 

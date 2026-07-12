@@ -9,30 +9,18 @@ struct OperatorHeaderView: View {
     @State private var partialPulseActive = false
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(alignment: .center, spacing: 16) {
-                statusColumn
-                Spacer(minLength: 12)
-                waveformColumn
-                Spacer(minLength: 12)
-                controlsColumn
-            }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 12)
-
-            if settingsOpen {
-                OperatorSettingsPanel(
-                    session: session,
-                    sessionManager: sessionManager,
-                    onOpenProjector: onOpenProjector
-                )
-                .padding(.horizontal, 20)
-                .padding(.bottom, 16)
-            }
+        HStack(alignment: .center, spacing: 16) {
+            statusColumn
+            Spacer(minLength: 12)
+            waveformColumn
+            Spacer(minLength: 12)
+            controlsColumn
         }
-        .background(Color(red: 0.1, green: 0.1, blue: 0.11))
+        .padding(.horizontal, 20)
+        .padding(.vertical, 12)
+        .background(.bar)
         .overlay(alignment: .bottom) {
-            Divider().overlay(Color.white.opacity(0.08))
+            Divider()
         }
         .onChange(of: session.transcript.partialTickAt) { _, tick in
             guard tick != nil else { return }
@@ -45,24 +33,18 @@ struct OperatorHeaderView: View {
     }
 
     private var statusColumn: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Operator")
-                .font(.caption.weight(.semibold))
+        HStack(spacing: 8) {
+            Circle()
+                .fill(statusColor)
+                .frame(width: 10, height: 10)
+            Text(statusLabel)
+                .font(.subheadline.weight(.semibold))
+            Text("/")
+                .foregroundStyle(.tertiary)
+            Text("\(session.config.source_lang) to \(session.config.target_lang)")
+                .font(.subheadline)
                 .foregroundStyle(.secondary)
-                .textCase(.uppercase)
-            HStack(spacing: 8) {
-                Circle()
-                    .fill(statusColor)
-                    .frame(width: 10, height: 10)
-                Text(statusLabel)
-                    .font(.subheadline.weight(.semibold))
-                Text("/")
-                    .foregroundStyle(.tertiary)
-                Text("\(session.config.source_lang) to \(session.config.target_lang)")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
+                .lineLimit(1)
         }
         .frame(minWidth: 220, alignment: .leading)
     }
@@ -72,7 +54,7 @@ struct OperatorHeaderView: View {
             WaveformMeterView(levels: session.levels, rms: session.levels.last ?? 0)
             HStack(spacing: 6) {
                 Circle()
-                    .fill(Color(red: 0.45, green: 0.95, blue: 0.78))
+                    .fill(Color.green)
                     .frame(width: 10, height: 10)
                     .opacity(partialPulseActive ? 1 : 0.2)
                 Text("Partials")
@@ -91,18 +73,26 @@ struct OperatorHeaderView: View {
                     .frame(minWidth: 72)
             }
             .buttonStyle(.borderedProminent)
-            .tint(Color(red: 0.45, green: 0.95, blue: 0.78))
-            .foregroundStyle(.black)
             .disabled(session.status == .connecting)
 
             Button(session.paused ? "Resume" : "Pause", action: session.pauseResume)
                 .buttonStyle(.bordered)
                 .disabled(session.status != .running)
 
-            Button("Settings") {
+            Button {
                 settingsOpen.toggle()
+            } label: {
+                Label("Controls", systemImage: "slider.horizontal.3")
             }
             .buttonStyle(.bordered)
+            .popover(isPresented: $settingsOpen, arrowEdge: .bottom) {
+                OperatorSettingsPanel(
+                    session: session,
+                    sessionManager: sessionManager,
+                    onOpenProjector: onOpenProjector
+                )
+                .frame(width: 560)
+            }
         }
     }
 
@@ -116,7 +106,7 @@ struct OperatorHeaderView: View {
 
     private var statusColor: Color {
         switch session.status {
-        case .running: Color(red: 0.45, green: 0.95, blue: 0.78)
+        case .running: .green
         case .connecting: .yellow
         case .idle: .gray
         }
@@ -141,7 +131,6 @@ struct OperatorSettingsPanel: View {
             advancedSection
         }
         .padding(16)
-        .liveGlassSurface(cornerRadius: 14)
         .onAppear {
             customVocabText = session.config.custom_vocab.joined(separator: ", ")
         }
@@ -291,7 +280,7 @@ struct OperatorSettingsPanel: View {
         }
         .padding(.bottom, 4)
         .overlay(alignment: .bottom) {
-            Divider().overlay(Color.white.opacity(0.06))
+            Divider()
         }
     }
 

@@ -7,7 +7,7 @@ enum WebSocketConnectionMode {
 }
 
 @MainActor
-final class LiveTR3WebSocket: NSObject {
+final class LiveTR3WebSocket: NSObject, CaptionEngine {
     var onMessage: ((LiveTR3ServerMessage) -> Void)?
     var onDisconnect: (() -> Void)?
 
@@ -15,7 +15,7 @@ final class LiveTR3WebSocket: NSObject {
     private let session = URLSession(configuration: .default)
     private var receiveTask: Task<Void, Never>?
 
-    func connect(sessionID: String, mode: WebSocketConnectionMode) async throws {
+    func connect(sessionID: String, mode: CaptionEngineConnectionMode) async throws {
         disconnect()
 
         var components = URLComponents()
@@ -32,16 +32,6 @@ final class LiveTR3WebSocket: NSObject {
         let task = session.webSocketTask(with: url)
         self.task = task
         task.resume()
-
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            task.sendPing { error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume()
-                }
-            }
-        }
 
         startReceiveLoop()
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from difflib import SequenceMatcher
 import json
 import logging
 import os
@@ -14,9 +15,7 @@ from typing import Literal
 from uuid import uuid4
 
 import numpy as np
-from fastapi import WebSocket
-
-from mlx_worker import MLXWorkerService, WorkerStatusEvent
+from mlx_worker import InferenceTimeoutError, MLXWorkerService, WorkerStatusEvent
 from parakeet_worker import ASRResult, ParakeetASRService
 from protocol import (
     ConfigMessage,
@@ -28,6 +27,7 @@ from protocol import (
     parse_control_message,
 )
 from segmenter import FRAME_SAMPLES, RMSGate, make_segmenter
+from transport import SessionTransport
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -47,7 +47,7 @@ LEARNING_PROFILE_PATH = (
 MAX_LEARNED_ASR_CORRECTIONS = max(
     8, int(os.getenv("MAX_LEARNED_ASR_CORRECTIONS", "64"))
 )
-PARTIAL_INTERVAL_MIN_SECONDS = 0.3
+PARTIAL_INTERVAL_MIN_SECONDS = 0.2
 PARTIAL_INTERVAL_MAX_SECONDS = 3.0
 SOURCE_END_PUNCTUATION = ".?!"
 TRAILING_PUNCTUATION_QUOTES = " \t\r\n\"'“”‘’)]}"
@@ -74,7 +74,7 @@ DEFAULT_EARLY_COMMIT_ENABLED = os.getenv("EARLY_COMMIT_ENABLED", "false").lower(
     "off",
 }
 DEFAULT_EARLY_COMMIT_MIN_SECONDS = max(
-    0.0, float(os.getenv("EARLY_COMMIT_MIN_SECONDS", "1.5"))
+    0.0, float(os.getenv("EARLY_COMMIT_MIN_SECONDS", "1.0"))
 )
 DEFAULT_EARLY_COMMIT_PUNCTUATION = os.getenv(
     "EARLY_COMMIT_PUNCTUATION", "true"
@@ -95,10 +95,14 @@ DEFAULT_PRIOR_CONTEXT_ENABLED = os.getenv(
     "off",
 }
 DEFAULT_PARTIAL_MIN_AUDIO_SECONDS = max(
-    0.0, float(os.getenv("PARTIAL_MIN_AUDIO_SECONDS", "0.5"))
+    0.0, float(os.getenv("PARTIAL_MIN_AUDIO_SECONDS", "0.25"))
 )
 DEFAULT_PARTIAL_MIN_NEW_SPEECH_SECONDS = max(
-    0.1, float(os.getenv("PARTIAL_MIN_NEW_SPEECH_SECONDS", "0.45"))
+    0.1, float(os.getenv("PARTIAL_MIN_NEW_SPEECH_SECONDS", "0.20"))
+)
+DEFAULT_PARTIAL_MAX_AUDIO_SECONDS = max(
+    DEFAULT_PARTIAL_MIN_AUDIO_SECONDS,
+    float(os.getenv("PARTIAL_MAX_AUDIO_SECONDS", "1.2")),
 )
 DEFAULT_PARTIAL_AST_ENABLED = os.getenv("PARTIAL_AST_ENABLED", "true").lower() not in {
     "0",
@@ -152,6 +156,46 @@ def _normalize_stability_text(text: str) -> str:
 def _normalize_learned_text(text: str) -> str:
     text = re.sub(r"[^\w\s]", "", text, flags=re.UNICODE)
     return " ".join(text.lower().split())
+
+
+def _merge_partial_text(previous: str, incoming: str) -> str:
+    previous = " ".join(previous.split())
+    incoming = " ".join(incoming.split())
+    if not previous:
+        return incoming
+    if not incoming:
+        return previous
+
+    normalized_previous = _normalize_learned_text(previous)
+    normalized_incoming = _normalize_learned_text(incoming)
+    if not normalized_previous:
+        return incoming
+    if not normalized_incoming:
+        return previous
+    if normalized_incoming in normalized_previous:
+        return previous
+    if normalized_previous in normalized_incoming:
+        return incoming
+
+    previous_words = previous.split()
+    incoming_words = incoming.split()
+    normalized_previous_words = [_normalize_learned_text(word) for word in previous_words]
+    normalized_incoming_words = [_normalize_learned_text(word) for word in incoming_words]
+    max_overlap = min(len(previous_words), len(incoming_words), 12)
+    for overlap in range(max_overlap, 0, -1):
+        if normalized_previous_words[-overlap:] == normalized_incoming_words[:overlap]:
+            return " ".join(previous_words + incoming_words[overlap:])
+
+    if SequenceMatcher(None, normalized_previous, normalized_incoming).ratio() >= 0.86:
+        return incoming if len(incoming) > len(previous) else previous
+    return f"{previous} {incoming}"
+
+
+def _tail_audio(audio: np.ndarray, max_seconds: float) -> np.ndarray:
+    max_samples = max(FRAME_SAMPLES, int(max_seconds * 16_000))
+    if audio.shape[0] <= max_samples:
+        return audio
+    return audio[-max_samples:]
 
 
 SPANISH_HINT_WORDS = {
@@ -274,15 +318,15 @@ def _bounded_partial_interval_seconds(value: float, *, source: str) -> float:
 
 
 def _load_default_partial_interval_seconds() -> float:
-    raw_value = os.getenv("PARTIAL_INTERVAL_SECONDS", "0.75")
+    raw_value = os.getenv("PARTIAL_INTERVAL_SECONDS", "0.25")
     try:
         value = float(raw_value)
     except ValueError:
         logger.warning(
-            "PARTIAL_INTERVAL_SECONDS=%r is not a float; using default 0.750s",
+            "PARTIAL_INTERVAL_SECONDS=%r is not a float; using default 0.250s",
             raw_value,
         )
-        return 0.75
+        return 0.25
     return _bounded_partial_interval_seconds(value, source="PARTIAL_INTERVAL_SECONDS")
 
 
@@ -372,6 +416,19 @@ class SessionHub:
             room = self._rooms.setdefault(session_id, SharedSessionRoom(session_id=session_id))
             room.producer = session
 
+    async def begin_producer_run(self, session_id: str) -> int:
+        async with self._lock:
+            room = self._rooms.setdefault(session_id, SharedSessionRoom(session_id=session_id))
+            highest_utterance_id = max(room.transcript_state.keys(), default=0)
+            if room.saved_state is not None:
+                highest_utterance_id = max(
+                    highest_utterance_id,
+                    int(room.saved_state.get("utterance_id", 0)),
+                )
+            room.transcript_state.clear()
+            room.saved_state = None
+            return highest_utterance_id
+
     async def attach_viewer(self, session_id: str, session: TranscriptionSession) -> list[dict]:
         async with self._lock:
             room = self._rooms.setdefault(session_id, SharedSessionRoom(session_id=session_id))
@@ -413,11 +470,15 @@ class SessionHub:
                 return None
             return room.saved_state.copy() if room.saved_state is not None else None
 
+    async def active_producer_count(self) -> int:
+        async with self._lock:
+            return sum(1 for room in self._rooms.values() if room.producer is not None)
+
 
 class TranscriptionSession:
     def __init__(
         self,
-        websocket: WebSocket,
+        websocket: SessionTransport,
         worker: MLXWorkerService,
         hub: SessionHub,
         *,
@@ -523,9 +584,12 @@ class TranscriptionSession:
             return
 
         if msg.type == "start":
+            highest_utterance_id = await self.hub.begin_producer_run(self.session_id)
             self._begin_archive()
             self.state.running = True
+            self.state.utterance_id = max(self.state.utterance_id, highest_utterance_id)
             self.segmenter.reset()
+            self._finalized.clear()
             self._finalizing.clear()
             self._utterance_runtime.clear()
             self.state.last_maintenance_at = time.monotonic()
@@ -605,7 +669,7 @@ class TranscriptionSession:
         if (
             result.speech_active
             and DEFAULT_PARTIAL_AST_ENABLED
-            and not self._partial_inference_is_busy_or_backlogged()
+            and not self._finalizing
             and self._active_utterance_has_new_speech_for_partial()
         ):
             audio = self.segmenter.current_audio()
@@ -615,11 +679,15 @@ class TranscriptionSession:
                 and trimmed_audio.shape[0] / 16_000 >= DEFAULT_PARTIAL_MIN_AUDIO_SECONDS
                 and _audio_has_transcribable_energy(trimmed_audio)
             ):
+                inference_audio = _tail_audio(
+                    trimmed_audio,
+                    DEFAULT_PARTIAL_MAX_AUDIO_SECONDS,
+                )
                 runtime = self._active_utterance_runtime()
                 if runtime is not None:
                     runtime.last_partial_wall_seconds = time.monotonic()
                     runtime.last_partial_audio_samples = runtime.voiced_audio_samples
-                self._schedule_ast("partial", self.state.active_utterance_id, trimmed_audio)
+                self._schedule_ast("partial", self.state.active_utterance_id, inference_audio)
 
         if result.speech_ended and result.audio is not None:
             utterance_id = self.state.active_utterance_id
@@ -704,10 +772,12 @@ class TranscriptionSession:
         task.add_done_callback(self._jobs.discard)
 
     async def _run_ast(self, priority: str, utterance_id: int, audio: np.ndarray) -> None:
-        if self.transcription_engine == "parakeet":
+        if self._should_use_parakeet_asr():
             await self._run_parakeet_asr(priority, utterance_id, audio)
             return
+        await self._run_mlx_ast(priority, utterance_id, audio)
 
+    async def _run_mlx_ast(self, priority: str, utterance_id: int, audio: np.ndarray) -> None:
         try:
             result = await self.worker.submit_ast(
                 priority="final" if priority == "final" else "partial",
@@ -724,6 +794,12 @@ class TranscriptionSession:
             )
         except asyncio.CancelledError:
             raise
+        except InferenceTimeoutError as exc:
+            if priority == "partial":
+                logger.info("partial_inference dropped after timeout: %s", exc)
+                return
+            await self._send_error(f"Inference failed: {exc}")
+            return
         except Exception as exc:
             await self._send_error(f"Inference failed: {exc}")
             return
@@ -735,15 +811,39 @@ class TranscriptionSession:
         if priority == "partial":
             if utterance_id in self._finalized or utterance_id in self._finalizing:
                 return
+            runtime = self._utterance_runtime.setdefault(
+                utterance_id,
+                UtteranceRuntime(partials=deque(maxlen=self._stability_window())),
+            )
+            previous_original = runtime.latest_partial_original
+            merged_original = _merge_partial_text(runtime.latest_partial_original, original)
+            if self._should_translate_final(merged_original):
+                merged_translation = runtime.latest_partial_translation or translation
+            else:
+                merged_translation = merged_original
+            if (
+                merged_original == runtime.latest_partial_original
+                and merged_translation == runtime.latest_partial_translation
+            ):
+                return
+            runtime.latest_partial_original = merged_original
+            runtime.latest_partial_translation = merged_translation
+            if merged_original != previous_original and self._should_translate_final(merged_original):
+                task = asyncio.create_task(
+                    self._run_partial_translation_update(utterance_id, merged_original),
+                    name=f"partial-translation-{utterance_id}",
+                )
+                self._jobs.add(task)
+                task.add_done_callback(self._jobs.discard)
             await self._send_and_broadcast(
                 TranscriptMessage(
                     type="partial",
                     utterance_id=utterance_id,
-                    original=original,
-                    translation=translation,
+                    original=merged_original,
+                    translation=merged_translation,
                 ).model_dump(exclude_none=True)
             )
-            await self._maybe_commit_early(utterance_id, original)
+            await self._maybe_commit_early(utterance_id, merged_original)
             return
 
         self._finalized.add(utterance_id)
@@ -776,6 +876,9 @@ class TranscriptionSession:
             self._jobs.add(task)
             task.add_done_callback(self._jobs.discard)
         await self._maybe_run_maintenance()
+
+    def _should_use_parakeet_asr(self) -> bool:
+        return self.transcription_engine == "parakeet"
 
     async def _run_parakeet_asr(self, priority: str, utterance_id: int, audio: np.ndarray) -> None:
         if self.asr_worker is None:
@@ -813,8 +916,13 @@ class TranscriptionSession:
                 else ""
             )
             if not translation:
-                translation = await self._translate_partial(utterance_id, original) or ""
-            if not translation or utterance_id in self._finalized or utterance_id in self._finalizing:
+                task = asyncio.create_task(
+                    self._run_partial_translation_update(utterance_id, original),
+                    name=f"partial-translation-{utterance_id}",
+                )
+                self._jobs.add(task)
+                task.add_done_callback(self._jobs.discard)
+            if utterance_id in self._finalized or utterance_id in self._finalizing:
                 return
             runtime.latest_partial_original = original
             runtime.latest_partial_translation = translation
@@ -835,21 +943,13 @@ class TranscriptionSession:
         last_audio_frame_unix_seconds = (
             runtime.last_audio_frame_unix_seconds if runtime is not None else None
         )
-        corrected_original = await self._correct_final_asr(original, correction_context)
-        if corrected_original is None:
-            corrected_original = original
-        corrected_original = corrected_original.strip() or original
-        if corrected_original != original:
-            self._remember_asr_correction(original, corrected_original)
-
-        translation = await self._translate_final(utterance_id, corrected_original)
-        if translation is None:
-            return
+        translation = self._promotable_partial_translation(runtime, original) or (
+            original if not self._should_translate_final(original) else ""
+        )
 
         self._finalized.add(utterance_id)
-        self.state.prior_context.append((original, translation))
-        self.state.prior_context = self.state.prior_context[-2:]
-        self._remember_bilingual_context(original, translation)
+        if translation:
+            self._remember_final_context(original, translation)
         self.state.utterances_since_maintenance += 1
         await self._send_and_broadcast(
             TranscriptMessage(
@@ -871,6 +971,19 @@ class TranscriptionSession:
             )
             self._jobs.add(task)
             task.add_done_callback(self._jobs.discard)
+        if self._should_run_final_translation_refresh(original):
+            task = asyncio.create_task(
+                self._run_final_translation_refresh(
+                    utterance_id,
+                    original,
+                    commit_reason,
+                    correction_context,
+                    translation,
+                ),
+                name=f"refresh-final-{utterance_id}",
+            )
+            self._jobs.add(task)
+            task.add_done_callback(self._jobs.discard)
         await self._maybe_run_maintenance()
 
     async def _run_partial_translation_update(self, utterance_id: int, original: str) -> None:
@@ -879,6 +992,9 @@ class TranscriptionSession:
             return
         runtime = self._utterance_runtime.get(utterance_id)
         if runtime is not None:
+            current_original = runtime.latest_partial_original
+            if _normalize_learned_text(current_original) != _normalize_learned_text(original):
+                return
             runtime.latest_partial_original = original
             runtime.latest_partial_translation = translation
         if utterance_id in self._finalizing:
@@ -894,36 +1010,107 @@ class TranscriptionSession:
             ).model_dump(exclude_none=True)
         )
 
-    async def _run_final_translation_update(
+    async def _run_final_translation_refresh(
         self,
         utterance_id: int,
         original: str,
         commit_reason: CommitReason,
         correction_context: list[tuple[str, str]],
+        previous_translation: str,
     ) -> None:
+        translation = await self._translate_final(utterance_id, original)
+        if translation is not None and translation.strip() != previous_translation.strip():
+            self._remember_final_context(original, translation, replacing_original=original)
+            await self._send_and_broadcast(
+                TranscriptMessage(
+                    type="final",
+                    utterance_id=utterance_id,
+                    original=original,
+                    translation=translation,
+                    commit_reason=commit_reason,
+                ).model_dump(exclude_none=True)
+            )
+
+        if not self._should_run_async_asr_correction(original):
+            return
+
         corrected_original = await self._correct_final_asr(original, correction_context)
         if corrected_original is None:
             corrected_original = original
         corrected_original = corrected_original.strip() or original
-        if corrected_original != original:
-            self._remember_asr_correction(original, corrected_original)
-
-        translation = await self._translate_final(utterance_id, corrected_original)
-        if translation is None:
+        if _normalize_learned_text(corrected_original) == _normalize_learned_text(original):
             return
-        for index, (prior_original, _) in enumerate(self.state.prior_context):
-            if prior_original == original:
-                self.state.prior_context[index] = (corrected_original, translation)
-        self._remember_bilingual_context(corrected_original, translation)
+
+        corrected_translation = await self._translate_final(utterance_id, corrected_original)
+        if corrected_translation is None:
+            return
+        self._remember_asr_correction(original, corrected_original)
+        if (
+            corrected_translation.strip() == (translation or previous_translation).strip()
+        ):
+            return
+        self._remember_final_context(corrected_original, corrected_translation, replacing_original=original)
         await self._send_and_broadcast(
             TranscriptMessage(
                 type="final",
                 utterance_id=utterance_id,
                 original=corrected_original,
-                translation=translation,
+                translation=corrected_translation,
                 commit_reason=commit_reason,
             ).model_dump(exclude_none=True)
         )
+
+    def _promotable_partial_translation(
+        self,
+        runtime: UtteranceRuntime | None,
+        original: str,
+    ) -> str | None:
+        if runtime is None or not runtime.latest_partial_translation.strip():
+            return None
+        partial = runtime.latest_partial_original.strip()
+        if not partial:
+            return None
+        normalized_partial = _normalize_learned_text(partial)
+        normalized_original = _normalize_learned_text(original)
+        if not normalized_partial or not normalized_original:
+            return None
+        if (
+            normalized_partial == normalized_original
+            or normalized_original.startswith(normalized_partial)
+            or normalized_partial.startswith(normalized_original)
+            or SequenceMatcher(None, normalized_partial, normalized_original).ratio() >= 0.78
+        ):
+            return runtime.latest_partial_translation
+        return None
+
+    def _should_run_final_translation_refresh(self, original: str) -> bool:
+        return self._should_translate_final(original) or self._should_run_async_asr_correction(original)
+
+    def _should_run_async_asr_correction(self, original: str) -> bool:
+        return (
+            self.transcription_engine == "parakeet"
+            and self.state.config.asr_correction_enabled
+            and bool(original.strip())
+        )
+
+    def _remember_final_context(
+        self,
+        original: str,
+        translation: str,
+        *,
+        replacing_original: str | None = None,
+    ) -> None:
+        if replacing_original is not None:
+            for index, (prior_original, _) in enumerate(self.state.prior_context):
+                if prior_original == replacing_original:
+                    self.state.prior_context[index] = (original, translation)
+                    break
+            else:
+                self.state.prior_context.append((original, translation))
+        else:
+            self.state.prior_context.append((original, translation))
+        self.state.prior_context = self.state.prior_context[-2:]
+        self._remember_bilingual_context(original, translation)
 
     def _should_translate_final(self, original: str) -> bool:
         return (

@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="LiveTR3"
 PACKAGE_DIR="$ROOT/macos/LiveTR3Mac"
 BUNDLE="$ROOT/dist/$APP_NAME.app"
+APP_ICON="$PACKAGE_DIR/Resources/AppIcon.icns"
 
 verify=false
 if [[ "${1:-}" == "--verify" ]]; then
@@ -13,32 +14,15 @@ fi
 
 pkill -x "$APP_NAME" >/dev/null 2>&1 || true
 
-stop_repo_process_on_port() {
-  local port="$1"
-  local pids
-  pids="$(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
-  [[ -n "$pids" ]] || return 0
-
-  while read -r pid; do
-    [[ -n "$pid" ]] || continue
-    local command
-    command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
-    if [[ "$command" == *"$ROOT"* ]] || [[ "$command" == *"server:app --host 127.0.0.1 --port 8765"* ]]; then
-      kill "$pid" >/dev/null 2>&1 || true
-    fi
-  done <<< "$pids"
-}
-
-stop_repo_process_on_port 8765
-
 cd "$PACKAGE_DIR"
 swift build -c debug
 
 EXECUTABLE="$(swift build -c debug --show-bin-path)/$APP_NAME"
 
 rm -rf "$BUNDLE"
-mkdir -p "$BUNDLE/Contents/MacOS"
+mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
 cp "$EXECUTABLE" "$BUNDLE/Contents/MacOS/$APP_NAME"
+cp "$APP_ICON" "$BUNDLE/Contents/Resources/AppIcon.icns"
 cat > "$BUNDLE/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -50,6 +34,8 @@ cat > "$BUNDLE/Contents/Info.plist" <<PLIST
   <string>com.livetr3.mac</string>
   <key>CFBundleName</key>
   <string>$APP_NAME</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>LSMinimumSystemVersion</key>
@@ -61,6 +47,8 @@ cat > "$BUNDLE/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
+
+"$ROOT/script/package_engine.sh" "$BUNDLE"
 
 /usr/bin/open -n "$BUNDLE"
 

@@ -18,7 +18,7 @@ struct ProjectorWorkspace: View {
                 DashboardMetric(
                     title: "Runtime",
                     value: runtime.state.label,
-                    detail: runtime.state == .ready ? "Backend on 8765" : "Waiting",
+                    detail: runtime.state == .ready ? "Local engine ready" : "Waiting",
                     symbolName: runtime.state.symbolName
                 )
             }

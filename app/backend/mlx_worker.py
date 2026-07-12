@@ -430,7 +430,7 @@ class MLXWorkerService:
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
         job = _QueuedJob(
-            priority=0 if priority == "final" else 10,
+            priority=1 if priority == "partial" else 0,
             sequence=next(self._sequence),
             kind="ast",
             future=future,
@@ -814,7 +814,9 @@ class MLXWorkerService:
             return POLISH_TIMEOUT_SECONDS
         if job.kind == "translate":
             return TRANSLATE_TIMEOUT_SECONDS
-        return FINAL_TIMEOUT_SECONDS if job.priority == 0 else PARTIAL_TIMEOUT_SECONDS
+        if job.kind == "ast" and job.payload.get("priority") == "partial":
+            return PARTIAL_TIMEOUT_SECONDS
+        return FINAL_TIMEOUT_SECONDS
 
 
 def _worker_process_main(

@@ -10,11 +10,19 @@ final class LiveTR3Runtime: ObservableObject {
     }
 
     @Published private(set) var state: State = .idle
-    @Published private(set) var statusMessage = "Local runtime is not running."
+    @Published private(set) var statusMessage = "Local engine is not running."
+
+    nonisolated static var engineSocketPath: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appending(path: "LiveTR3")
+            .appending(path: "Runtime")
+        return base.appending(path: "engine.sock")
+    }
 
     private let repoRoot: URL
     private let logDirectory: URL
     private var backendProcess: Process?
+    private var ownsBackendProcess = false
 
     init() {
         self.repoRoot = Self.findRepoRoot()
@@ -25,13 +33,13 @@ final class LiveTR3Runtime: ObservableObject {
         guard state != .starting && state != .ready else { return }
 
         state = .starting
-        statusMessage = "Starting backend..."
+        statusMessage = "Starting local caption engine..."
 
         do {
             try launchBackend()
             try await waitForReady()
             state = .ready
-            statusMessage = "Backend is running locally."
+            statusMessage = "Local engine is ready."
         } catch {
             state = .failed
             statusMessage = error.localizedDescription
@@ -45,24 +53,63 @@ final class LiveTR3Runtime: ObservableObject {
     }
 
     func stop() {
-        backendProcess?.terminate()
+        if ownsBackendProcess {
+            backendProcess?.terminate()
+        }
         backendProcess = nil
+        ownsBackendProcess = false
         if state != .failed {
             state = .idle
-            statusMessage = "Local runtime is stopped."
+            statusMessage = "Local engine is stopped."
         }
     }
 
     private func launchBackend() throws {
-        let backend = repoRoot.appending(path: "app/backend")
-        backendProcess = try launch(
-            executable: "/bin/zsh",
-            arguments: [
-                "-lc",
-                "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin uv run python -m uvicorn server:app --host 127.0.0.1 --port 8765"
-            ],
-            workingDirectory: backend
+        try FileManager.default.createDirectory(
+            at: Self.engineSocketPath.deletingLastPathComponent(),
+            withIntermediateDirectories: true
         )
+        try? FileManager.default.removeItem(at: Self.engineSocketPath)
+
+        let bundledBackend = Bundle.main.bundleURL
+            .appending(path: "Contents")
+            .appending(path: "Resources")
+            .appending(path: "Engine")
+            .appending(path: "backend")
+        let devBackend = repoRoot.appending(path: "app/backend")
+        let bundledVenvPython = Bundle.main.bundleURL
+            .appending(path: "Contents")
+            .appending(path: "Resources")
+            .appending(path: "Engine")
+            .appending(path: "venv/bin/python")
+        let bundledPython = Bundle.main.bundleURL
+            .appending(path: "Contents")
+            .appending(path: "Resources")
+            .appending(path: "Engine")
+            .appending(path: "python/bin/python3")
+        let packagedPython = FileManager.default.fileExists(atPath: bundledVenvPython.path)
+            ? bundledVenvPython
+            : bundledPython
+
+        if FileManager.default.fileExists(atPath: packagedPython.path) {
+            let backend = bundledBackend
+            backendProcess = try launch(
+                executable: packagedPython.path,
+                arguments: ["uds_host.py"],
+                workingDirectory: backend
+            )
+        } else {
+            let backend = devBackend
+            backendProcess = try launch(
+                executable: "/bin/zsh",
+                arguments: [
+                    "-lc",
+                    "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin uv run python uds_host.py"
+                ],
+                workingDirectory: backend
+            )
+        }
+        ownsBackendProcess = true
     }
 
     private func launch(executable: String, arguments: [String], workingDirectory: URL) throws -> Process {
@@ -75,6 +122,7 @@ final class LiveTR3Runtime: ObservableObject {
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
         process.currentDirectoryURL = workingDirectory
+        process.environment = Self.engineEnvironment(backend: workingDirectory)
         process.standardOutput = logHandle
         process.standardError = logHandle
         try process.run()
@@ -82,27 +130,20 @@ final class LiveTR3Runtime: ObservableObject {
     }
 
     private func waitForReady() async throws {
-        try await waitUntil("Backend did not become healthy on 127.0.0.1:8765.") {
-            await Self.httpOK(LiveTR3Routes.backendHealth)
+        try await waitUntil("Local engine did not create its Unix socket.") {
+            FileManager.default.fileExists(atPath: Self.engineSocketPath.path)
         }
     }
 
     private func waitUntil(_ timeoutMessage: String, check: @escaping () async -> Bool) async throws {
         for _ in 0..<80 {
             if await check() { return }
+            if let backendProcess, !backendProcess.isRunning {
+                throw RuntimeError(message: "Local engine exited before becoming ready. Check dist/logs/backend-runtime.log.")
+            }
             try await Task.sleep(nanoseconds: 250_000_000)
         }
         throw RuntimeError(message: timeoutMessage)
-    }
-
-    private static func httpOK(_ url: URL) async -> Bool {
-        do {
-            let (_, response) = try await URLSession.shared.data(from: url)
-            guard let http = response as? HTTPURLResponse else { return false }
-            return (200..<400).contains(http.statusCode)
-        } catch {
-            return false
-        }
     }
 
     private static func findRepoRoot() -> URL {
@@ -116,6 +157,16 @@ final class LiveTR3Runtime: ObservableObject {
             sourceURL.deleteLastPathComponent()
         }
         return sourceURL
+    }
+
+    private static func engineEnvironment(backend: URL) -> [String: String] {
+        var environment = ProcessInfo.processInfo.environment
+        environment["LIVETR3_ENGINE_SOCKET"] = engineSocketPath.path
+        environment["PYTHONNOUSERSITE"] = "1"
+        environment["PYTHONPATH"] = backend.path
+        environment["HF_HUB_OFFLINE"] = environment["HF_HUB_OFFLINE"] ?? "1"
+        environment["TRANSFORMERS_OFFLINE"] = environment["TRANSFORMERS_OFFLINE"] ?? "1"
+        return environment
     }
 
     private struct RuntimeError: LocalizedError {

@@ -31,15 +31,14 @@ struct NativeOperatorView: View {
                 targetLanguage: session.config.target_lang
             )
         }
-        .background(Color(red: 0.07, green: 0.07, blue: 0.08))
+        .background(.background)
         .onAppear {
             session.refreshDevices()
         }
         .background {
             KeyboardShortcutMonitor(
                 onStartStop: session.startStop,
-                onExportTXT: exportTXT,
-                onToggleSettings: { settingsOpen.toggle() }
+                onExportTXT: exportTXT
             )
         }
     }
@@ -71,14 +70,12 @@ struct NativeOperatorView: View {
 private struct KeyboardShortcutMonitor: NSViewRepresentable {
     let onStartStop: () -> Void
     let onExportTXT: () -> Void
-    let onToggleSettings: () -> Void
 
     func makeNSView(context: Context) -> NSView {
         let view = NSView()
         context.coordinator.start(
             onStartStop: onStartStop,
-            onExportTXT: onExportTXT,
-            onToggleSettings: onToggleSettings
+            onExportTXT: onExportTXT
         )
         return view
     }
@@ -86,8 +83,7 @@ private struct KeyboardShortcutMonitor: NSViewRepresentable {
     func updateNSView(_ nsView: NSView, context: Context) {
         context.coordinator.updateHandlers(
             onStartStop: onStartStop,
-            onExportTXT: onExportTXT,
-            onToggleSettings: onToggleSettings
+            onExportTXT: onExportTXT
         )
     }
 
@@ -103,17 +99,14 @@ private struct KeyboardShortcutMonitor: NSViewRepresentable {
         private var monitor: Any?
         private var onStartStop: (() -> Void)?
         private var onExportTXT: (() -> Void)?
-        private var onToggleSettings: (() -> Void)?
 
         func start(
             onStartStop: @escaping () -> Void,
-            onExportTXT: @escaping () -> Void,
-            onToggleSettings: @escaping () -> Void
+            onExportTXT: @escaping () -> Void
         ) {
             updateHandlers(
                 onStartStop: onStartStop,
-                onExportTXT: onExportTXT,
-                onToggleSettings: onToggleSettings
+                onExportTXT: onExportTXT
             )
             guard monitor == nil else { return }
             monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
@@ -128,22 +121,16 @@ private struct KeyboardShortcutMonitor: NSViewRepresentable {
                     self.onExportTXT?()
                     return nil
                 }
-                if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers == "," {
-                    self.onToggleSettings?()
-                    return nil
-                }
                 return event
             }
         }
 
         func updateHandlers(
             onStartStop: @escaping () -> Void,
-            onExportTXT: @escaping () -> Void,
-            onToggleSettings: @escaping () -> Void
+            onExportTXT: @escaping () -> Void
         ) {
             self.onStartStop = onStartStop
             self.onExportTXT = onExportTXT
-            self.onToggleSettings = onToggleSettings
         }
 
         func stop() {

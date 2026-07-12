@@ -229,6 +229,19 @@ class ParakeetASRService:
         return False
 
     async def _dispatch_job(self, job: _QueuedASRJob) -> ASRResult:
+        try:
+            return await self._dispatch_job_once(job)
+        except RuntimeError as exc:
+            if "worker process" not in str(exc) and "worker response" not in str(exc):
+                raise
+            await self._emit_status(
+                ParakeetStatusEvent(state="recovering", message=f"Recovering Parakeet ASR worker: {exc}")
+            )
+            await self._stop_worker_process(force=True)
+            await self._start_worker_process()
+            return await self._dispatch_job_once(job)
+
+    async def _dispatch_job_once(self, job: _QueuedASRJob) -> ASRResult:
         if self._request_queue is None or self._response_queue is None or self._process is None:
             raise RuntimeError("Parakeet ASR worker process is not started")
         if not self._process.is_alive():

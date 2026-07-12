@@ -18,20 +18,11 @@ final class TranscriptStore: ObservableObject {
             }
         case .speechStart(let utteranceID):
             guard !entries.contains(where: { $0.id == utteranceID }) else { return }
-            entries.append(
-                TranscriptUtterance(
-                    id: utteranceID,
-                    original: "",
-                    translation: "",
-                    state: .partial,
-                    stableOriginalLength: 0,
-                    stableTranslationLength: 0,
-                    startedAt: Date()
-                )
-            )
+            partialTickAt = Date()
         case .level:
             break
         case .caption(let type, let utteranceID, let original, let translation):
+            lastError = nil
             if type == .partial {
                 partialTickAt = Date()
             }

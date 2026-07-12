@@ -50,12 +50,12 @@ struct TranscriptLineView: View {
 
     private var attributedCaption: AttributedString {
         var result = AttributedString(stableText)
-        result.foregroundColor = isPartial ? Color.white.opacity(0.55) : Color.white.opacity(0.95)
+        result.foregroundColor = isPartial ? Color.secondary : Color.primary
         result.font = .system(size: 30, weight: .regular).italic(isPartial)
 
         if !unstableText.isEmpty {
             var unstable = AttributedString(unstableText)
-            unstable.foregroundColor = Color.white.opacity(0.4)
+            unstable.foregroundColor = Color.secondary.opacity(0.7)
             unstable.font = .system(size: 30, weight: .regular).italic()
             result.append(unstable)
         }

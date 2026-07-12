@@ -40,16 +40,16 @@ struct FloatingRuntimeControls: View {
     var body: some View {
         HStack(spacing: 12) {
             RuntimePill(
-                title: "Local runtime",
+                title: "Local engine",
                 value: runtime.state.label,
                 symbolName: runtime.state.symbolName,
                 tint: runtime.state.tint
             )
 
             RuntimePill(
-                title: "Backend",
-                value: runtime.state == .ready ? "8765 healthy" : "Starting",
-                symbolName: "server.rack",
+                title: "Transport",
+                value: runtime.state == .ready ? "Unix socket" : "Starting",
+                symbolName: "point.3.connected.trianglepath.dotted",
                 tint: .secondary
             )
 

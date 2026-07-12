@@ -9,7 +9,7 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 5) {
                 Text("Settings")
                     .font(.title2.weight(.semibold))
-                Text("Configure how the local operator runtime starts and how much system detail LiveTR3 shows.")
+                Text("Configure how the local caption engine starts and how much system detail LiveTR3 shows.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -19,21 +19,21 @@ struct SettingsView: View {
                 Section {
                     Toggle(isOn: $startsRuntimeAutomatically) {
                         SettingLabel(
-                            title: "Start Local Runtime",
-                            detail: "Launch the backend when LiveTR3 opens."
+                            title: "Start Local Engine",
+                            detail: "Launch the local caption engine when LiveTR3 opens."
                         )
                     }
                 } header: {
-                    Text("Runtime")
+                    Text("Local Engine")
                 } footer: {
-                    Text("Turn this off when you want to open the Mac shell without starting capture services.")
+                    Text("Turn this off when you want to open the Mac app without starting capture services.")
                 }
 
                 Section {
                     Toggle(isOn: $showsAdvancedRuntimeDetails) {
                         SettingLabel(
-                            title: "Show Advanced Runtime Details",
-                            detail: "Reveal local endpoint and diagnostic information in the Runtime view."
+                            title: "Show Advanced Engine Details",
+                            detail: "Reveal local IPC and diagnostic information in the Local Engine view."
                         )
                     }
                 } header: {
