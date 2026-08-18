@@ -95,7 +95,7 @@ Run this on the actual event Mac with the intended microphone and projector/disp
 - Fresh launch and microphone permission.
 - Start/stop a session repeatedly.
 - English→Spanish and Spanish→English.
-- Pause/resume and commit-now.
+- Pause capture, speak a unique phrase while paused, resume, and verify that the paused phrase is never emitted or replayed; also verify commit-now separately.
 - Change the input microphone during a session.
 - Open, close, and reopen the native projector window.
 - Verify projector captions match finalized operator captions and ordering.
