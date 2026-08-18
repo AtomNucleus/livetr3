@@ -68,7 +68,7 @@ def test_config_control_message_round_trips_runtime_tunables() -> None:
     }
     parsed = parse_control_message(payload)
     assert isinstance(parsed, ConfigMessage)
-    assert parsed.model_dump(exclude_none=True) == payload
+    assert parsed.model_dump(exclude_none=True, exclude_unset=True) == payload
 
 
 def test_unknown_control_message_is_rejected() -> None:
