@@ -40,9 +40,16 @@ def test_unix_socket_transport_receive_text_and_binary() -> None:
 
 
 def test_transport_preserves_session_query_params() -> None:
-    reader = asyncio.StreamReader()
-    transport = UnixSocketTransport(reader, _MemoryWriter(), {"session": "session-123", "role": "viewer"})
-    assert transport.query_params == {"session": "session-123", "role": "viewer"}
+    async def run() -> None:
+        reader = asyncio.StreamReader()
+        transport = UnixSocketTransport(
+            reader,
+            _MemoryWriter(),
+            {"session": "session-123", "role": "viewer"},
+        )
+        assert transport.query_params == {"session": "session-123", "role": "viewer"}
+
+    asyncio.run(run())
 
 
 def test_incomplete_frame_becomes_disconnect_instead_of_crashing() -> None:
