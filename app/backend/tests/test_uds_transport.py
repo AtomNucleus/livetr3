@@ -39,6 +39,48 @@ def test_unix_socket_transport_receive_text_and_binary() -> None:
     asyncio.run(run())
 
 
+def test_transport_preserves_session_query_params() -> None:
+    reader = asyncio.StreamReader()
+    transport = UnixSocketTransport(reader, _MemoryWriter(), {"session": "session-123", "role": "viewer"})
+    assert transport.query_params == {"session": "session-123", "role": "viewer"}
+
+
+def test_incomplete_frame_becomes_disconnect_instead_of_crashing() -> None:
+    async def run() -> None:
+        reader = asyncio.StreamReader()
+        transport = UnixSocketTransport(reader, _MemoryWriter(), {})
+        reader.feed_data(b"\x01\x00")
+        reader.feed_eof()
+        assert await transport.receive() == {"type": "websocket.disconnect"}
+
+    asyncio.run(run())
+
+
+def test_unknown_frame_type_is_treated_as_disconnect() -> None:
+    async def run() -> None:
+        reader = asyncio.StreamReader()
+        transport = UnixSocketTransport(reader, _MemoryWriter(), {})
+        reader.feed_data(frame(0x7F, b"unexpected"))
+        assert await transport.receive() == {"type": "websocket.disconnect"}
+
+    asyncio.run(run())
+
+
+def test_send_json_preserves_unicode() -> None:
+    async def run() -> None:
+        reader = asyncio.StreamReader()
+        writer = _MemoryWriter()
+        transport = UnixSocketTransport(reader, writer, {})
+        await transport.send_json({"type": "final", "translation": "Buenos días 👋"})
+        out_type, out_length = HEADER.unpack(writer.payloads[0][: HEADER.size])
+        payload = writer.payloads[0][HEADER.size :]
+        assert out_type == FRAME_TEXT
+        assert out_length == len(payload)
+        assert json.loads(payload) == {"type": "final", "translation": "Buenos días 👋"}
+
+    asyncio.run(run())
+
+
 class _MemoryWriter:
     def __init__(self) -> None:
         self.payloads: list[bytes] = []
