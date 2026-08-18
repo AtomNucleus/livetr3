@@ -24,7 +24,8 @@ parakeet = [
   "parakeet-mlx>=0.3.0",
 ]
 test = [
-    "psutil>=7.0.0",
+  "psutil>=7.0.0",
+  "pytest>=8.3.0",
 ]
 
 [tool.uv]
