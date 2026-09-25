@@ -1,4 +1,5 @@
 import AVFoundation
+import Combine
 import Foundation
 
 enum SessionCaptureStatus: Equatable {
@@ -336,12 +337,16 @@ final class ProjectorConnection: ObservableObject {
 
     private let sessionID: String
     private let engine: CaptionEngine
+    private var transcriptObservation: AnyCancellable? = nil
 
     init(sessionID: String) {
         self.sessionID = sessionID
         self.engine = ProcessInfo.processInfo.environment["LIVETR3_DEBUG_WEBSOCKET"] == "1"
             ? LiveTR3WebSocket()
             : LocalEngineConnection()
+        self.transcriptObservation = transcript.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
         engine.onMessage = { [weak self] message in
             Task { @MainActor in
                 self?.transcript.handle(message)
