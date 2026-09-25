@@ -1,5 +1,9 @@
 # LiveTR3 PRD
 
+> Historical planning document. LiveTR3 now uses a native SwiftUI interface and
+> Unix-socket engine transport; the browser client and design gallery have been
+> removed. See `../README.md` for the current architecture and commands.
+
 ## Goal
 
 Build a local macOS web app for a mic'd speaker that shows live dual-pane captions:

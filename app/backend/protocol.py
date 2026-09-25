@@ -32,9 +32,9 @@ class ConfigMessage(BaseModel):
     input_device_id: str | None = None
     input_device_label: str | None = None
     code_switching_enabled: bool = False
-    asr_correction_enabled: bool = True
+    asr_correction_enabled: bool = False
     bilingual_context_enabled: bool = False
-    transcript_learning_enabled: bool = True
+    transcript_learning_enabled: bool = False
     partial_interval_seconds: float | None = None
     max_utterance_seconds: float | None = None
     silero_threshold: float | None = None

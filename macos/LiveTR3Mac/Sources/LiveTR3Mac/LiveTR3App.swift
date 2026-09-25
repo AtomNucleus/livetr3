@@ -16,10 +16,6 @@ struct LiveTR3App: App {
         _sessionController = StateObject(wrappedValue: SessionController(sessionManager: manager, runtime: runtime))
     }
 
-    private var isGalleryMode: Bool {
-        ProcessInfo.processInfo.environment["LIVETR3_GALLERY"] == "1"
-    }
-
     var body: some Scene {
         WindowGroup {
             rootContent
@@ -40,11 +36,6 @@ struct LiveTR3App: App {
             }
         }
 
-        WindowGroup(id: LiveTR3WindowID.variation, for: String.self) { $id in
-            VariationWindowRoot(id: id ?? "aurora")
-        }
-        .defaultSize(width: 1100, height: 720)
-
         Window("Projector", id: LiveTR3WindowID.projector) {
             ProjectorWindowRoot()
                 .environmentObject(sessionManager)
@@ -56,24 +47,18 @@ struct LiveTR3App: App {
         }
     }
 
-    @ViewBuilder
     private var rootContent: some View {
-        if isGalleryMode {
-            VariationGalleryView()
-                .frame(minWidth: 1200, minHeight: 800)
-        } else {
-            OperatorWorkspace()
-                .environmentObject(runtime)
-                .environmentObject(sessionManager)
-                .environmentObject(sessionController)
-                .frame(minWidth: 1120, minHeight: 760)
-                .task {
-                    guard startsRuntimeAutomatically else { return }
-                    await runtime.start()
-                }
-                .onDisappear {
-                    runtime.stop()
-                }
-        }
+        OperatorWorkspace()
+            .environmentObject(runtime)
+            .environmentObject(sessionManager)
+            .environmentObject(sessionController)
+            .frame(minWidth: 1120, minHeight: 760)
+            .task {
+                guard startsRuntimeAutomatically else { return }
+                await runtime.start()
+            }
+            .onDisappear {
+                runtime.stop()
+            }
     }
 }

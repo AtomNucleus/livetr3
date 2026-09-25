@@ -9,13 +9,12 @@ struct AudioInputDevice: Identifiable, Equatable {
 
 final class AudioCaptureEngine {
     private let engine = AVAudioEngine()
-    private let targetSampleRate: Double = 16_000
     private let frameSize = 320
     private let processingQueue = DispatchQueue(label: "com.livetr3.audio-capture")
 
     private var onFrame: ((Data) -> Void)?
     private var onLevel: ((Float) -> Void)?
-    private var resampleRatio: Double = 1
+    private var converter: StreamingAudioConverter?
     private var pendingSamples: [Float] = []
     private var isPaused = false
 
@@ -43,13 +42,11 @@ final class AudioCaptureEngine {
 
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
-        resampleRatio = format.sampleRate / targetSampleRate
+        converter = try StreamingAudioConverter(inputFormat: format)
 
         input.removeTap(onBus: 0)
         input.installTap(onBus: 0, bufferSize: 1_024, format: format) { [weak self] buffer, _ in
-            self?.processingQueue.async {
-                self?.process(buffer: buffer)
-            }
+            self?.enqueue(buffer: buffer)
         }
 
         engine.prepare()
@@ -59,14 +56,19 @@ final class AudioCaptureEngine {
     func stop() {
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
-        pendingSamples = []
-        onFrame = nil
-        onLevel = nil
+        processingQueue.sync {
+            pendingSamples = []
+            converter = nil
+            onFrame = nil
+            onLevel = nil
+        }
     }
 
     func setPaused(_ paused: Bool) {
         processingQueue.async { [weak self] in
             self?.isPaused = paused
+            self?.pendingSamples.removeAll(keepingCapacity: true)
+            self?.converter?.reset()
         }
     }
 
@@ -75,6 +77,7 @@ final class AudioCaptureEngine {
         if wasRunning {
             engine.inputNode.removeTap(onBus: 0)
             engine.stop()
+            processingQueue.sync {}
         }
 
         if let deviceID, !deviceID.isEmpty {
@@ -84,16 +87,28 @@ final class AudioCaptureEngine {
         if wasRunning {
             let input = engine.inputNode
             let format = input.outputFormat(forBus: 0)
-            resampleRatio = format.sampleRate / targetSampleRate
+            converter = try StreamingAudioConverter(inputFormat: format)
             pendingSamples = []
 
             input.installTap(onBus: 0, bufferSize: 1_024, format: format) { [weak self] buffer, _ in
-                self?.processingQueue.async {
-                    self?.process(buffer: buffer)
-                }
+                self?.enqueue(buffer: buffer)
             }
             try engine.start()
         }
+    }
+
+    private func enqueue(buffer: AVAudioPCMBuffer) {
+        // Audio taps reuse their buffers after returning; own the samples before dispatching.
+        guard let copy = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: buffer.frameLength) else { return }
+        copy.frameLength = buffer.frameLength
+        let source = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
+        let destination = UnsafeMutableAudioBufferListPointer(copy.mutableAudioBufferList)
+        for (src, dst) in zip(source, destination) {
+            if let srcData = src.mData, let dstData = dst.mData {
+                memcpy(dstData, srcData, Int(src.mDataByteSize))
+            }
+        }
+        processingQueue.async { [weak self] in self?.process(buffer: copy) }
     }
 
     private func process(buffer: AVAudioPCMBuffer) {
@@ -123,7 +138,8 @@ final class AudioCaptureEngine {
         let rms = sqrt(sumSquares / Float(max(frameCount, 1)))
         onLevel?(rms)
 
-        let resampled = resampleLinear(mono, ratio: resampleRatio)
+        guard !isPaused else { return }
+        guard let resampled = try? converter?.convert(buffer) else { return }
         pendingSamples.append(contentsOf: resampled)
         emitFrames()
     }
@@ -136,22 +152,6 @@ final class AudioCaptureEngine {
             let data = frame.withUnsafeBufferPointer { Data(buffer: $0) }
             onFrame?(data)
         }
-    }
-
-    private func resampleLinear(_ input: [Float], ratio: Double) -> [Float] {
-        guard ratio != 1 else { return input }
-        let outputLength = Int(Double(input.count) / ratio)
-        guard outputLength > 0 else { return [] }
-
-        var output = [Float](repeating: 0, count: outputLength)
-        for index in 0..<outputLength {
-            let source = Double(index) * ratio
-            let lower = Int(source)
-            let upper = min(lower + 1, input.count - 1)
-            let fraction = Float(source - Double(lower))
-            output[index] = input[lower] + (input[upper] - input[lower]) * fraction
-        }
-        return output
     }
 
     private func setDefaultInputDevice(uid targetUID: String) throws {

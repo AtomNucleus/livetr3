@@ -3,31 +3,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BACKEND_DIR="$ROOT/app/backend"
-FRONTEND_DIR="$ROOT/app/frontend"
 
 mode="${1:-quick}"
-
-stop_repo_process_on_port() {
-  local port="$1"
-  local pids
-  pids="$(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
-  [[ -n "$pids" ]] || return 0
-
-  while read -r pid; do
-    [[ -n "$pid" ]] || continue
-    local command
-    command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
-    if [[ "$command" == *"$ROOT"* ]] || [[ "$command" == *"server:app --host 127.0.0.1 --port 8765"* ]]; then
-      kill "$pid" >/dev/null 2>&1 || true
-    fi
-  done <<< "$pids"
-}
-
-prepare_live_ports() {
-  stop_repo_process_on_port 8765
-  stop_repo_process_on_port 5173
-  sleep 1
-}
 
 run_backend_import_gate() {
   cd "$BACKEND_DIR"
@@ -40,15 +17,11 @@ run_backend_import_gate() {
     server.py
 }
 
-run_frontend_build() {
-  cd "$FRONTEND_DIR"
-  yarn build
-}
-
-run_projector_smoke() {
-  prepare_live_ports
-  cd "$FRONTEND_DIR"
-  yarn test:projector
+run_native_checks() {
+  swift build -c release --package-path "$ROOT/macos/LiveTR3Mac"
+  swift test --package-path "$ROOT/macos/LiveTR3Mac"
+  cd "$BACKEND_DIR"
+  uv run --extra test python -m pytest tests -q
 }
 
 run_short_soak() {
@@ -74,16 +47,14 @@ run_fault_soak() {
 case "$mode" in
   quick)
     run_backend_import_gate
-    run_frontend_build
-    run_projector_smoke
+    run_native_checks
     ;;
   soak)
     run_short_soak
     ;;
   full)
     run_backend_import_gate
-    run_frontend_build
-    run_projector_smoke
+    run_native_checks
     run_fault_soak
     ;;
   *)

@@ -98,6 +98,12 @@ final class LiveTR3Runtime: ObservableObject {
                 arguments: ["uds_host.py"],
                 workingDirectory: backend
             )
+        } else if FileManager.default.isExecutableFile(atPath: devBackend.appending(path: ".venv/bin/python").path) {
+            backendProcess = try launch(
+                executable: devBackend.appending(path: ".venv/bin/python").path,
+                arguments: ["uds_host.py"],
+                workingDirectory: devBackend
+            )
         } else {
             let backend = devBackend
             backendProcess = try launch(
@@ -163,6 +169,7 @@ final class LiveTR3Runtime: ObservableObject {
         var environment = ProcessInfo.processInfo.environment
         environment["LIVETR3_ENGINE_SOCKET"] = engineSocketPath.path
         environment["PYTHONNOUSERSITE"] = "1"
+        environment["TRANSCRIPTION_ENGINE"] = environment["TRANSCRIPTION_ENGINE"] ?? "parakeet"
         environment["PYTHONPATH"] = backend.path
         environment["HF_HUB_OFFLINE"] = environment["HF_HUB_OFFLINE"] ?? "1"
         environment["TRANSFORMERS_OFFLINE"] = environment["TRANSFORMERS_OFFLINE"] ?? "1"

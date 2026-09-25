@@ -96,10 +96,16 @@ struct TeleprompterSessionSheetOperatorView: View {
                     .multilineTextAlignment(textAlignment)
             }
 
-            Text(entry.translation.isEmpty ? entry.original : entry.translation)
-                .font(.system(size: sessionManager.projectorFontSize, weight: .semibold))
-                .foregroundStyle(entry.state == .partial ? .white.opacity(0.72) : .white)
-                .multilineTextAlignment(textAlignment)
+            if entry.translation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Text("Translating to \(session.config.target_lang)…")
+                    .font(.title3)
+                    .foregroundStyle(.white.opacity(0.48))
+            } else {
+                Text(entry.translation)
+                    .font(.system(size: sessionManager.projectorFontSize, weight: .semibold))
+                    .foregroundStyle(entry.state == .partial ? .white.opacity(0.72) : .white)
+                    .multilineTextAlignment(textAlignment)
+            }
         }
         .frame(maxWidth: .infinity, alignment: frameAlignment)
     }

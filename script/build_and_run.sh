@@ -15,9 +15,9 @@ fi
 pkill -x "$APP_NAME" >/dev/null 2>&1 || true
 
 cd "$PACKAGE_DIR"
-swift build -c debug
+swift build -c release
 
-EXECUTABLE="$(swift build -c debug --show-bin-path)/$APP_NAME"
+EXECUTABLE="$(swift build -c release --show-bin-path)/$APP_NAME"
 
 rm -rf "$BUNDLE"
 mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
