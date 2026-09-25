@@ -39,6 +39,7 @@ struct LiveTR3App: App {
         Window("Projector", id: LiveTR3WindowID.projector) {
             ProjectorWindowRoot()
                 .environmentObject(sessionManager)
+                .environmentObject(sessionController)
         }
         .defaultSize(width: 1440, height: 900)
 

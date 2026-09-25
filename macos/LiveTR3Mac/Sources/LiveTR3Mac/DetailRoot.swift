@@ -18,6 +18,7 @@ struct DetailRoot: View {
                 ProjectorWorkspace()
                     .environmentObject(runtime)
                     .environmentObject(sessionManager)
+                    .environmentObject(sessionController)
             case .runtime:
                 RuntimeWorkspace()
                     .environmentObject(runtime)
