@@ -13,6 +13,10 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "LiveTR3Mac"
+        ),
+        .testTarget(
+            name: "LiveTR3MacTests",
+            dependencies: ["LiveTR3Mac"]
         )
     ]
 )

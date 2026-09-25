@@ -1,207 +1,76 @@
 # LiveTR3
 
-Local-first live transcription and translation for a mic'd speaker on an Apple Silicon Mac.
+Native macOS live transcription and translation. SwiftUI renders the operator and
+projector windows, AVAudioEngine captures the microphone, and a local Python/MLX
+engine communicates over a Unix socket. No browser or web server is needed for the
+Mac app. Inference stays on this Mac; model downloads need internet access.
 
-The app captures microphone audio in the browser, sends 16 kHz mono float32 PCM frames to a local FastAPI WebSocket server, segments speech locally, and runs Gemma 4 E4B through `mlx-vlm` on Metal. The original-language caption appears in the top pane and the translation appears in the bottom pane.
+## Build and run
 
-## Requirements
+Requires Apple Silicon, macOS 14+, Xcode command-line tools, Python 3.13+, and `uv`.
+From the repository root:
 
-- Apple M1 Pro with 32 GB unified memory
-- macOS 14+
-- Python 3.13
-- `uv`
-- Node.js 20+ and `yarn`
-- Enough free disk for the MLX model download. Expect roughly 8 GB for `mlx-community/gemma-4-e4b-it-8bit`, plus cache overhead.
-
-No cloud service or external API is used by the app. Internet is only needed for dependency and model download.
-
-## Install
-
-From this directory:
-
-```bash
-brew install uv
-npm install -g yarn
-```
-
-```bash
+```sh
 cd app/backend
-uv sync
+uv sync --extra test
+cd ../..
+./script/build_and_run.sh --verify
 ```
 
-Then install the frontend dependencies:
+This creates and opens `dist/LiveTR3.app` using a release Swift build. The default
+bundle contains the engine source and uses the repository's Python environment.
+It is a development app, not yet a relocatable standalone distribution.
+`script/package_engine.sh` supports a supplied standalone Python and wheelhouse
+for packaging that runtime separately.
 
-```bash
-cd ../frontend
-yarn install
-```
+Download/cache these models before offline use:
 
-The model is downloaded by `mlx-vlm` the first time the backend or smoke test loads:
+- `mlx-community/parakeet-tdt-0.6b-v3`
+- `mlx-community/gemma-4-e4b-it-8bit`
 
-```bash
-cd ../backend
-uv run python smoke_ast.py /path/to/ten-second-16khz-mono.wav --source English --target Spanish
-```
+The native launcher sets offline model loading by default. Model files must
+already be available in the Hugging Face cache. The engine log is
+`dist/logs/backend-runtime.log`.
 
-The first run downloads the model and compiles/primes Metal kernels. On the target M1 Pro, expect a longer first run for download and cache setup; subsequent cold model loads should be under about 30 seconds, and warmup inference should be under about 5 seconds once dependencies and model cache are present.
+## Caption path
 
-## Start
+The native app defaults to Parakeet ASR for English, Spanish, French, German,
+Italian, and Portuguese. Gemma handles translation, other source languages, and
+code-switching sessions. Set `TRANSCRIPTION_ENGINE=gemma` in the app's inherited
+environment to use Gemma ASR throughout.
 
-Backend:
+- Apple's streaming audio converter produces 16 kHz mono PCM with continuous
+  resampling and anti-alias filtering. Pausing discards captured audio.
+- Silero detects utterance boundaries. Native defaults request partials every
+  250 ms, a 12-second utterance cap, and a 150 ms silence threshold. Scheduling
+  cadence is not a promise that inference finishes within 250 ms.
+- Each partial decodes the complete utterance so far and replaces the previous
+  hypothesis. Final ASR runs again on the completed utterance.
+- Parakeet source finals appear before translation completes. A subsequent
+  message updates the same caption with the translation.
+- Gemma's audio path supplies both languages in one pass, without a redundant
+  partial translation request. Generation uses greedy decoding.
+- Automatic text-only ASR correction, transcript learning, polish, and speculative
+  punctuation/stability commits default off. A language model's rewrite is not
+  independent evidence of what was spoken.
+- Final translations outrank previews. Finalizing one utterance does not stop
+  partials for the next. Failed or empty finals release their pending state.
+- Parakeet consumes PCM directly in memory. Gemma temporary audio directories
+  are isolated by engine and host process.
+- Slow jobs log queue and inference timing to the native engine log.
 
-```bash
+The native macOS app is the only UI. The browser client and alternative design
+gallery have been removed.
+
+## Validation
+
+```sh
 cd app/backend
-uv run uvicorn server:app --host 127.0.0.1 --port 8765
+uv run --extra test python -m pytest tests -q
+uv run python -m scripts.check_imports
+cd ../..
+swift test --package-path macos/LiveTR3Mac
 ```
 
-Frontend:
-
-```bash
-cd app/frontend
-yarn dev
-```
-
-Open the Vite URL, usually `http://127.0.0.1:5173`, grant mic access, and press Start.
-
-For projector mode, use the operator window's `Open Projector Window` button. That opens
-`/projector?session=<token>` in a second window that mirrors the same backend session as a
-read-only audience view.
-
-## CLI Smoke Test
-
-Before testing the live app, confirm MLX audio inference works with a short WAV:
-
-```bash
-cd app/backend
-uv run python smoke_ast.py ./sample.wav --source English --target Spanish
-```
-
-Input must be 16 kHz mono WAV. Keep it under 10 seconds for the smoke test. The script prints:
-
-```text
-<original transcript>
-Spanish: <translation>
-```
-
-## Prerecorded WebSocket Test
-
-With the backend running:
-
-```bash
-cd app/backend
-uv run python stream_wav_client.py ./sample.wav --source English --target Spanish
-```
-
-This sends the WAV as 20 ms little-endian float32 frames over `ws://127.0.0.1:8765/` and prints server JSON messages.
-
-## Runtime Behavior
-
-- Audio up: binary little-endian float32, 16 kHz, mono, 320 samples per 20 ms frame.
-- Text down: JSON only.
-- Config contract: `ConfigMessage.version = 2`.
-- Shared sessions: producer and viewer sockets join the same session with `?session=<id>`.
-- Viewer handshake: read-only clients send `{"type":"join_viewer"}` after connect.
-- Segmentation: Silero VAD at 16 kHz with 512-sample VAD frames.
-- Partial inference: every about 0.75 seconds while speech is active by default, configurable per session.
-- Final inference: dynamic early-commit races punctuation, partial stability, and Silero end-of-speech. Punctuation commits when the source partial ends in `.`, `?`, or `!`; stability commits when normalized source partials stop changing; Silero remains the fallback and max-utterance cap safety net.
-- Context: last two committed utterances are inserted as text-only prior context.
-- Custom vocabulary: injected before the AST prompt per session.
-- Code-switch mode: optional prompt hint to let the model handle source/target language switching within one utterance.
-- Polish pass: optional text-only cleanup after final output.
-- MLX execution: single model worker with an `asyncio.PriorityQueue`; final jobs outrank partial jobs.
-- Worker recovery: AST/final/polish jobs have configurable timeouts, and the model worker is reloaded after timeouts or fatal inference crashes.
-- Maintenance: MLX cache clear + Silero reset run periodically by time or utterance count.
-- Mid-session controls: pause/resume capture, commit-now flush, skip-next-polish, queued language-direction swap, and live mic hot-swap.
-- Reconnect/resume: the operator client reconnects to the same session token and restores the utterance counter when the backend stays alive.
-- Early-commit env tunables: `EARLY_COMMIT_ENABLED` default `true`, `EARLY_COMMIT_MIN_SECONDS` default `1.5`, `EARLY_COMMIT_PUNCTUATION` default `true`, `EARLY_COMMIT_STABILITY` default `true`, and `STABILITY_WINDOW` default `2`.
-
-## Latency Expectations
-
-Measured locally on an M1 Pro with 32 GB RAM, using `backend/sample.wav` looped through
-`app/backend/scripts/soak.py` on April 23-24, 2026:
-
-- Finalized caption latency after speech start: median 10.94 seconds, p95 12.05 seconds over a 30 minute run. This includes the full utterance duration.
-- Silence-to-final inference latency after dynamic early-commit: median 5.74 seconds, p95 8.87 seconds over a 5 minute run. The Silero-only baseline on the same harness was median 7.81 seconds, p95 10.08 seconds.
-- Late-window latency did not drift upward: median 10.24 seconds at 25-30 minutes versus 11.03 seconds at 0-5 minutes.
-- Partial cadence: about every 0.75 seconds during speech by default.
-- Worker fault recovery: SIGTERM of the MLX child recovered to ready in 8.73 seconds; first post-fault final arrived 12.20 seconds after injection.
-- Sustained temp files: max 1 file in the 30 minute soak, max 2 files in the worker fault run.
-- Sustained RSS: final RSS stayed below the 1.25x pass threshold versus the 5 minute baseline.
-
-Actual latency depends on speech length, selected languages, thermal state, and whether polish is enabled. Disable polish for the lowest final-caption latency.
-
-## Verified
-
-These checks were run locally on April 23-24, 2026:
-
-- Import-time backend gate: `cd app/backend && uv run python -m scripts.check_imports` returned `OK`.
-- Dynamic early-commit soak: `cd app/backend && uv run --extra test python scripts/soak.py --duration-seconds 300 --metric-interval-seconds 30 --drain-seconds 15` passed with 56 finals, 0 errors, median silence-to-final 5.74 seconds, p95 8.87 seconds, and commit reasons 17.86% punctuation / 0.00% stability / 82.14% Silero end. Evidence: `backend/scripts/soak_2026-04-24T12-48-18-0400.csv` and `.summary.json`.
-- Silero-only early-commit baseline: `cd app/backend && EARLY_COMMIT_ENABLED=false uv run --extra test python scripts/soak.py --duration-seconds 300 --metric-interval-seconds 30 --drain-seconds 15` passed with 47 finals, 0 errors, median silence-to-final 7.81 seconds, p95 10.08 seconds, and 100% Silero end commits. Evidence: `backend/scripts/soak_2026-04-24T12-35-23-0400.csv` and `.summary.json`.
-- Sustained load: `cd app/backend && uv run --extra test python scripts/soak.py --duration-seconds 1800 --metric-interval-seconds 60 --drain-seconds 30` passed with 290 finals, 0 errors, max temp-file count 1, median final latency 10.94 seconds, and no late-window latency drift. Evidence: `backend/scripts/soak_2026-04-23T18-29-50-0400.csv` and `.summary.json`.
-- MLX worker fault injection: `cd app/backend && uv run --extra test python scripts/soak.py --duration-seconds 360 --metric-interval-seconds 60 --drain-seconds 30 --inject-fault --fault-at-seconds 180` passed with 58 finals, 0 errors, max temp-file count 2, and inference resumed within 12.20 seconds after SIGTERM. Evidence: `backend/scripts/soak_2026-04-23T19-01-11-0400.csv` and `.summary.json`.
-- Projector browser smoke: `cd app/frontend && yarn test:projector` passed. It compared 5 consecutive finalized captions between operator and projector DOM, enforced p95 mirror delay <= 300 ms, checked 1280x720 and 1920x1080 projector clipping, and captured screenshots in `docs/evidence/`.
-- Backend kill/reconnect archive test: `cd app/backend && uv run --extra test python scripts/kill_test.py` passed. The archive had strictly monotonic final `utterance_id` values with no duplicate finals and contained both pre-kill and post-kill utterances.
-
-Audio-worklet cumulative drift is not listed as verified. A browser harness was attempted, but it did not collect valid worklet timing samples, so no pass claim is made here.
-
-## Silero VAD
-
-Silero VAD is the active segmenter for this build. RMS segmentation is not used as a fallback. The backend config is:
-
-```json
-{"type":"config","segmenter":"silero"}
-```
-
-The backend dependency list includes `silero-vad`. If Silero cannot load, the server sends an error instead of switching to another segmenter.
-
-If captions start too late or cut off, adjust mic gain/placement first. Then tune the Silero parameters in `backend/segmenter.py`:
-
-- probability threshold: default `0.5`
-- speech pad: default `300 ms`
-- min silence: default `400 ms`
-
-The `level` WebSocket message still reports a loudness value named `rms` for the waveform meter. That value is not used to decide speech boundaries in this Silero-only build.
-
-## Exports
-
-The TXT, SRT, and VTT buttons download:
-
-- `livetr3-transcript.txt`
-- `livetr3-transcript.srt`
-- `livetr3-transcript.vtt`
-
-Keyboard shortcuts:
-
-- Space: start/stop when focus is not in a form control
-- Cmd+E: export TXT
-- Cmd+,: open/close settings
-
-## Projector View
-
-- Route: `/projector?session=<id>`
-- Transport: the operator window keeps the producer WebSocket; projector windows join as read-only viewers.
-- Content: target-language captions only, with the last two utterances auto-fit to the largest readable font that fits the screen.
-- Font control: the operator slider updates projector font size live across windows.
-
-## Session Archive
-
-Each started session is autosaved every 60 seconds and finalized on stop/disconnect under:
-
-```text
-~/Library/Application Support/LiveTR3/sessions/<ISO timestamp>/
-```
-
-Files written:
-
-- `transcript.srt`
-- `transcript.vtt`
-- `transcript.json`
-- `meta.json`
-
-## Offline Use
-
-After `uv sync`, `yarn install`, and the first successful model load, turn Wi-Fi off and start both local servers. The app uses only local WebSocket traffic and local MLX inference.
-
-## Privacy
-
-The backend keeps audio in memory and writes only short-lived temporary WAV files for the current inference call because `mlx-vlm` expects audio paths. Temp files are deleted immediately after generation, placed under a managed LiveTR3 temp directory, and stale files are swept periodically. Raw audio is not stored between chunks.
+See `docs/NATIVE_VALIDATION.md` for the current test evidence and limits. Historical
+browser/Gemma-only timing results do not characterize this native pipeline.

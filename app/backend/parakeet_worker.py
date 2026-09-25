@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import logging
 import multiprocessing as mp
 import os
 import queue
-import tempfile
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -13,13 +13,14 @@ from pathlib import Path
 from typing import Awaitable, Callable, Literal
 
 import numpy as np
-import soundfile as sf
 from dotenv import load_dotenv
-from mlx.core import bfloat16
+import mlx.core as mx
 
-from mlx_worker import TEMP_WAV_ROOT, _safe_unlink, sweep_stale_temp_wavs
+from mlx_worker import TEMP_WAV_ROOT, sweep_stale_temp_wavs
 
 load_dotenv()
+
+logger = logging.getLogger("uvicorn.error")
 
 PARAKEET_MODEL = os.getenv("PARAKEET_MODEL", "mlx-community/parakeet-tdt-0.6b-v3")
 PARAKEET_WORKER_START_TIMEOUT_SECONDS = max(
@@ -51,41 +52,34 @@ class _QueuedASRJob:
     sequence: int
     future: asyncio.Future = field(compare=False)
     payload: dict = field(compare=False)
+    enqueued_at: float = field(default_factory=time.monotonic, compare=False)
 
 
 class ParakeetASR:
     def __init__(self, temp_wav_root: Path | None = None) -> None:
         from parakeet_mlx import from_pretrained
 
-        self._temp_wav_root = temp_wav_root or TEMP_WAV_ROOT
+        self._temp_wav_root = temp_wav_root or TEMP_WAV_ROOT / f"parakeet-{os.getpid()}"
         self._temp_wav_root.mkdir(parents=True, exist_ok=True)
         sweep_stale_temp_wavs(self._temp_wav_root, 0)
         self.model = from_pretrained(PARAKEET_MODEL)
 
     def transcribe(self, audio_f32_16k: np.ndarray) -> ASRResult:
         audio_f32_16k = np.asarray(audio_f32_16k, dtype=np.float32).reshape(-1)
-        fd, wav_path_raw = tempfile.mkstemp(
-            suffix=".wav",
-            prefix="parakeet-",
-            dir=self._temp_wav_root,
+        from parakeet_mlx.audio import get_logmel
+
+        if self.model.preprocessor_config.sample_rate != 16_000:
+            raise ValueError("Parakeet model must accept 16 kHz audio")
+        # Same frontend as model.transcribe(), without WAV quantization, disk I/O,
+        # or a fresh ffmpeg subprocess for every streaming hypothesis.
+        mel = get_logmel(mx.array(audio_f32_16k), self.model.preprocessor_config)
+        first = self.model.generate(mel)[0]
+        text = getattr(first, "text", None)
+        timestamps = getattr(first, "timestamp", None)
+        return ASRResult(
+            text=(text if isinstance(text, str) else str(first)).strip(),
+            timestamps=timestamps if isinstance(timestamps, dict) else None,
         )
-        os.close(fd)
-        wav_path = Path(wav_path_raw)
-        try:
-            sf.write(wav_path, audio_f32_16k, 16_000, subtype="PCM_16")
-            first = self.model.transcribe(
-                wav_path,
-                dtype=bfloat16,
-                chunk_duration=None,
-            )
-            text = getattr(first, "text", None)
-            timestamps = getattr(first, "timestamp", None)
-            return ASRResult(
-                text=(text if isinstance(text, str) else str(first)).strip(),
-                timestamps=timestamps if isinstance(timestamps, dict) else None,
-            )
-        finally:
-            _safe_unlink(wav_path)
 
 
 class ParakeetASRService:
@@ -96,7 +90,7 @@ class ParakeetASRService:
         self._sequence = itertools.count()
         self._runner: asyncio.Task | None = None
         self._closed = asyncio.Event()
-        self._temp_wav_root = TEMP_WAV_ROOT
+        self._temp_wav_root = TEMP_WAV_ROOT / f"parakeet-{os.getpid()}"
         self._process: mp.Process | None = None
         self._request_queue: mp.Queue | None = None
         self._response_queue: mp.Queue | None = None
@@ -203,7 +197,15 @@ class ParakeetASRService:
                     if not job.future.done():
                         job.future.set_result(None)
                     continue
+                dispatched_at = time.monotonic()
                 result = await self._dispatch_job(job)
+                finished_at = time.monotonic()
+                if finished_at - job.enqueued_at >= 1.0:
+                    logger.warning(
+                        "slow_inference engine=parakeet priority=%s utterance_id=%s queue_seconds=%.3f inference_seconds=%.3f",
+                        job.payload.get("priority"), job.payload.get("utterance_id"),
+                        dispatched_at - job.enqueued_at, finished_at - dispatched_at,
+                    )
                 if not job.future.cancelled():
                     job.future.set_result(result)
             except Exception as exc:
@@ -231,14 +233,20 @@ class ParakeetASRService:
     async def _dispatch_job(self, job: _QueuedASRJob) -> ASRResult:
         try:
             return await self._dispatch_job_once(job)
-        except RuntimeError as exc:
-            if "worker process" not in str(exc) and "worker response" not in str(exc):
+        except (RuntimeError, TimeoutError) as exc:
+            if (not isinstance(exc, TimeoutError)
+                    and "worker process" not in str(exc) and "worker response" not in str(exc)):
                 raise
             await self._emit_status(
                 ParakeetStatusEvent(state="recovering", message=f"Recovering Parakeet ASR worker: {exc}")
             )
             await self._stop_worker_process(force=True)
             await self._start_worker_process()
+            if isinstance(exc, TimeoutError):
+                # Never spend another timeout replaying expired work while live audio waits.
+                if job.payload.get("priority") == "partial":
+                    return ASRResult(text="")
+                raise
             return await self._dispatch_job_once(job)
 
     async def _dispatch_job_once(self, job: _QueuedASRJob) -> ASRResult:

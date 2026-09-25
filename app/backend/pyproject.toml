@@ -11,9 +11,10 @@ dependencies = [
   "numpy>=2.1.0",
   "soundfile>=0.12.1",
   "mlx>=0.22.0",
-  "mlx-vlm>=0.4.3",
+  "mlx-vlm>=0.7.3",
   "python-dotenv>=1.0.1",
   "silero-vad>=5.1.2",
+  "parakeet-mlx>=0.3.0",
 ]
 
 [project.optional-dependencies]
@@ -24,7 +25,8 @@ parakeet = [
   "parakeet-mlx>=0.3.0",
 ]
 test = [
-    "psutil>=7.0.0",
+  "psutil>=7.0.0",
+  "pytest>=8.3.0",
 ]
 
 [tool.uv]

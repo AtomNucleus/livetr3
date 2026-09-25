@@ -57,6 +57,9 @@ class RMSGate:
         self._speech_active = False
         self._below_threshold_frames = 0
 
+    def _rollover(self) -> None:
+        self.reset()
+
     def ingest(self, frame: np.ndarray) -> SegmentResult:
         frame = _coerce_frame(frame)
         rms = float(sqrt(float(np.mean(np.square(frame)))))
@@ -91,7 +94,7 @@ class RMSGate:
             audio = self.current_audio()
             force_flushed = True
             speech_ended = True
-            self.reset()
+            self._rollover()
         elif self._below_threshold_frames >= self.trailing_silence_frames:
             if len(self._current) >= self.min_utterance_frames:
                 audio = self.current_audio()
@@ -157,6 +160,11 @@ class SileroVAD(RMSGate):
         except AttributeError:
             pass
 
+    def _rollover(self) -> None:
+        # A size limit is not end-of-speech. Carry the detector state and pending
+        # samples into the next chunk, with the existing audio overlap.
+        RMSGate.reset(self)
+
     def ingest(self, frame: np.ndarray) -> SegmentResult:
         frame = _coerce_frame(frame)
         rms = float(sqrt(float(np.mean(np.square(frame)))))
@@ -185,6 +193,9 @@ class SileroVAD(RMSGate):
         self.threshold = -1.0 if active_for_parent else 2.0
         result = super().ingest(frame)
         self.threshold = parent_threshold
+        if end_event and result.force_flushed:
+            # Real end-of-speech on the cap frame still resets the detector.
+            self.reset()
         if end_event and not result.speech_ended:
             audio = self.current_audio()
             speech_ended = len(self._current) >= self.min_utterance_frames

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import logging
 import multiprocessing as mp
 import os
 import queue
@@ -17,6 +18,8 @@ import soundfile as sf
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger("uvicorn.error")
 
 MODEL_PATH = os.getenv("MODEL_PATH", "mlx-community/gemma-4-e4b-it-8bit")
 TEMP_WAV_ROOT = Path(
@@ -81,7 +84,7 @@ class MLXWorker:
     def __init__(self, temp_wav_root: Path | None = None) -> None:
         from mlx_vlm import load
 
-        self._temp_wav_root = temp_wav_root or TEMP_WAV_ROOT
+        self._temp_wav_root = temp_wav_root or TEMP_WAV_ROOT / f"gemma-{os.getpid()}"
         self._temp_wav_root.mkdir(parents=True, exist_ok=True)
         sweep_stale_temp_wavs(self._temp_wav_root, TEMP_WAV_STALE_SECONDS)
         self.model, self.processor = load(MODEL_PATH)
@@ -90,7 +93,7 @@ class MLXWorker:
 
     def _warmup(self) -> None:
         silent = np.zeros(16_000, dtype=np.float32)
-        self.ast(silent, "English", "Spanish", prior_context=[])
+        self.ast(silent, "English", "Spanish", prior_context=[], max_tokens=8)
 
     def ast(
         self,
@@ -150,7 +153,7 @@ class MLXWorker:
                     formatted,
                     audio=[str(wav_path)],
                     max_tokens=max_tokens,
-                    temperature=1.0,
+                    temperature=0.0,
                     top_p=0.95,
                     top_k=64,
                     verbose=False,
@@ -177,7 +180,7 @@ class MLXWorker:
                 self.processor,
                 formatted,
                 max_tokens=max_tokens,
-                temperature=1.0,
+                temperature=0.0,
                 top_p=0.95,
                 top_k=64,
                 verbose=False,
@@ -192,7 +195,9 @@ class MLXWorker:
         tgt: str,
         max_tokens: int = 256,
         bilingual_context: list[tuple[str, str]] | None = None,
-    ) -> str:
+        cancelled: Callable[[], bool] | None = None,
+        on_progress: Callable[[str], None] | None = None,
+    ) -> str | None:
         from mlx_vlm import generate
         from mlx_vlm.prompt_utils import apply_chat_template
 
@@ -207,13 +212,33 @@ class MLXWorker:
         else:
             prompt = TRANSLATE_PROMPT.format(text=text, src=src, tgt=tgt)
         formatted = apply_chat_template(self.processor, self.config, prompt, num_audios=0)
+        if cancelled is not None:
+            from mlx_vlm import stream_generate
+
+            if cancelled():
+                return None
+            stream = stream_generate(
+                self.model, self.processor, formatted, max_tokens=max_tokens,
+                temperature=0.0, top_p=0.95, top_k=64,
+            )
+            pieces: list[str] = []
+            try:
+                for response in stream:
+                    if cancelled():
+                        return None
+                    pieces.append(response.text)
+                    if on_progress is not None:
+                        on_progress("".join(pieces).strip())
+            finally:
+                stream.close()
+            return "".join(pieces).strip()
         out = _generation_text(
             generate(
                 self.model,
                 self.processor,
                 formatted,
                 max_tokens=max_tokens,
-                temperature=1.0,
+                temperature=0.0,
                 top_p=0.95,
                 top_k=64,
                 verbose=False,
@@ -349,6 +374,8 @@ class _QueuedJob:
     kind: Literal["ast", "polish", "translate", "correct", "maintenance"] = field(compare=False)
     future: asyncio.Future = field(compare=False)
     payload: dict = field(compare=False)
+    enqueued_at: float = field(default_factory=time.monotonic, compare=False)
+    on_progress: Callable[[str], Awaitable[None]] | None = field(default=None, compare=False)
 
 
 class MLXWorkerService:
@@ -362,7 +389,7 @@ class MLXWorkerService:
         self._start_lock = asyncio.Lock()
         self._started = False
         self._closed = asyncio.Event()
-        self._temp_wav_root = TEMP_WAV_ROOT
+        self._temp_wav_root = TEMP_WAV_ROOT / f"gemma-{os.getpid()}"
         self._process: mp.Process | None = None
         self._request_queue: mp.Queue | None = None
         self._response_queue: mp.Queue | None = None
@@ -371,6 +398,8 @@ class MLXWorkerService:
         self._queued_partial_translation_jobs: dict[int, _QueuedJob] = {}
         self._final_utterance_ids: set[int] = set()
         self._mp_context = mp.get_context("spawn")
+        self._cancelled_job_id = self._mp_context.Value("q", -1)
+        self._active_job: _QueuedJob | None = None
         self._status = WorkerStatusEvent(state="starting", message="Loading Gemma model worker")
         self._status_listeners: set[Callable[[WorkerStatusEvent], Awaitable[None]]] = set()
 
@@ -478,6 +507,19 @@ class MLXWorkerService:
         )
         return await future
 
+    def finish_partials(self, utterance_id: int) -> None:
+        """Retire queued previews immediately when audio commits, before final ASR finishes."""
+        self._final_utterance_ids.add(utterance_id)
+        active = self._active_job
+        if (active is not None and active.kind == "translate"
+                and active.payload.get("priority") == "partial"
+                and active.payload.get("utterance_id") == utterance_id):
+            self._cancelled_job_id.value = active.sequence
+        for queued in (self._queued_partial_jobs, self._queued_partial_translation_jobs):
+            job = queued.pop(utterance_id, None)
+            if job is not None and not job.future.done():
+                job.future.set_result(None)
+
     async def submit_translate_text(
         self,
         text: str,
@@ -487,13 +529,15 @@ class MLXWorkerService:
         priority: Literal["partial", "final"] = "final",
         utterance_id: int | None = None,
         bilingual_context: list[tuple[str, str]] | None = None,
+        on_progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> str | None:
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
         job = _QueuedJob(
-            priority=5 if priority == "final" else 3,
+            priority=1 if priority == "final" else 20,
             sequence=next(self._sequence),
             kind="translate",
+            on_progress=on_progress,
             future=future,
             payload={
                 "priority": priority,
@@ -593,7 +637,16 @@ class MLXWorkerService:
                         job.future.set_result(None)
                     continue
                 self._active_job_kind = job.kind
+                self._active_job = job
+                dispatched_at = time.monotonic()
                 result = await self._execute_job(job)
+                finished_at = time.monotonic()
+                if finished_at - job.enqueued_at >= 1.0:
+                    logger.warning(
+                        "slow_inference engine=gemma priority=%s utterance_id=%s queue_seconds=%.3f inference_seconds=%.3f",
+                        job.payload.get("priority"), job.payload.get("utterance_id"),
+                        dispatched_at - job.enqueued_at, finished_at - dispatched_at,
+                    )
                 if not job.future.cancelled():
                     job.future.set_result(result)
             except Exception as exc:
@@ -601,6 +654,7 @@ class MLXWorkerService:
                     job.future.set_exception(exc)
             finally:
                 self._active_job_kind = None
+                self._active_job = None
                 self._queue.task_done()
 
     def _should_skip_job(self, job: _QueuedJob) -> bool:
@@ -674,6 +728,7 @@ class MLXWorkerService:
         request = {
             "job_id": job.sequence,
             "kind": job.kind,
+            "cancellable": job.kind == "translate" and job.payload.get("priority") == "partial",
             "payload": payload,
         }
         await asyncio.to_thread(self._request_queue.put, request)
@@ -705,11 +760,16 @@ class MLXWorkerService:
                     f"{job.kind.upper()} timed out after {timeout_seconds:.1f}s"
                 )
             try:
-                return await asyncio.to_thread(
+                response = await asyncio.to_thread(
                     self._response_queue.get,
                     True,
                     min(0.25, remaining),
                 )
+                if response.get("type") == "progress" and response.get("job_id") == job.sequence:
+                    if job.on_progress is not None:
+                        await job.on_progress(response["text"])
+                    continue
+                return response
             except queue.Empty:
                 continue
 
@@ -735,7 +795,7 @@ class MLXWorkerService:
         response_queue: mp.Queue = self._mp_context.Queue()
         process = self._mp_context.Process(
             target=_worker_process_main,
-            args=(request_queue, response_queue, str(self._temp_wav_root)),
+            args=(request_queue, response_queue, str(self._temp_wav_root), self._cancelled_job_id),
             daemon=True,
         )
         process.start()
@@ -823,6 +883,7 @@ def _worker_process_main(
     request_queue: mp.Queue,
     response_queue: mp.Queue,
     temp_wav_root: str,
+    cancelled_job_id,
 ) -> None:
     try:
         worker = MLXWorker(Path(temp_wav_root))
@@ -851,7 +912,16 @@ def _worker_process_main(
             elif request["kind"] == "correct":
                 result = worker.correct_asr_text(**request["payload"])
             else:
-                result = worker.translate_text(**request["payload"])
+                cancelled = (
+                    (lambda: cancelled_job_id.value == job_id)
+                    if request.get("cancellable") else None
+                )
+                result = worker.translate_text(
+                    **request["payload"], cancelled=cancelled,
+                    on_progress=lambda text: response_queue.put(
+                        {"type": "progress", "job_id": job_id, "text": text}
+                    ),
+                )
         except Exception:
             response_queue.put(
                 {
