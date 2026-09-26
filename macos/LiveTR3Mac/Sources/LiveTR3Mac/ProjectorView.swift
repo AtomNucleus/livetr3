@@ -10,10 +10,7 @@ struct ProjectorView: View {
 
     private var visibleEntries: [TranscriptUtterance] {
         connection.transcript.entries
-            .filter { entry in
-                !entry.original.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    || !entry.translation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            }
+            .filter { !$0.translation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
             .suffix(2)
             .map { $0 }
     }
@@ -102,60 +99,49 @@ struct ProjectorView: View {
     }
 
     private var focusStage: some View {
-        VStack(alignment: .center, spacing: 28) {
+        let alignment: HorizontalAlignment = targetDirection == .rightToLeft ? .trailing : .leading
+        let frameAlignment: Alignment = targetDirection == .rightToLeft ? .bottomTrailing : .bottomLeading
+        return VStack(alignment: alignment, spacing: 24) {
             Spacer(minLength: 0)
             ForEach(visibleEntries) { entry in
-                VStack(alignment: .center, spacing: 10) {
-                    if showsSource(entry) {
-                        ProjectorCaptionText(
-                            text: entry.original,
-                            stableLength: entry.stableOriginalLength,
-                            isPartial: entry.state == .partial,
-                            fontSize: fittedFontSize * 0.38,
-                            weight: .medium,
-                            color: .white.opacity(0.48),
-                            alignment: .center,
-                            layoutDirection: sourceDirection
-                        )
-                    }
-                    ProjectorCaptionText(
-                        text: displayTranslation(for: entry),
-                        stableLength: translationStableLength(for: entry),
-                        isPartial: entry.state == .partial,
-                        fontSize: fittedFontSize,
-                        weight: .semibold,
-                        color: .white,
-                        alignment: .center,
-                        layoutDirection: targetDirection
-                    )
-                }
+                ProjectorCaptionText(
+                    text: entry.translation,
+                    stableLength: entry.stableTranslationLength,
+                    isPartial: entry.state == .partial,
+                    fontSize: fittedFontSize,
+                    weight: .semibold,
+                    alignment: frameAlignment,
+                    layoutDirection: targetDirection
+                )
             }
         }
-        .padding(.horizontal, 72)
-        .padding(.vertical, 56)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+        .padding(40)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: frameAlignment)
     }
 
     private var splitStage: some View {
-        HStack(alignment: .bottom, spacing: 0) {
-            splitColumn(
-                title: session.config.source_lang,
-                field: .original,
-                direction: sourceDirection
-            )
-            Rectangle()
-                .fill(Color.white.opacity(0.16))
-                .frame(width: 1)
-                .padding(.vertical, 48)
-                .accessibilityHidden(true)
-            splitColumn(
-                title: session.config.target_lang,
-                field: .translation,
-                direction: targetDirection
-            )
+        HStack(alignment: .center, spacing: 40) {
+            if targetDirection == .rightToLeft {
+                splitColumn(title: session.config.target_lang, field: .translation, direction: targetDirection)
+                splitRule
+                splitColumn(title: session.config.source_lang, field: .original, direction: sourceDirection)
+            } else {
+                splitColumn(title: session.config.source_lang, field: .original, direction: sourceDirection)
+                splitRule
+                splitColumn(title: session.config.target_lang, field: .translation, direction: targetDirection)
+            }
         }
-        .padding(.horizontal, 36)
-        .padding(.vertical, 28)
+        .padding(.horizontal, 48)
+        .padding(.vertical, 40)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+    }
+
+    private var splitRule: some View {
+        Rectangle()
+            .fill(Color.white.opacity(0.12))
+            .frame(width: 1)
+            .padding(.vertical, 48)
+            .accessibilityHidden(true)
     }
 
     private func splitColumn(
@@ -163,72 +149,64 @@ struct ProjectorView: View {
         field: ProjectorCaptionField,
         direction: LayoutDirection
     ) -> some View {
-        VStack(alignment: direction == .rightToLeft ? .trailing : .leading, spacing: 22) {
+        let textAlignment: Alignment = direction == .rightToLeft ? .trailing : .leading
+        return VStack(alignment: direction == .rightToLeft ? .trailing : .leading, spacing: 22) {
             Text(title)
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(Color.white.opacity(0.45))
                 .textCase(.uppercase)
                 .tracking(1.5)
-                .frame(maxWidth: .infinity, alignment: direction == .rightToLeft ? .trailing : .leading)
-            Spacer(minLength: 0)
+                .frame(maxWidth: .infinity, alignment: textAlignment)
             ForEach(visibleEntries) { entry in
                 ProjectorCaptionText(
                     text: field.text(from: entry),
                     stableLength: field.stableLength(from: entry),
                     isPartial: entry.state == .partial,
-                    fontSize: fittedFontSize * 0.82,
-                    weight: .semibold,
-                    color: field == .translation ? .white : .white.opacity(0.82),
-                    alignment: direction == .rightToLeft ? .trailing : .leading,
+                    fontSize: fittedFontSize * field.scale,
+                    weight: field.weight,
+                    alignment: textAlignment,
                     layoutDirection: direction
                 )
             }
         }
-        .padding(28)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+        .padding(.horizontal, 8)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
     }
 
     private var stackStage: some View {
-        let alignment: HorizontalAlignment = targetDirection == .rightToLeft ? .trailing : .leading
-        return VStack(alignment: alignment, spacing: 32) {
-            Spacer(minLength: 0)
+        VStack(spacing: 32) {
             ForEach(visibleEntries) { entry in
-                VStack(alignment: alignment, spacing: 8) {
-                    if showsSource(entry) {
+                VStack(alignment: .leading, spacing: 16) {
+                    if !entry.original.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         ProjectorCaptionText(
                             text: entry.original,
                             stableLength: entry.stableOriginalLength,
                             isPartial: entry.state == .partial,
-                            fontSize: fittedFontSize * 0.72,
-                            weight: .medium,
-                            color: .white.opacity(0.62),
-                            alignment: targetDirection == .rightToLeft ? .trailing : .leading,
+                            fontSize: fittedFontSize * 0.92,
+                            weight: .semibold,
+                            alignment: sourceDirection == .rightToLeft ? .trailing : .leading,
                             layoutDirection: sourceDirection
                         )
+                        Rectangle()
+                            .fill(Color.white.opacity(0.08))
+                            .frame(height: 1)
+                            .accessibilityHidden(true)
                     }
                     ProjectorCaptionText(
-                        text: displayTranslation(for: entry),
-                        stableLength: translationStableLength(for: entry),
+                        text: entry.translation,
+                        stableLength: entry.stableTranslationLength,
                         isPartial: entry.state == .partial,
                         fontSize: fittedFontSize,
                         weight: .semibold,
-                        color: .white,
                         alignment: targetDirection == .rightToLeft ? .trailing : .leading,
                         layoutDirection: targetDirection
                     )
-                }
-                .padding(.bottom, 4)
-                .overlay(alignment: .bottom) {
-                    Rectangle()
-                        .fill(Color.white.opacity(0.12))
-                        .frame(height: 1)
-                        .accessibilityHidden(true)
                 }
             }
         }
         .padding(.horizontal, 64)
         .padding(.vertical, 48)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
     }
 
     private var sourceDirection: LayoutDirection {
@@ -237,25 +215,6 @@ struct ProjectorView: View {
 
     private var targetDirection: LayoutDirection {
         isRtlLanguage(session.config.target_lang) ? .rightToLeft : .leftToRight
-    }
-
-    private func showsSource(_ entry: TranscriptUtterance) -> Bool {
-        !entry.original.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && !entry.translation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
-    private func translationStableLength(for entry: TranscriptUtterance) -> Int {
-        entry.translation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? entry.stableOriginalLength
-            : entry.stableTranslationLength
-    }
-
-    private func displayTranslation(for entry: TranscriptUtterance) -> String {
-        let translation = entry.translation.trimmingCharacters(in: .whitespacesAndNewlines)
-        if translation.isEmpty {
-            return entry.original
-        }
-        return entry.translation
     }
 
     private func refitFont(containerSize: CGSize) {
@@ -289,43 +248,23 @@ struct ProjectorView: View {
         switch style {
         case .focus:
             return visibleEntries.reduce(0) { total, entry in
-                let source = showsSource(entry) ? blockHeight(
-                    entry.original,
-                    fontSize: fontSize * 0.38,
-                    width: columnWidth
-                ) : 0
-                let translation = blockHeight(
-                    displayTranslation(for: entry),
-                    fontSize: fontSize,
-                    width: columnWidth
-                )
-                return total + source + translation + 38
+                total + blockHeight(entry.translation, fontSize: fontSize, width: columnWidth) + 24
             }
         case .split:
-            let sourceHeight = visibleEntries.reduce(CGFloat(36)) { total, entry in
-                total + blockHeight(entry.original, fontSize: fontSize * 0.82, width: columnWidth) + 22
+            let sourceHeight = visibleEntries.reduce(CGFloat(28)) { total, entry in
+                total + blockHeight(entry.original, fontSize: fontSize * 0.72, width: columnWidth) + 22
             }
-            let translationHeight = visibleEntries.reduce(CGFloat(36)) { total, entry in
-                total + blockHeight(
-                    displayTranslation(for: entry),
-                    fontSize: fontSize * 0.82,
-                    width: columnWidth
-                ) + 22
+            let translationHeight = visibleEntries.reduce(CGFloat(28)) { total, entry in
+                total + blockHeight(entry.translation, fontSize: fontSize, width: columnWidth) + 22
             }
             return max(sourceHeight, translationHeight)
         case .stack:
             return visibleEntries.reduce(0) { total, entry in
-                let source = showsSource(entry) ? blockHeight(
-                    entry.original,
-                    fontSize: fontSize * 0.72,
-                    width: columnWidth
-                ) : 0
-                let translation = blockHeight(
-                    displayTranslation(for: entry),
-                    fontSize: fontSize,
-                    width: columnWidth
-                )
-                return total + source + translation + 44
+                let source = entry.original.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? 0
+                    : blockHeight(entry.original, fontSize: fontSize * 0.92, width: columnWidth) + 16
+                let translation = blockHeight(entry.translation, fontSize: fontSize, width: columnWidth)
+                return total + source + translation + 32
             }
         }
     }
@@ -347,21 +286,31 @@ private enum ProjectorCaptionField {
     case original
     case translation
 
+    var scale: CGFloat {
+        switch self {
+        case .original: 0.72
+        case .translation: 1
+        }
+    }
+
+    var weight: Font.Weight {
+        switch self {
+        case .original: .medium
+        case .translation: .semibold
+        }
+    }
+
     func text(from entry: TranscriptUtterance) -> String {
         switch self {
-        case .original:
-            entry.original.isEmpty ? " " : entry.original
-        case .translation:
-            entry.translation.isEmpty ? entry.original : entry.translation
+        case .original: entry.original
+        case .translation: entry.translation
         }
     }
 
     func stableLength(from entry: TranscriptUtterance) -> Int {
         switch self {
-        case .original:
-            entry.stableOriginalLength
-        case .translation:
-            entry.translation.isEmpty ? entry.stableOriginalLength : entry.stableTranslationLength
+        case .original: entry.stableOriginalLength
+        case .translation: entry.stableTranslationLength
         }
     }
 }
@@ -372,7 +321,6 @@ private struct ProjectorCaptionText: View {
     let isPartial: Bool
     let fontSize: CGFloat
     let weight: Font.Weight
-    let color: Color
     let alignment: Alignment
     let layoutDirection: LayoutDirection
 
@@ -388,8 +336,8 @@ private struct ProjectorCaptionText: View {
 
     var body: some View {
         (
-            Text(stable).foregroundStyle(color.opacity(isPartial ? 0.85 : 1))
-            + Text(unstable).foregroundStyle(color.opacity(0.62))
+            Text(stable).foregroundStyle(Color.white.opacity(isPartial ? 0.85 : 1))
+            + Text(unstable).foregroundStyle(Color.white.opacity(0.65))
         )
         .font(.system(size: fontSize, weight: weight))
         .lineSpacing(4)

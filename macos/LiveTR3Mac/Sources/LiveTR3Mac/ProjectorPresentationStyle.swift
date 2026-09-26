@@ -17,7 +17,7 @@ enum ProjectorPresentationStyle: String, CaseIterable, Identifiable {
 
     var detail: String {
         switch self {
-        case .focus: "Large translation, smaller source"
+        case .focus: "Large translation only"
         case .split: "Source and translation side by side"
         case .stack: "Source and translation stacked together"
         }
