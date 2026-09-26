@@ -179,22 +179,34 @@ struct OperatorSettingsPanel: View {
     }
 
     private var outputSection: some View {
-        settingsSection(title: "Output") {
-            HStack(alignment: .bottom, spacing: 12) {
+        settingsSection(title: "Projector output") {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .bottom, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Projector font size")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                        HStack {
+                            Slider(value: $sessionManager.projectorFontSize, in: 36...144, step: 2)
+                            Text("\(Int(sessionManager.projectorFontSize))px")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .frame(width: 48, alignment: .trailing)
+                        }
+                    }
+                    Button("Open Projector", action: onOpenProjector)
+                        .buttonStyle(.borderedProminent)
+                }
+
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("Projector font size")
+                    Text("Projector look")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
-                    HStack {
-                        Slider(value: $sessionManager.projectorFontSize, in: 36...144, step: 2)
-                        Text("\(Int(sessionManager.projectorFontSize))px")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .frame(width: 48, alignment: .trailing)
-                    }
+                    ProjectorLookPicker(selection: $sessionManager.projectorStyle)
+                    Text(sessionManager.projectorStyle.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
-                Button("Open Projector", action: onOpenProjector)
-                    .buttonStyle(.borderedProminent)
             }
         }
     }
