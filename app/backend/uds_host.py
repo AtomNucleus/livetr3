@@ -9,12 +9,10 @@ import time
 from pathlib import Path
 
 from mlx_worker import MLXWorkerService
-from parakeet_worker import ParakeetASRService
 from session import SessionHub, TranscriptionSession
 from transport import FRAME_TEXT, HEADER, UnixSocketTransport
 
 
-TRANSCRIPTION_ENGINE = os.getenv("TRANSCRIPTION_ENGINE", "gemma").lower()
 IDLE_UNLOAD_SECONDS = max(
     5.0, float(os.getenv("MLX_WORKER_IDLE_UNLOAD_SECONDS", "45"))
 )
@@ -23,7 +21,6 @@ IDLE_UNLOAD_SECONDS = max(
 class EngineHost:
     def __init__(self) -> None:
         self.worker = MLXWorkerService()
-        self.asr_worker = ParakeetASRService() if TRANSCRIPTION_ENGINE == "parakeet" else None
         self.hub = SessionHub()
         self._idle_task: asyncio.Task[None] | None = None
         self._stopped = asyncio.Event()
@@ -32,9 +29,6 @@ class EngineHost:
         socket_path.parent.mkdir(parents=True, exist_ok=True)
         if socket_path.exists():
             socket_path.unlink()
-
-        if self.asr_worker is not None:
-            await self.asr_worker.start()
 
         server = await asyncio.start_unix_server(self._handle_client, path=str(socket_path))
         self._idle_task = asyncio.create_task(self._idle_unloader())
@@ -48,8 +42,6 @@ class EngineHost:
         if self._idle_task is not None:
             self._idle_task.cancel()
             await asyncio.gather(self._idle_task, return_exceptions=True)
-        if self.asr_worker is not None:
-            await self.asr_worker.stop()
         await self.worker.stop()
         if socket_path.exists():
             socket_path.unlink()
@@ -69,8 +61,6 @@ class EngineHost:
                 transport,
                 self.worker,
                 self.hub,
-                transcription_engine=TRANSCRIPTION_ENGINE,
-                asr_worker=self.asr_worker,
             ).run()
         finally:
             writer.close()

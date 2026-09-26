@@ -144,6 +144,26 @@ final class TranscriptStoreTests: XCTestCase {
         }
     }
 
+    func testLatePartialCannotOverwriteFinalCaption() async {
+        await MainActor.run {
+            let store = TranscriptStore()
+            store.handle(
+                .caption(type: .partial, utteranceID: 8, original: "We can", translation: "Podemos")
+            )
+            store.handle(
+                .caption(type: .final, utteranceID: 8, original: "We cannot", translation: "No podemos")
+            )
+            store.handle(
+                .caption(type: .partial, utteranceID: 8, original: "We can", translation: "Podemos")
+            )
+
+            XCTAssertEqual(store.entries.count, 1)
+            XCTAssertEqual(store.entries[0].state, .final)
+            XCTAssertEqual(store.entries[0].original, "We cannot")
+            XCTAssertEqual(store.entries[0].translation, "No podemos")
+        }
+    }
+
     func testReadyStatusClearsPriorError() async {
         await MainActor.run {
             let store = TranscriptStore()

@@ -14,15 +14,11 @@ dependencies = [
   "mlx-vlm>=0.7.3",
   "python-dotenv>=1.0.1",
   "silero-vad>=5.1.2",
-  "parakeet-mlx>=0.3.0",
 ]
 
 [project.optional-dependencies]
 dev = [
   "ruff>=0.9.0",
-]
-parakeet = [
-  "parakeet-mlx>=0.3.0",
 ]
 test = [
   "psutil>=7.0.0",

@@ -22,12 +22,15 @@ final class TranscriptStore: ObservableObject {
         case .level:
             break
         case .caption(let type, let utteranceID, let original, let translation):
+            let existing = entries.first(where: { $0.id == utteranceID })
+            if type == .partial, let existing, existing.state != .partial {
+                return
+            }
             lastError = nil
             if type == .partial {
                 partialTickAt = Date()
             }
 
-            let existing = entries.first(where: { $0.id == utteranceID })
             let previousOriginal = existing?.original ?? ""
             let previousTranslation = existing?.translation ?? ""
 
