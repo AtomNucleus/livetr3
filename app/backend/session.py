@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from difflib import SequenceMatcher
 import json
 import logging
 import os
@@ -15,8 +14,13 @@ from typing import Literal
 from uuid import uuid4
 
 import numpy as np
-from mlx_worker import InferenceTimeoutError, MLXWorkerService, WorkerStatusEvent
-from parakeet_worker import ASRResult, ParakeetASRService
+from mlx_worker import (
+    ASTResult,
+    InferenceTimeoutError,
+    MLXWorkerService,
+    WorkerStatusEvent,
+    _parse_ast_response,
+)
 from protocol import (
     ConfigMessage,
     ErrorMessage,
@@ -43,9 +47,6 @@ ARCHIVE_ROOT = (
 )
 LEARNING_PROFILE_PATH = (
     Path.home() / "Library" / "Application Support" / "LiveTR3" / "learning_profile.json"
-)
-MAX_LEARNED_ASR_CORRECTIONS = max(
-    8, int(os.getenv("MAX_LEARNED_ASR_CORRECTIONS", "64"))
 )
 PARTIAL_INTERVAL_MIN_SECONDS = 0.2
 PARTIAL_INTERVAL_MAX_SECONDS = 3.0
@@ -86,14 +87,6 @@ DEFAULT_EARLY_COMMIT_STABILITY = os.getenv("EARLY_COMMIT_STABILITY", "true").low
     "off",
 }
 DEFAULT_STABILITY_WINDOW = max(2, int(os.getenv("STABILITY_WINDOW", "2")))
-DEFAULT_PRIOR_CONTEXT_ENABLED = os.getenv(
-    "PRIOR_CONTEXT_ENABLED", "false"
-).lower() not in {
-    "0",
-    "false",
-    "no",
-    "off",
-}
 DEFAULT_PARTIAL_MIN_AUDIO_SECONDS = max(
     0.0, float(os.getenv("PARTIAL_MIN_AUDIO_SECONDS", "0.25"))
 )
@@ -128,12 +121,11 @@ class UtteranceRuntime:
     last_audio_frame_unix_seconds: float | None = None
     last_partial_wall_seconds: float = 0.0
     last_partial_audio_samples: int = 0
+    slowest_partial_turnaround_seconds: float = 0.0
     last_voiced_audio_samples: int = 0
     voiced_audio_samples: int = 0
     latest_partial_original: str = ""
     latest_partial_translation: str = ""
-    latest_translation_original: str = ""
-    translation_incomplete: bool = False
 
 
 def _source_text_ends_sentence(text: str) -> bool:
@@ -149,125 +141,6 @@ def _source_text_ends_sentence(text: str) -> bool:
 
 def _normalize_stability_text(text: str) -> str:
     return text.strip().rstrip(TRAILING_PUNCTUATION_QUOTES + SOURCE_END_PUNCTUATION).lower()
-
-
-def _normalize_learned_text(text: str) -> str:
-    text = re.sub(r"[^\w\s]", "", text, flags=re.UNICODE)
-    return " ".join(text.lower().split())
-
-
-def _source_extends_translation(current: str, translated_source: str) -> bool:
-    """A translated prefix remains valid when speech grows, but not when ASR revises it."""
-    current = _normalize_learned_text(current)
-    translated_source = _normalize_learned_text(translated_source)
-    return bool(translated_source) and (
-        current == translated_source or current.startswith(translated_source + " ")
-    )
-
-
-SPANISH_HINT_WORDS = {
-    "a",
-    "al",
-    "como",
-    "con",
-    "de",
-    "del",
-    "dios",
-    "el",
-    "en",
-    "evangelio",
-    "iglesia",
-    "la",
-    "las",
-    "lo",
-    "los",
-    "nosotros",
-    "para",
-    "palabra",
-    "por",
-    "que",
-    "se",
-    "señor",
-    "tu",
-    "un",
-    "una",
-    "vida",
-    "viva",
-    "y",
-}
-ENGLISH_HINT_WORDS = {
-    "a",
-    "all",
-    "and",
-    "are",
-    "christian",
-    "christians",
-    "church",
-    "for",
-    "god",
-    "gospel",
-    "in",
-    "is",
-    "it",
-    "life",
-    "new",
-    "them",
-    "of",
-    "that",
-    "the",
-    "this",
-    "to",
-    "we",
-    "word",
-    "you",
-}
-
-
-def _language_hint_score(text: str, words: set[str]) -> int:
-    tokens = re.findall(r"[\wñáéíóúü]+", text.lower(), flags=re.UNICODE)
-    return sum(1 for token in tokens if token in words)
-
-
-def _spanish_hint_score(text: str) -> int:
-    return _language_hint_score(text, SPANISH_HINT_WORDS) + len(
-        re.findall(r"[ñáéíóúü]", text.lower())
-    )
-
-
-def _english_hint_score(text: str) -> int:
-    return _language_hint_score(text, ENGLISH_HINT_WORDS)
-
-
-def _looks_like_translation_pair(heard: str, corrected: str) -> bool:
-    heard_spanish = _spanish_hint_score(heard)
-    heard_english = _english_hint_score(heard)
-    corrected_spanish = _spanish_hint_score(corrected)
-    corrected_english = _english_hint_score(corrected)
-    return (
-        heard_spanish >= heard_english + 2
-        and corrected_english >= corrected_spanish + 2
-    ) or (
-        heard_english >= heard_spanish + 2
-        and corrected_spanish >= corrected_english + 2
-    ) or (
-        heard_spanish >= 1
-        and corrected_english >= 1
-        and corrected_spanish == 0
-    ) or (
-        heard_english >= 1
-        and corrected_spanish >= 1
-        and heard_spanish == 0
-    )
-
-
-def _language_hint(text: str) -> Literal["English", "Spanish"] | None:
-    spanish = _spanish_hint_score(text)
-    english = _english_hint_score(text)
-    if spanish >= english + 1:
-        return "Spanish"
-    if english >= spanish + 1:
-        return "English"
-    return None
 
 
 def _bounded_partial_interval_seconds(value: float, *, source: str) -> float:
@@ -448,15 +321,10 @@ class TranscriptionSession:
         websocket: SessionTransport,
         worker: MLXWorkerService,
         hub: SessionHub,
-        *,
-        transcription_engine: str = "gemma",
-        asr_worker: ParakeetASRService | None = None,
     ) -> None:
         self.websocket = websocket
         self.worker = worker
-        self.asr_worker = asr_worker
         self.hub = hub
-        self.transcription_engine = transcription_engine
         self.state = SessionState()
         self.segmenter: RMSGate = self._build_segmenter(self.state.config)
         self.ring: deque[np.ndarray] = deque(maxlen=int(30 / 0.02))
@@ -480,10 +348,7 @@ class TranscriptionSession:
 
     async def run(self) -> None:
         await self.websocket.accept()
-        if self.transcription_engine == "gemma":
-            await self.worker.add_status_listener(self._handle_worker_status)
-        if self.asr_worker is not None:
-            await self.asr_worker.add_status_listener(self._handle_worker_status)
+        await self.worker.add_status_listener(self._handle_worker_status)
         try:
             while True:
                 message = await self.websocket.receive()
@@ -494,10 +359,7 @@ class TranscriptionSession:
                 elif message.get("text") is not None:
                     await self._receive_text(message["text"])
         finally:
-            if self.transcription_engine == "gemma":
-                self.worker.remove_status_listener(self._handle_worker_status)
-            if self.asr_worker is not None:
-                self.asr_worker.remove_status_listener(self._handle_worker_status)
+            self.worker.remove_status_listener(self._handle_worker_status)
             await self.hub.detach(self.session_id, self)
             await self._finalize_archive()
             for task in self._jobs:
@@ -730,20 +592,42 @@ class TranscriptionSession:
             utterance_id in self._finalized or utterance_id in self._finalizing
         ):
             return
+        if priority == "partial":
+            scheduled = self._run_scheduled_partial_ast(
+                priority, utterance_id, audio.copy()
+            )
+        else:
+            scheduled = self._run_ast(priority, utterance_id, audio.copy())
         task = asyncio.create_task(
-            self._run_ast(priority, utterance_id, audio.copy()),
+            scheduled,
             name=f"{priority}-ast-{utterance_id}",
         )
         self._jobs.add(task)
         task.add_done_callback(self._jobs.discard)
 
+    async def _run_scheduled_partial_ast(
+        self, priority: str, utterance_id: int, audio: np.ndarray
+    ) -> None:
+        started_at = time.monotonic()
+        try:
+            await self._run_ast(priority, utterance_id, audio)
+        finally:
+            runtime = self._utterance_runtime.get(utterance_id)
+            if (
+                runtime is not None
+                and utterance_id not in self._finalizing
+                and utterance_id not in self._finalized
+            ):
+                # This includes queue wait, so a congested worker also slows preview submissions.
+                turnaround = max(0.0, time.monotonic() - started_at)
+                runtime.slowest_partial_turnaround_seconds = max(
+                    runtime.slowest_partial_turnaround_seconds, turnaround
+                )
+
     async def _run_ast(self, priority: str, utterance_id: int, audio: np.ndarray) -> None:
         started_at = time.monotonic()
         try:
-            if self._should_use_parakeet_asr():
-                await self._run_parakeet_asr(priority, utterance_id, audio)
-            else:
-                await self._run_mlx_ast(priority, utterance_id, audio)
+            await self._run_mlx_ast(priority, utterance_id, audio)
         finally:
             # Errors, empty decodes, and cancellation must not leave a commit pending.
             if priority == "final":
@@ -757,6 +641,42 @@ class TranscriptionSession:
                 )
 
     async def _run_mlx_ast(self, priority: str, utterance_id: int, audio: np.ndarray) -> None:
+        async def publish_progress(text: str) -> None:
+            if utterance_id in self._finalized:
+                return
+            if priority == "partial" and utterance_id in self._finalizing:
+                return
+            original, translation = _parse_ast_response(
+                text,
+                self.state.config.target_lang,
+                self.state.config.source_lang,
+            )
+            original = original.strip()
+            translation = translation.strip()
+            if not original:
+                return
+            if not self._should_translate_final(original):
+                translation = original
+            runtime = self._utterance_runtime.setdefault(
+                utterance_id,
+                UtteranceRuntime(partials=deque(maxlen=self._stability_window())),
+            )
+            if (
+                original == runtime.latest_partial_original
+                and translation == runtime.latest_partial_translation
+            ):
+                return
+            runtime.latest_partial_original = original
+            runtime.latest_partial_translation = translation
+            await self._send_and_broadcast(
+                TranscriptMessage(
+                    type="partial",
+                    utterance_id=utterance_id,
+                    original=original,
+                    translation=translation,
+                ).model_dump(exclude_none=True)
+            )
+
         try:
             result = await self.worker.submit_ast(
                 priority="final" if priority == "final" else "partial",
@@ -764,12 +684,12 @@ class TranscriptionSession:
                 audio_f32_16k=audio,
                 src=self.state.config.source_lang,
                 tgt=self.state.config.target_lang,
-                prior_context=self.state.prior_context[-2:]
-                if DEFAULT_PRIOR_CONTEXT_ENABLED
-                else [],
-                custom_vocab=[] if priority == "partial" else self.state.config.custom_vocab,
+                # Model-generated prior captions can repeat an earlier recognition error.
+                prior_context=[],
+                custom_vocab=self.state.config.custom_vocab,
                 code_switching_enabled=self.state.config.code_switching_enabled,
                 max_tokens=self._max_tokens_for_ast(priority, audio),
+                on_progress=publish_progress,
             )
         except asyncio.CancelledError:
             raise
@@ -785,7 +705,16 @@ class TranscriptionSession:
 
         if result is None:
             return
-        original, translation = result
+        if not isinstance(result, ASTResult):
+            await self._send_error("Inference failed: model returned an invalid AST result")
+            return
+        if not result.complete:
+            if priority == "final":
+                await self._send_error(
+                    "Final inference remained incomplete after one retry; no final caption was published"
+                )
+            return
+        original, translation = result.original, result.translation
 
         if priority == "partial":
             if utterance_id in self._finalized or utterance_id in self._finalizing:
@@ -821,7 +750,6 @@ class TranscriptionSession:
         runtime = self._utterance_runtime.pop(utterance_id, None)
         self.state.prior_context.append((original, translation))
         self.state.prior_context = self.state.prior_context[-2:]
-        self._remember_bilingual_context(original, translation)
         self.state.utterances_since_maintenance += 1
         await self._send_and_broadcast(
             TranscriptMessage(
@@ -847,259 +775,6 @@ class TranscriptionSession:
             task.add_done_callback(self._jobs.discard)
         await self._maybe_run_maintenance()
 
-    def _should_use_parakeet_asr(self) -> bool:
-        return (
-            self.transcription_engine == "parakeet"
-            and self.state.config.source_lang in {
-                "English", "Spanish", "French", "German", "Italian", "Portuguese"
-            }
-            and not self.state.config.code_switching_enabled
-        )
-
-    async def _run_parakeet_asr(self, priority: str, utterance_id: int, audio: np.ndarray) -> None:
-        if self.asr_worker is None:
-            await self._send_error("Parakeet ASR is not configured; set TRANSCRIPTION_ENGINE=gemma to use Gemma AST fallback")
-            return
-        try:
-            result = await self.asr_worker.submit_asr(
-                priority="final" if priority == "final" else "partial",
-                utterance_id=utterance_id,
-                audio_f32_16k=audio,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            await self._send_error(f"Parakeet ASR failed: {exc}")
-            return
-
-        if result is None:
-            return
-
-        original = result.text.strip() if isinstance(result, ASRResult) else str(result).strip()
-        if not original:
-            return
-
-        if priority == "partial":
-            if utterance_id in self._finalized or utterance_id in self._finalizing:
-                return
-            runtime = self._utterance_runtime.setdefault(
-                utterance_id,
-                UtteranceRuntime(partials=deque(maxlen=self._stability_window())),
-            )
-            translation = (
-                runtime.latest_partial_translation
-                if _source_extends_translation(original, runtime.latest_translation_original)
-                else ""
-            )
-            if (not translation or _normalize_learned_text(original)
-                    != _normalize_learned_text(runtime.latest_translation_original)):
-                task = asyncio.create_task(
-                    self._run_partial_translation_update(utterance_id, original),
-                    name=f"partial-translation-{utterance_id}",
-                )
-                self._jobs.add(task)
-                task.add_done_callback(self._jobs.discard)
-            if utterance_id in self._finalized or utterance_id in self._finalizing:
-                return
-            runtime.latest_partial_original = original
-            runtime.latest_partial_translation = translation
-            await self._send_and_broadcast(
-                TranscriptMessage(
-                    type="partial",
-                    utterance_id=utterance_id,
-                    original=original,
-                    translation=translation,
-                ).model_dump(exclude_none=True)
-            )
-            await self._maybe_commit_early(utterance_id, original)
-            return
-
-        commit_reason = self._finalizing.pop(utterance_id, "silero_end")
-        runtime = self._utterance_runtime.pop(utterance_id, None)
-        correction_context = self.state.prior_context[-3:]
-        last_audio_frame_unix_seconds = (
-            runtime.last_audio_frame_unix_seconds if runtime is not None else None
-        )
-        translation = self._promotable_partial_translation(runtime, original) or (
-            original if not self._should_translate_final(original) else ""
-        )
-
-        self._finalized.add(utterance_id)
-        if translation:
-            self._remember_final_context(original, translation)
-        self.state.utterances_since_maintenance += 1
-        await self._send_and_broadcast(
-            TranscriptMessage(
-                type="final",
-                utterance_id=utterance_id,
-                original=original,
-                translation=translation,
-                commit_reason=commit_reason,
-                last_audio_frame_unix_seconds=last_audio_frame_unix_seconds,
-            ).model_dump(exclude_none=True)
-        )
-
-        skip_polish = self._skip_next_polish
-        self._skip_next_polish = False
-        if self.state.config.polish_enabled and not skip_polish:
-            task = asyncio.create_task(
-                self._run_polish(utterance_id, original, translation),
-                name=f"polish-{utterance_id}",
-            )
-            self._jobs.add(task)
-            task.add_done_callback(self._jobs.discard)
-        if self._should_run_final_translation_refresh(original):
-            task = asyncio.create_task(
-                self._run_final_translation_refresh(
-                    utterance_id,
-                    original,
-                    commit_reason,
-                    correction_context,
-                    translation,
-                ),
-                name=f"refresh-final-{utterance_id}",
-            )
-            self._jobs.add(task)
-            task.add_done_callback(self._jobs.discard)
-        await self._maybe_run_maintenance()
-
-    async def _run_partial_translation_update(self, utterance_id: int, original: str) -> None:
-        translation = await self._translate_partial(utterance_id, original)
-        if translation is None:
-            return
-        await self._publish_translation_preview(utterance_id, original, translation, complete=True)
-
-    async def _publish_translation_preview(
-        self, utterance_id: int, original: str, translation: str, *, complete: bool = False,
-    ) -> None:
-        if not translation.strip():
-            return
-        runtime = self._utterance_runtime.get(utterance_id)
-        if (runtime is None or utterance_id in self._finalizing
-                or utterance_id in self._finalized):
-            return
-        current_original = runtime.latest_partial_original
-        if not _source_extends_translation(current_original, original):
-            return
-        # Never let a late, shorter translation overwrite one covering more speech.
-        if (runtime.latest_partial_translation
-                and _source_extends_translation(runtime.latest_translation_original, original)
-                and _normalize_learned_text(runtime.latest_translation_original)
-                != _normalize_learned_text(original)):
-            return
-        # A fresh decode repeats its prefix; keep the existing words until it catches up.
-        if (not complete and runtime.latest_partial_translation
-                and runtime.latest_partial_translation.startswith(translation)
-                and _source_extends_translation(original, runtime.latest_translation_original)):
-            return
-        runtime.translation_incomplete = not complete
-        runtime.latest_translation_original = original
-        runtime.latest_partial_translation = translation
-        await self._send_and_broadcast(
-            TranscriptMessage(
-                type="partial",
-                utterance_id=utterance_id,
-                original=current_original,
-                translation=translation,
-            ).model_dump(exclude_none=True)
-        )
-
-    async def _run_final_translation_refresh(
-        self,
-        utterance_id: int,
-        original: str,
-        commit_reason: CommitReason,
-        correction_context: list[tuple[str, str]],
-        previous_translation: str,
-    ) -> None:
-        translation = await self._translate_final(utterance_id, original)
-        if translation is not None and translation.strip() != previous_translation.strip():
-            self._remember_final_context(original, translation, replacing_original=original)
-            await self._send_and_broadcast(
-                TranscriptMessage(
-                    type="final",
-                    utterance_id=utterance_id,
-                    original=original,
-                    translation=translation,
-                    commit_reason=commit_reason,
-                ).model_dump(exclude_none=True)
-            )
-
-        if not self._should_run_async_asr_correction(original):
-            return
-
-        corrected_original = await self._correct_final_asr(original, correction_context)
-        if corrected_original is None:
-            corrected_original = original
-        corrected_original = corrected_original.strip() or original
-        if _normalize_learned_text(corrected_original) == _normalize_learned_text(original):
-            return
-
-        corrected_translation = await self._translate_final(utterance_id, corrected_original)
-        if corrected_translation is None:
-            return
-        self._remember_asr_correction(original, corrected_original)
-        if (
-            corrected_translation.strip() == (translation or previous_translation).strip()
-        ):
-            return
-        self._remember_final_context(corrected_original, corrected_translation, replacing_original=original)
-        await self._send_and_broadcast(
-            TranscriptMessage(
-                type="final",
-                utterance_id=utterance_id,
-                original=corrected_original,
-                translation=corrected_translation,
-                commit_reason=commit_reason,
-            ).model_dump(exclude_none=True)
-        )
-
-    def _promotable_partial_translation(
-        self,
-        runtime: UtteranceRuntime | None,
-        original: str,
-    ) -> str | None:
-        if runtime is None or runtime.translation_incomplete or not runtime.latest_partial_translation.strip():
-            return None
-        partial = runtime.latest_translation_original.strip()
-        if not partial:
-            return None
-        normalized_partial = _normalize_learned_text(partial)
-        normalized_original = _normalize_learned_text(original)
-        if not normalized_partial or not normalized_original:
-            return None
-        if normalized_partial == normalized_original:
-            return runtime.latest_partial_translation
-        return None
-
-    def _should_run_final_translation_refresh(self, original: str) -> bool:
-        return self._should_translate_final(original) or self._should_run_async_asr_correction(original)
-
-    def _should_run_async_asr_correction(self, original: str) -> bool:
-        return (
-            self.transcription_engine == "parakeet"
-            and self.state.config.asr_correction_enabled
-            and bool(original.strip())
-        )
-
-    def _remember_final_context(
-        self,
-        original: str,
-        translation: str,
-        *,
-        replacing_original: str | None = None,
-    ) -> None:
-        if replacing_original is not None:
-            for index, (prior_original, _) in enumerate(self.state.prior_context):
-                if prior_original == replacing_original:
-                    self.state.prior_context[index] = (original, translation)
-                    break
-            else:
-                self.state.prior_context.append((original, translation))
-        else:
-            self.state.prior_context.append((original, translation))
-        self.state.prior_context = self.state.prior_context[-2:]
-        self._remember_bilingual_context(original, translation)
 
     def _should_translate_final(self, original: str) -> bool:
         return (
@@ -1108,170 +783,30 @@ class TranscriptionSession:
             != self.state.config.target_lang.strip().lower()
         )
 
-    async def _translate_partial(self, utterance_id: int, original: str) -> str | None:
-        if not self._should_translate_final(original):
-            return original
-        try:
-            await self.worker.start()
-            translation = await self.worker.submit_translate_text(
-                original,
-                self.state.config.source_lang,
-                self.state.config.target_lang,
-                priority="partial",
-                utterance_id=utterance_id,
-                on_progress=lambda text: self._publish_translation_preview(utterance_id, original, text),
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            await self._send_error(f"Partial translation failed: {exc}")
-            return None
-        return translation
-
-    async def _translate_final(self, utterance_id: int, original: str) -> str | None:
-        if not self._should_translate_final(original):
-            return original
-        try:
-            await self.worker.start()
-            translation = await self.worker.submit_translate_text(
-                original,
-                self.state.config.source_lang,
-                self.state.config.target_lang,
-                priority="final",
-                utterance_id=utterance_id,
-                bilingual_context=self._bilingual_context_for_translation(),
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            await self._send_error(f"Translation failed: {exc}")
-            return None
-        return translation
-
-    async def _correct_final_asr(
-        self,
-        original: str,
-        correction_context: list[tuple[str, str]],
-    ) -> str | None:
-        if self.transcription_engine != "parakeet":
-            return original
-        if not self.state.config.asr_correction_enabled:
-            return original
-        if not original.strip():
-            return original
-        try:
-            await self.worker.start()
-            corrected = await self.worker.submit_correct_asr_text(
-                original,
-                self.state.config.source_lang,
-                custom_vocab=self.state.config.custom_vocab,
-                prior_context=correction_context,
-                learned_corrections=self._learned_asr_corrections_for_prompt(),
-                code_switching_enabled=self.state.config.code_switching_enabled,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            await self._send_error(f"ASR correction failed: {exc}")
-            return original
-        return corrected.strip() or original
-
-    def _remember_asr_correction(self, heard: str, corrected: str) -> None:
-        if not self.state.config.transcript_learning_enabled:
-            return
-        heard = " ".join(heard.strip().split())
-        corrected = " ".join(corrected.strip().split())
-        if not heard or not corrected:
-            return
-        if _normalize_learned_text(heard) == _normalize_learned_text(corrected):
-            return
-        if _looks_like_translation_pair(heard, corrected):
-            return
-        pair = (heard, corrected)
-        if pair in self.state.asr_corrections:
-            self.state.asr_corrections.remove(pair)
-        self.state.asr_corrections.append(pair)
-        self.state.asr_corrections = self.state.asr_corrections[
-            -MAX_LEARNED_ASR_CORRECTIONS:
-        ]
-
-    def _learned_asr_corrections_for_prompt(self) -> list[tuple[str, str]]:
-        if not self.state.config.transcript_learning_enabled:
-            return []
-        return self.state.asr_corrections[-8:]
 
     def _load_global_learning_profile(self) -> None:
         try:
             profile = json.loads(LEARNING_PROFILE_PATH.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return
-        for item in profile.get("asr_corrections", []):
-            if not isinstance(item, list | tuple) or len(item) != 2:
-                continue
-            heard, corrected = item
-            if isinstance(heard, str) and isinstance(corrected, str):
-                self._remember_asr_correction(heard, corrected)
-        for item in profile.get("bilingual_context", []):
-            if not isinstance(item, list | tuple) or len(item) != 2:
-                continue
-            original, translation = item
-            if isinstance(original, str) and isinstance(translation, str):
-                self._remember_bilingual_context(original, translation)
-
-    def _write_global_learning_profile(self) -> None:
-        LEARNING_PROFILE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        profile = {
-            "version": 1,
-            "updated_at": datetime.now().astimezone().isoformat(),
-            "asr_corrections": self.state.asr_corrections[
-                -MAX_LEARNED_ASR_CORRECTIONS:
-            ],
-            "bilingual_context": self.state.bilingual_context[-32:],
-        }
-        LEARNING_PROFILE_PATH.write_text(
-            json.dumps(profile, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-
-    def _remember_bilingual_context(self, original: str, translation: str) -> None:
-        if not self.state.config.bilingual_context_enabled:
-            return
-        original = " ".join(original.strip().split())
-        translation = " ".join(translation.strip().split())
-        if not original or not translation or original == translation:
-            return
-        pair = (original, translation)
-        if pair in self.state.bilingual_context:
-            self.state.bilingual_context.remove(pair)
-        self.state.bilingual_context.append(pair)
-        self.state.bilingual_context = self.state.bilingual_context[-8:]
-
-    def _bilingual_context_for_translation(self) -> list[tuple[str, str]]:
-        if not self.state.config.bilingual_context_enabled:
-            return []
-        return self.state.bilingual_context[-5:]
+        # Preserve legacy profile data for archive compatibility; never use it to
+        # rewrite captions or overwrite the user's profile on disk.
+        for key in ("asr_corrections", "bilingual_context"):
+            pairs = profile.get(key, [])
+            setattr(self.state, key, [
+                (item[0], item[1]) for item in pairs
+                if isinstance(item, (list, tuple)) and len(item) == 2
+                and all(isinstance(value, str) for value in item)
+            ])
 
     def _partial_inference_is_busy_or_backlogged(self) -> bool:
-        if self._should_use_parakeet_asr() and self.asr_worker is not None:
-            return self.asr_worker.is_busy_or_backlogged
         return self.worker.is_busy_or_backlogged
 
     def _schedule_worker_warmup(self) -> None:
-        if not self._session_uses_mlx_worker():
-            return
         task = asyncio.create_task(self._warm_mlx_worker(), name="mlx-worker-warmup")
         self._jobs.add(task)
         task.add_done_callback(self._jobs.discard)
 
-    def _session_uses_mlx_worker(self) -> bool:
-        if not self._should_use_parakeet_asr():
-            return True
-        if self.state.config.asr_correction_enabled:
-            return True
-        return (
-            self.state.config.source_lang.strip().lower()
-            != self.state.config.target_lang.strip().lower()
-        )
 
     async def _warm_mlx_worker(self) -> None:
         try:
@@ -1447,15 +982,28 @@ class TranscriptionSession:
         )
 
     def _max_tokens_for_ast(self, priority: str, audio: np.ndarray) -> int:
+        if priority == "partial":
+            return 192
         duration_seconds = audio.shape[0] / 16_000
         if duration_seconds <= 8:
-            return 80
+            return 384
         if duration_seconds <= 15:
-            return 128
-        return 192
+            return 512
+        return 640
 
     def _partial_interval_seconds(self) -> float:
-        return self.state.config.partial_interval_seconds or DEFAULT_PARTIAL_INTERVAL_SECONDS
+        configured = (
+            self.state.config.partial_interval_seconds
+            or DEFAULT_PARTIAL_INTERVAL_SECONDS
+        )
+        runtime = self._active_utterance_runtime()
+        if runtime is None:
+            return configured
+        service_interval = min(
+            PARTIAL_INTERVAL_MAX_SECONDS,
+            runtime.slowest_partial_turnaround_seconds,
+        )
+        return max(configured, service_interval)
 
     def _active_utterance_runtime(self) -> UtteranceRuntime | None:
         if self.state.active_utterance_id is None:
@@ -1592,10 +1140,6 @@ class TranscriptionSession:
             return
         archive_dir = self._archive_dir
         events = list(self._archive_events)
-        self._load_global_learning_profile()
-        self._learn_asr_corrections_from_archive_events(events)
-        self._learn_bilingual_context_from_archive_events(events)
-        self._write_global_learning_profile()
         utterances = [self._archive_utterances[key] for key in sorted(self._archive_utterances)]
         duration_seconds = self._archive_elapsed_seconds()
         meta = {
@@ -1734,52 +1278,6 @@ class TranscriptionSession:
         except (OSError, json.JSONDecodeError):
             return {}
 
-    def _learn_asr_corrections_from_archive_events(self, events: list[dict]) -> None:
-        if not self.state.config.transcript_learning_enabled:
-            return
-        first_final_by_id: dict[int, str] = {}
-        latest_final_by_id: dict[int, str] = {}
-        for event in events:
-            payload = event.get("payload", {})
-            if payload.get("type") != "final":
-                continue
-            utterance_id = payload.get("utterance_id")
-            original = payload.get("original")
-            if not isinstance(utterance_id, int) or not isinstance(original, str):
-                continue
-            first_final_by_id.setdefault(utterance_id, original)
-            latest_final_by_id[utterance_id] = original
-        for utterance_id, heard in first_final_by_id.items():
-            corrected = latest_final_by_id.get(utterance_id, "")
-            self._remember_asr_correction(heard, corrected)
-
-    def _learn_bilingual_context_from_archive_events(self, events: list[dict]) -> None:
-        if not self.state.config.bilingual_context_enabled:
-            return
-        latest_final_by_id: dict[int, str] = {}
-        for event in events:
-            payload = event.get("payload", {})
-            if payload.get("type") != "final":
-                continue
-            utterance_id = payload.get("utterance_id")
-            original = payload.get("original")
-            if isinstance(utterance_id, int) and isinstance(original, str):
-                latest_final_by_id[utterance_id] = original
-
-        finals = [
-            (utterance_id, text)
-            for utterance_id, text in sorted(latest_final_by_id.items())
-            if text.strip()
-        ]
-        for (_, first_text), (_, second_text) in zip(finals, finals[1:]):
-            first_language = _language_hint(first_text)
-            second_language = _language_hint(second_text)
-            if first_language == second_language or not first_language or not second_language:
-                continue
-            if first_language == self.state.config.source_lang:
-                self._remember_bilingual_context(first_text, second_text)
-            elif second_language == self.state.config.source_lang:
-                self._remember_bilingual_context(second_text, first_text)
 
     def _utterances_from_events(self, events: list[dict]) -> dict[int, dict]:
         utterances: dict[int, dict] = {}

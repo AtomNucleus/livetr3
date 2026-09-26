@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from mlx_worker import MLXWorker
+from mlx_worker import AST_MAX_AUDIO_SECONDS, MLXWorker
 
 
 def read_wav_16k_mono(path: Path) -> np.ndarray:
@@ -16,8 +16,8 @@ def read_wav_16k_mono(path: Path) -> np.ndarray:
         raise ValueError(
             f"{path} is {sample_rate} Hz. Convert to 16 kHz mono float32 before smoke testing."
         )
-    if mono.shape[0] > 25 * 16_000:
-        mono = mono[: 25 * 16_000]
+    if mono.shape[0] > AST_MAX_AUDIO_SECONDS * 16_000:
+        raise ValueError(f"Audio must be at most {AST_MAX_AUDIO_SECONDS} seconds")
     return np.clip(mono, -1.0, 1.0).astype(np.float32, copy=False)
 
 
@@ -31,7 +31,7 @@ def main() -> None:
 
     custom_vocab = [item.strip() for item in args.vocab.split(",") if item.strip()]
     worker = MLXWorker()
-    original, translation = worker.ast(
+    result = worker.ast(
         read_wav_16k_mono(args.wav),
         args.source,
         args.target,
@@ -39,10 +39,11 @@ def main() -> None:
         custom_vocab=custom_vocab,
         max_tokens=256,
     )
-    print(original)
-    print(f"{args.target}: {translation}")
+    if result is None or not result.complete:
+        raise SystemExit("Gemma did not produce a complete transcription and translation")
+    print(result.original)
+    print(f"{args.target}: {result.translation}")
 
 
 if __name__ == "__main__":
     main()
-

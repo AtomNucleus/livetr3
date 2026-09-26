@@ -8,6 +8,8 @@ import numpy as np
 
 SAMPLE_RATE = 16_000
 FRAME_SAMPLES = 320
+MAX_UTTERANCE_SECONDS = 29.0
+FRAME_SECONDS = FRAME_SAMPLES / SAMPLE_RATE
 
 
 @dataclass(slots=True)
@@ -34,7 +36,10 @@ class RMSGate:
         self.threshold = threshold
         self.trailing_silence_frames = max(1, trailing_silence_ms // 20)
         self.min_utterance_frames = max(1, min_utterance_ms // 20)
-        self.max_utterance_frames = max(1, int(max_utterance_s / 0.02))
+        # Gemma's audio window is 30 seconds; keep segment boundaries below it so
+        # no caller can hand the worker a chunk that needs to be silently trimmed.
+        safe_max_utterance_s = min(float(max_utterance_s), MAX_UTTERANCE_SECONDS)
+        self.max_utterance_frames = max(1, int(safe_max_utterance_s / FRAME_SECONDS))
         self.overlap_frames = max(0, int(overlap_s / 0.02))
         self._pre_roll: deque[np.ndarray] = deque(maxlen=self.overlap_frames)
         self._current: list[np.ndarray] = []

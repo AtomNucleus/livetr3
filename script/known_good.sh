@@ -12,7 +12,6 @@ run_backend_import_gate() {
   PYTHONPATH=. uv run python -m py_compile \
     mlx_worker.py \
     session.py \
-    parakeet_worker.py \
     protocol.py \
     server.py
 }

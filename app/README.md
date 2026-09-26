@@ -23,9 +23,8 @@ It is a development app, not yet a relocatable standalone distribution.
 `script/package_engine.sh` supports a supplied standalone Python and wheelhouse
 for packaging that runtime separately.
 
-Download/cache these models before offline use:
+Download/cache this model before offline use:
 
-- `mlx-community/parakeet-tdt-0.6b-v3`
 - `mlx-community/gemma-4-e4b-it-8bit`
 
 The native launcher sets offline model loading by default. Model files must
@@ -34,10 +33,9 @@ already be available in the Hugging Face cache. The engine log is
 
 ## Caption path
 
-The native app defaults to Parakeet ASR for English, Spanish, French, German,
-Italian, and Portuguese. Gemma handles translation, other source languages, and
-code-switching sessions. Set `TRANSCRIPTION_ENGINE=gemma` in the app's inherited
-environment to use Gemma ASR throughout.
+Gemma handles transcription and translation together in one normal inference
+call for every source language, including code-switching sessions. The native
+app and both backend transports use this same path without an engine override.
 
 - Apple's streaming audio converter produces 16 kHz mono PCM with continuous
   resampling and anti-alias filtering. Pausing discards captured audio.
@@ -46,17 +44,17 @@ environment to use Gemma ASR throughout.
   cadence is not a promise that inference finishes within 250 ms.
 - Each partial decodes the complete utterance so far and replaces the previous
   hypothesis. Final ASR runs again on the completed utterance.
-- Parakeet source finals appear before translation completes. A subsequent
-  message updates the same caption with the translation.
-- Gemma's audio path supplies both languages in one pass, without a redundant
-  partial translation request. Generation uses greedy decoding.
-- Automatic text-only ASR correction, transcript learning, polish, and speculative
-  punctuation/stability commits default off. A language model's rewrite is not
-  independent evidence of what was spoken.
-- Final translations outrank previews. Finalizing one utterance does not stop
+- Gemma streams source text followed by translation from the same response.
+  Generation uses greedy decoding. Incomplete finals get one bounded retry and
+  cannot be published as complete captions.
+- Preview pacing adapts to inference turnaround. Final jobs outrank previews,
+  and committing audio cancels obsolete previews. Finalizing one utterance does not stop
   partials for the next. Failed or empty finals release their pending state.
-- Parakeet consumes PCM directly in memory. Gemma temporary audio directories
-  are isolated by engine and host process.
+- Automatic transcript correction and learning are removed. Existing vocabulary,
+  archives, and legacy profile files are retained; stored corrections do not feed
+  inference. Optional polish and speculative commits remain off by default.
+- Segment lengths are capped at 29 seconds; oversized audio is rejected instead
+  of silently trimmed. Gemma temporary audio directories are isolated by process.
 - Slow jobs log queue and inference timing to the native engine log.
 
 The native macOS app is the only UI. The browser client and alternative design
@@ -72,5 +70,6 @@ cd ../..
 swift test --package-path macos/LiveTR3Mac
 ```
 
-See `docs/NATIVE_VALIDATION.md` for the current test evidence and limits. Historical
-browser/Gemma-only timing results do not characterize this native pipeline.
+See `docs/GEMMA_ONLY_VALIDATION.md` for this change's evidence and limits.
+`docs/NATIVE_VALIDATION.md` and its replay files describe the historical pipeline;
+their timings do not characterize the current combined Gemma path.

@@ -6,6 +6,7 @@ import logging
 import multiprocessing as mp
 import os
 import queue
+import re
 import tempfile
 import time
 import traceback
@@ -30,10 +31,10 @@ TEMP_WAV_SWEEP_INTERVAL_SECONDS = max(
     30, int(os.getenv("TEMP_WAV_SWEEP_INTERVAL_SECONDS", "300"))
 )
 PARTIAL_TIMEOUT_SECONDS = max(1.0, float(os.getenv("PARTIAL_TIMEOUT_SECONDS", "8")))
-FINAL_TIMEOUT_SECONDS = max(1.0, float(os.getenv("FINAL_TIMEOUT_SECONDS", "15")))
+FINAL_TIMEOUT_SECONDS = max(1.0, float(os.getenv("FINAL_TIMEOUT_SECONDS", "45")))
 POLISH_TIMEOUT_SECONDS = max(1.0, float(os.getenv("POLISH_TIMEOUT_SECONDS", "10")))
-TRANSLATE_TIMEOUT_SECONDS = max(1.0, float(os.getenv("TRANSLATE_TIMEOUT_SECONDS", "12")))
 MAINTENANCE_TIMEOUT_SECONDS = max(1.0, float(os.getenv("MAINTENANCE_TIMEOUT_SECONDS", "5")))
+AST_MAX_AUDIO_SECONDS = 30
 MLX_WORKER_START_TIMEOUT_SECONDS = max(
     10.0, float(os.getenv("MLX_WORKER_START_TIMEOUT_SECONDS", "180"))
 )
@@ -42,8 +43,10 @@ MLX_WORKER_RECOVERY_BACKOFF_SECONDS = max(
 )
 
 AST_PROMPT = (
-    "Transcribe the following speech segment in {src}, "
-    "then translate it into {tgt}. When formatting the answer, "
+    "Transcribe the following speech segment in {src} into {src} text, "
+    "then translate it into {tgt}. Transcribe exactly as spoken and preserve "
+    "every word, especially negation and quantities. Do not add, omit, or infer words. "
+    "When formatting the answer, "
     "first output the transcription in {src}, then one newline, "
     "then output the string '{tgt}: ', then the translation in {tgt}."
 )
@@ -55,30 +58,13 @@ POLISH_PROMPT = (
     "with no preamble.\n\nTranscription: {text}"
 )
 
-TRANSLATE_PROMPT = (
-    "Translate the following text from {src} to {tgt}. Return ONLY the translation "
-    "with no preamble.\n\nText: {text}"
-)
 
-CONTEXTUAL_TRANSLATE_PROMPT = (
-    "Translate the following text from {src} to {tgt}. Return ONLY the translation "
-    "with no preamble.\n\n"
-    "Use these recent bilingual reference pairs only to preserve names, recurring "
-    "church terms, scripture wording, tone, and phrase choices when they clearly "
-    "apply. Do not copy a reference pair unless it matches the text being translated.\n\n"
-    "{context}\n\nText: {text}"
-)
-
-ASR_CORRECTION_PROMPT = (
-    "You will receive a finalized ASR transcript in {src}. Correct likely speech "
-    "recognition errors, punctuation, capitalization, and spacing. Preserve the "
-    "speaker's wording and meaning. Do not summarize, translate, add commentary, "
-    "or censor. Never translate the transcript; if the transcript is actually in "
-    "another language, keep that language and only fix recognition mistakes. "
-    "Use the optional context only when it plausibly matches what was "
-    "said. Return ONLY the corrected {src} transcript.\n\n{context}Transcript: {text}"
-)
-
+@dataclass(slots=True, frozen=True)
+class ASTResult:
+    original: str
+    translation: str
+    complete: bool
+    truncated: bool
 
 class MLXWorker:
     def __init__(self, temp_wav_root: Path | None = None) -> None:
@@ -93,7 +79,14 @@ class MLXWorker:
 
     def _warmup(self) -> None:
         silent = np.zeros(16_000, dtype=np.float32)
-        self.ast(silent, "English", "Spanish", prior_context=[], max_tokens=8)
+        self.ast(
+            silent,
+            "English",
+            "Spanish",
+            prior_context=[],
+            max_tokens=8,
+            priority="partial",
+        )
 
     def ast(
         self,
@@ -104,13 +97,18 @@ class MLXWorker:
         custom_vocab: list[str] | None = None,
         code_switching_enabled: bool = False,
         max_tokens: int = 256,
-    ) -> tuple[str, str]:
-        from mlx_vlm import generate
-        from mlx_vlm.prompt_utils import apply_chat_template
-
+        priority: Literal["partial", "final"] = "final",
+        cancelled: Callable[[], bool] | None = None,
+        on_progress: Callable[[str], None] | None = None,
+    ) -> ASTResult | None:
         audio_f32_16k = np.asarray(audio_f32_16k, dtype=np.float32).reshape(-1)
-        if audio_f32_16k.shape[0] > 25 * 16_000:
-            audio_f32_16k = audio_f32_16k[: 25 * 16_000]
+        if audio_f32_16k.shape[0] > AST_MAX_AUDIO_SECONDS * 16_000:
+            raise ValueError(
+                f"Gemma AST audio exceeds the {AST_MAX_AUDIO_SECONDS}-second clip limit"
+            )
+
+        from mlx_vlm import stream_generate
+        from mlx_vlm.prompt_utils import apply_chat_template
 
         fd, wav_path_raw = tempfile.mkstemp(
             suffix=".wav",
@@ -124,9 +122,12 @@ class MLXWorker:
             sf.write(wav_path, audio_f32_16k, 16_000, subtype="FLOAT")
             prompt_text = AST_PROMPT.format(src=src, tgt=tgt)
             if custom_vocab:
+                vocabulary = [" ".join(item.split()) for item in custom_vocab if item.strip()]
+                vocabulary = vocabulary[:12]
                 prompt_text = (
-                    f"The speaker frequently uses these terms: {', '.join(custom_vocab)}. "
-                    "Prefer them when acoustically ambiguous.\n\n"
+                    f"Possible names or terms include: {', '.join(vocabulary)}. "
+                    "Use a listed term only when the audio supports it; do not insert one "
+                    "because it appears in this list.\n\n"
                     + prompt_text
                 )
             if code_switching_enabled:
@@ -135,10 +136,6 @@ class MLXWorker:
                     f"transcribe in the spoken language, translate to {tgt}.\n\n"
                     + prompt_text
                 )
-            if prior_context:
-                ctx = "\n".join(f"Previous: {o} / {t}" for o, t in prior_context[-2:])
-                prompt_text = ctx + "\n\n" + prompt_text
-
             # mlx-vlm expands num_audios before the prompt text; do not hand-roll templates.
             formatted = apply_chat_template(
                 self.processor,
@@ -146,25 +143,53 @@ class MLXWorker:
                 prompt_text,
                 num_audios=1,
             )
-            out = _generation_text(
-                generate(
+            def generate_once(token_budget: int) -> ASTResult | None:
+                if cancelled is not None and cancelled():
+                    return None
+                stream = stream_generate(
                     self.model,
                     self.processor,
                     formatted,
                     audio=[str(wav_path)],
-                    max_tokens=max_tokens,
+                    max_tokens=token_budget,
                     temperature=0.0,
                     top_p=0.95,
                     top_k=64,
-                    verbose=False,
                 )
-            )
-            marker = f"\n{tgt}: "
-            if marker in out:
-                original, translation = out.split(marker, 1)
-            else:
-                original, translation = out, ""
-            return original.strip(), translation.strip()
+                pieces: list[str] = []
+                latest_response: object | None = None
+                last_progress_text = ""
+                try:
+                    for response in stream:
+                        if cancelled is not None and cancelled():
+                            return None
+                        latest_response = response
+                        piece = getattr(response, "text", None)
+                        if isinstance(piece, str):
+                            pieces.append(piece)
+                        output = "".join(pieces)
+                        if output and output != last_progress_text and on_progress is not None:
+                            on_progress(output)
+                            last_progress_text = output
+                finally:
+                    close = getattr(stream, "close", None)
+                    if callable(close):
+                        close()
+
+                output = "".join(pieces)
+                original, translation = _parse_ast_response(output, tgt, src)
+                truncated = _generation_was_truncated(latest_response, token_budget)
+                complete = bool(original and translation and not truncated)
+                return ASTResult(original, translation, complete, truncated)
+
+            result = generate_once(max_tokens)
+            if result is None:
+                return None
+            if priority == "final" and not result.complete:
+                retry_budget = min(768, max_tokens * 2)
+                if retry_budget > max_tokens:
+                    result = generate_once(retry_budget)
+            return result
         finally:
             _safe_unlink(wav_path)
 
@@ -188,119 +213,6 @@ class MLXWorker:
         )
         return out.strip()
 
-    def translate_text(
-        self,
-        text: str,
-        src: str,
-        tgt: str,
-        max_tokens: int = 256,
-        bilingual_context: list[tuple[str, str]] | None = None,
-        cancelled: Callable[[], bool] | None = None,
-        on_progress: Callable[[str], None] | None = None,
-    ) -> str | None:
-        from mlx_vlm import generate
-        from mlx_vlm.prompt_utils import apply_chat_template
-
-        context = _format_bilingual_context(bilingual_context or [])
-        if context:
-            prompt = CONTEXTUAL_TRANSLATE_PROMPT.format(
-                text=text,
-                src=src,
-                tgt=tgt,
-                context=context,
-            )
-        else:
-            prompt = TRANSLATE_PROMPT.format(text=text, src=src, tgt=tgt)
-        formatted = apply_chat_template(self.processor, self.config, prompt, num_audios=0)
-        if cancelled is not None:
-            from mlx_vlm import stream_generate
-
-            if cancelled():
-                return None
-            stream = stream_generate(
-                self.model, self.processor, formatted, max_tokens=max_tokens,
-                temperature=0.0, top_p=0.95, top_k=64,
-            )
-            pieces: list[str] = []
-            try:
-                for response in stream:
-                    if cancelled():
-                        return None
-                    pieces.append(response.text)
-                    if on_progress is not None:
-                        on_progress("".join(pieces).strip())
-            finally:
-                stream.close()
-            return "".join(pieces).strip()
-        out = _generation_text(
-            generate(
-                self.model,
-                self.processor,
-                formatted,
-                max_tokens=max_tokens,
-                temperature=0.0,
-                top_p=0.95,
-                top_k=64,
-                verbose=False,
-            )
-        )
-        return out.strip()
-
-    def correct_asr_text(
-        self,
-        text: str,
-        src: str,
-        custom_vocab: list[str] | None = None,
-        prior_context: list[tuple[str, str]] | None = None,
-        learned_corrections: list[tuple[str, str]] | None = None,
-        code_switching_enabled: bool = False,
-        max_tokens: int = 192,
-    ) -> str:
-        from mlx_vlm import generate
-        from mlx_vlm.prompt_utils import apply_chat_template
-
-        context_parts: list[str] = []
-        if custom_vocab:
-            context_parts.append(
-                "Known names, terms, or phrases: "
-                + ", ".join(item.strip() for item in custom_vocab if item.strip())
-                + "."
-            )
-        if prior_context:
-            recent = "\n".join(
-                f"- {original}" for original, _ in prior_context[-3:] if original.strip()
-            )
-            if recent:
-                context_parts.append("Recent transcript context:\n" + recent)
-        learned = _format_learned_corrections(learned_corrections or [])
-        if learned:
-            context_parts.append(
-                "Previously corrected ASR mistakes. If a similar mistake appears, "
-                "prefer the corrected wording when it plausibly matches the audio:\n"
-                + learned
-            )
-        if code_switching_enabled:
-            context_parts.append(
-                f"The speaker may code-switch while primarily speaking {src}."
-            )
-        context = "\n\n".join(context_parts)
-        if context:
-            context += "\n\n"
-        prompt = ASR_CORRECTION_PROMPT.format(text=text, src=src, context=context)
-        formatted = apply_chat_template(self.processor, self.config, prompt, num_audios=0)
-        out = _generation_text(
-            generate(
-                self.model,
-                self.processor,
-                formatted,
-                max_tokens=max_tokens,
-                temperature=0.2,
-                top_p=0.9,
-                top_k=32,
-                verbose=False,
-            )
-        )
-        return out.strip()
 
     def clear_caches(self) -> None:
         import gc
@@ -323,34 +235,72 @@ def _generation_text(result: object) -> str:
     return str(result)
 
 
-def _translation_max_tokens(text: str, priority: Literal["partial", "final"]) -> int:
-    word_count = len(text.split())
-    buffer = 18 if priority == "partial" else 28
-    minimum = 32 if priority == "partial" else 48
-    maximum = 96 if priority == "partial" else 160
-    return min(maximum, max(minimum, word_count * 3 + buffer))
+def _generation_was_truncated(result: object | None, max_tokens: int) -> bool:
+    if result is None:
+        return False
+    finish_reason = getattr(result, "finish_reason", None)
+    if isinstance(finish_reason, str) and finish_reason.casefold() in {
+        "length",
+        "max_tokens",
+        "token_limit",
+    }:
+        return True
+    generated = getattr(result, "generation_tokens", None)
+    return isinstance(generated, int) and generated >= max_tokens
 
 
-def _format_bilingual_context(pairs: list[tuple[str, str]]) -> str:
-    lines: list[str] = []
-    for original, translation in pairs[-5:]:
-        original = " ".join(original.strip().split())
-        translation = " ".join(translation.strip().split())
-        if not original or not translation:
+def _parse_ast_response(
+    response: str,
+    target_language: str,
+    source_language: str | None = None,
+) -> tuple[str, str]:
+    """Parse Gemma's source-first output across minor label/markdown variations."""
+    text = response.replace("\r\n", "\n").replace("\r", "\n").strip()
+    for marker in ("<turn|>", "</s>", "<|end_of_turn|>"):
+        text = text.replace(marker, "")
+    lines = text.strip().splitlines()
+    target = re.escape(target_language.strip())
+    label = re.compile(
+        rf"^\s*(?:[-*]\s*)?(?:\*{{1,2}}|__)?\s*"
+        rf"(?:translation\s*\(\s*{target}\s*\)|{target})"
+        rf"\s*(?:\*{{1,2}}|__)?\s*"
+        rf"(?:(?::|：)\s*(?P<colon>.*)|\s+[-–—]\s+(?P<dash>.*))?\s*$",
+        re.IGNORECASE,
+    )
+    for index, line in enumerate(lines):
+        match = label.match(line)
+        if match is None:
             continue
-        lines.append(f"- Source: {original}\n  Translation: {translation}")
-    return "\n".join(lines)
+        source = "\n".join(lines[:index]).strip(" \n*`_")
+        if source_language:
+            source = re.sub(
+                rf"^\s*(?:\*{{1,2}}|__)?\s*{re.escape(source_language.strip())}"
+                rf"\s*(?:\*{{1,2}}|__)?\s*[:：-]\s*",
+                "",
+                source,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+        first_translation_line = match.group("colon") or match.group("dash")
+        translated_lines = (
+            [first_translation_line]
+            if first_translation_line and first_translation_line.strip()
+            else []
+        ) + lines[index + 1 :]
+        translation = "\n".join(translated_lines).strip(" \n*`_")
+        return source, translation
 
-
-def _format_learned_corrections(pairs: list[tuple[str, str]]) -> str:
-    lines: list[str] = []
-    for heard, corrected in pairs[-8:]:
-        heard = " ".join(heard.strip().split())
-        corrected = " ".join(corrected.strip().split())
-        if not heard or not corrected or heard == corrected:
-            continue
-        lines.append(f"- Heard: {heard}\n  Corrected: {corrected}")
-    return "\n".join(lines)
+    source = "\n".join(lines).strip(" \n*`_")
+    if source_language:
+        source = re.sub(
+            rf"^\s*(?:\*{{1,2}}|__)?\s*{re.escape(source_language.strip())}"
+            rf"\s*(?:\*{{1,2}}|__)?\s*[:：-]\s*",
+            "",
+            source,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+    return source, ""
 
 
 class InferenceTimeoutError(RuntimeError):
@@ -371,7 +321,7 @@ class WorkerStatusEvent:
 class _QueuedJob:
     priority: int
     sequence: int
-    kind: Literal["ast", "polish", "translate", "correct", "maintenance"] = field(compare=False)
+    kind: Literal["ast", "polish", "maintenance"] = field(compare=False)
     future: asyncio.Future = field(compare=False)
     payload: dict = field(compare=False)
     enqueued_at: float = field(default_factory=time.monotonic, compare=False)
@@ -393,9 +343,8 @@ class MLXWorkerService:
         self._process: mp.Process | None = None
         self._request_queue: mp.Queue | None = None
         self._response_queue: mp.Queue | None = None
-        self._active_job_kind: Literal["ast", "polish", "translate", "correct", "maintenance"] | None = None
+        self._active_job_kind: Literal["ast", "polish", "maintenance"] | None = None
         self._queued_partial_jobs: dict[int, _QueuedJob] = {}
-        self._queued_partial_translation_jobs: dict[int, _QueuedJob] = {}
         self._final_utterance_ids: set[int] = set()
         self._mp_context = mp.get_context("spawn")
         self._cancelled_job_id = self._mp_context.Value("q", -1)
@@ -455,7 +404,8 @@ class MLXWorkerService:
         custom_vocab: list[str],
         code_switching_enabled: bool,
         max_tokens: int,
-    ) -> tuple[str, str] | None:
+        on_progress: Callable[[str], Awaitable[None]] | None = None,
+    ) -> ASTResult | None:
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
         job = _QueuedJob(
@@ -463,6 +413,7 @@ class MLXWorkerService:
             sequence=next(self._sequence),
             kind="ast",
             future=future,
+            on_progress=on_progress,
             payload={
                 "priority": priority,
                 "utterance_id": utterance_id,
@@ -511,91 +462,14 @@ class MLXWorkerService:
         """Retire queued previews immediately when audio commits, before final ASR finishes."""
         self._final_utterance_ids.add(utterance_id)
         active = self._active_job
-        if (active is not None and active.kind == "translate"
+        if (active is not None and active.kind == "ast"
                 and active.payload.get("priority") == "partial"
                 and active.payload.get("utterance_id") == utterance_id):
             self._cancelled_job_id.value = active.sequence
-        for queued in (self._queued_partial_jobs, self._queued_partial_translation_jobs):
-            job = queued.pop(utterance_id, None)
-            if job is not None and not job.future.done():
-                job.future.set_result(None)
+        job = self._queued_partial_jobs.pop(utterance_id, None)
+        if job is not None and not job.future.done():
+            job.future.set_result(None)
 
-    async def submit_translate_text(
-        self,
-        text: str,
-        src: str,
-        tgt: str,
-        *,
-        priority: Literal["partial", "final"] = "final",
-        utterance_id: int | None = None,
-        bilingual_context: list[tuple[str, str]] | None = None,
-        on_progress: Callable[[str], Awaitable[None]] | None = None,
-    ) -> str | None:
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future = loop.create_future()
-        job = _QueuedJob(
-            priority=1 if priority == "final" else 20,
-            sequence=next(self._sequence),
-            kind="translate",
-            on_progress=on_progress,
-            future=future,
-            payload={
-                "priority": priority,
-                "utterance_id": utterance_id,
-                "text": text,
-                "src": src,
-                "tgt": tgt,
-                "max_tokens": _translation_max_tokens(text, priority),
-                "bilingual_context": bilingual_context or [],
-            },
-        )
-        if utterance_id is not None:
-            previous = self._queued_partial_translation_jobs.get(utterance_id)
-            if priority == "partial":
-                if utterance_id in self._final_utterance_ids:
-                    future.set_result(None)
-                    return await future
-                if previous is not None and not previous.future.done():
-                    previous.future.set_result(None)
-                self._queued_partial_translation_jobs[utterance_id] = job
-            else:
-                self._final_utterance_ids.add(utterance_id)
-                if previous is not None:
-                    self._queued_partial_translation_jobs.pop(utterance_id, None)
-                    if not previous.future.done():
-                        previous.future.set_result(None)
-        await self._queue.put(job)
-        return await future
-
-    async def submit_correct_asr_text(
-        self,
-        text: str,
-        src: str,
-        *,
-        custom_vocab: list[str] | None = None,
-        prior_context: list[tuple[str, str]] | None = None,
-        learned_corrections: list[tuple[str, str]] | None = None,
-        code_switching_enabled: bool = False,
-    ) -> str:
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future = loop.create_future()
-        await self._queue.put(
-            _QueuedJob(
-                priority=4,
-                sequence=next(self._sequence),
-                kind="correct",
-                future=future,
-                payload={
-                    "text": text,
-                    "src": src,
-                    "custom_vocab": custom_vocab or [],
-                    "prior_context": prior_context or [],
-                    "learned_corrections": learned_corrections or [],
-                    "code_switching_enabled": code_switching_enabled,
-                },
-            )
-        )
-        return await future
 
     async def submit_maintenance(self) -> None:
         loop = asyncio.get_running_loop()
@@ -621,6 +495,10 @@ class MLXWorkerService:
         self, listener: Callable[[WorkerStatusEvent], Awaitable[None]]
     ) -> None:
         self._status_listeners.discard(listener)
+
+    @property
+    def status(self) -> WorkerStatusEvent:
+        return self._status
 
     @property
     def is_busy_or_backlogged(self) -> bool:
@@ -668,9 +546,6 @@ class MLXWorkerService:
         if job.kind == "ast":
             queued_job = self._queued_partial_jobs.get(utterance_id)
             queued_jobs = self._queued_partial_jobs
-        elif job.kind == "translate":
-            queued_job = self._queued_partial_translation_jobs.get(utterance_id)
-            queued_jobs = self._queued_partial_translation_jobs
         else:
             return False
         if queued_job is None:
@@ -719,16 +594,19 @@ class MLXWorkerService:
             raise WorkerProcessError("MLX worker process exited unexpectedly")
 
         payload = job.payload
-        if job.kind in {"ast", "translate"}:
+        if job.kind == "ast":
             payload = {
                 key: value
                 for key, value in job.payload.items()
-                if key not in {"priority", "utterance_id"}
+                if key != "utterance_id"
             }
         request = {
             "job_id": job.sequence,
             "kind": job.kind,
-            "cancellable": job.kind == "translate" and job.payload.get("priority") == "partial",
+            "cancellable": (
+                job.kind == "ast"
+                and job.payload.get("priority") == "partial"
+            ),
             "payload": payload,
         }
         await asyncio.to_thread(self._request_queue.put, request)
@@ -868,12 +746,8 @@ class MLXWorkerService:
     def _job_timeout_seconds(self, job: _QueuedJob) -> float:
         if job.kind == "maintenance":
             return MAINTENANCE_TIMEOUT_SECONDS
-        if job.kind == "correct":
-            return POLISH_TIMEOUT_SECONDS
         if job.kind == "polish":
             return POLISH_TIMEOUT_SECONDS
-        if job.kind == "translate":
-            return TRANSLATE_TIMEOUT_SECONDS
         if job.kind == "ast" and job.payload.get("priority") == "partial":
             return PARTIAL_TIMEOUT_SECONDS
         return FINAL_TIMEOUT_SECONDS
@@ -904,24 +778,23 @@ def _worker_process_main(
         job_id = request["job_id"]
         try:
             if request["kind"] == "ast":
-                result = worker.ast(**request["payload"])
-            elif request["kind"] == "maintenance":
-                result = worker.clear_caches()
-            elif request["kind"] == "polish":
-                result = worker.polish(**request["payload"])
-            elif request["kind"] == "correct":
-                result = worker.correct_asr_text(**request["payload"])
-            else:
                 cancelled = (
                     (lambda: cancelled_job_id.value == job_id)
                     if request.get("cancellable") else None
                 )
-                result = worker.translate_text(
-                    **request["payload"], cancelled=cancelled,
+                result = worker.ast(
+                    **request["payload"],
+                    cancelled=cancelled,
                     on_progress=lambda text: response_queue.put(
                         {"type": "progress", "job_id": job_id, "text": text}
                     ),
                 )
+            elif request["kind"] == "maintenance":
+                result = worker.clear_caches()
+            elif request["kind"] == "polish":
+                result = worker.polish(**request["payload"])
+            else:
+                raise ValueError(f"Unknown worker job: {request["kind"]}")
         except Exception:
             response_queue.put(
                 {

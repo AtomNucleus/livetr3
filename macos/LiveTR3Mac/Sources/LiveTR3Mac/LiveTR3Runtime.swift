@@ -169,7 +169,6 @@ final class LiveTR3Runtime: ObservableObject {
         var environment = ProcessInfo.processInfo.environment
         environment["LIVETR3_ENGINE_SOCKET"] = engineSocketPath.path
         environment["PYTHONNOUSERSITE"] = "1"
-        environment["TRANSCRIPTION_ENGINE"] = environment["TRANSCRIPTION_ENGINE"] ?? "parakeet"
         environment["PYTHONPATH"] = backend.path
         environment["HF_HUB_OFFLINE"] = environment["HF_HUB_OFFLINE"] ?? "1"
         environment["TRANSFORMERS_OFFLINE"] = environment["TRANSFORMERS_OFFLINE"] ?? "1"

@@ -1,10 +1,8 @@
-import asyncio
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import numpy as np
 
-from mlx_worker import MLXWorkerService
 from segmenter import RMSGate, SileroVAD
 
 
@@ -51,76 +49,3 @@ def test_end_of_speech_at_size_cap_still_resets_silero():
     assert result.force_flushed
     assert not vad._silero_active
     vad._vad_iterator.reset_states.assert_called_once()
-
-
-def test_audio_commit_discards_previews_before_final_asr_has_completed():
-    async def run():
-        worker = MLXWorkerService()
-        preview = asyncio.create_task(worker.submit_translate_text(
-            "unfinished", "English", "Spanish", priority="partial", utterance_id=1))
-        await asyncio.sleep(0)
-        worker.finish_partials(1)
-        assert await preview is None
-        # A preview task that was waiting for model startup cannot rejoin the queue.
-        assert await worker.submit_translate_text(
-            "late preview", "English", "Spanish", priority="partial", utterance_id=1) is None
-        final = asyncio.create_task(worker.submit_translate_text(
-            "finished", "English", "Spanish", priority="final", utterance_id=1))
-        await asyncio.sleep(0)
-        assert worker._queue.get_nowait().payload["text"] == "finished"
-        final.cancel()
-        await asyncio.gather(final, return_exceptions=True)
-    asyncio.run(run())
-
-
-def test_commit_cancels_only_active_preview_for_that_utterance():
-    worker = MLXWorkerService()
-    worker._active_job = SimpleNamespace(
-        kind="translate", sequence=17, payload={"priority": "partial", "utterance_id": 4})
-    worker.finish_partials(3)
-    assert worker._cancelled_job_id.value == -1
-    worker.finish_partials(4)
-    assert worker._cancelled_job_id.value == 17
-    worker._active_job = SimpleNamespace(
-        kind="translate", sequence=18, payload={"priority": "final", "utterance_id": 5})
-    worker.finish_partials(5)
-    assert worker._cancelled_job_id.value == 17
-
-
-def test_cancelled_translation_returns_no_truncated_text_and_closes_stream(monkeypatch):
-    import mlx_vlm
-    import mlx_vlm.prompt_utils
-    from mlx_worker import MLXWorker
-
-    closed = []
-    cancelled = [False]
-    def tokens(*args, **kwargs):
-        try:
-            yield SimpleNamespace(text="partial")
-            cancelled[0] = True
-            yield SimpleNamespace(text=" unfinished")
-        finally:
-            closed.append(True)
-    monkeypatch.setattr(mlx_vlm, "stream_generate", tokens)
-    monkeypatch.setattr(mlx_vlm.prompt_utils, "apply_chat_template", lambda *a, **k: "prompt")
-    worker = object.__new__(MLXWorker)
-    worker.model = worker.processor = worker.config = None
-    assert worker.translate_text("source", "English", "Spanish", cancelled=lambda: cancelled[0]) is None
-    assert closed == [True]
-
-
-def test_uncancelled_preview_returns_complete_streamed_translation(monkeypatch):
-    import mlx_vlm
-    import mlx_vlm.prompt_utils
-    from mlx_worker import MLXWorker
-
-    def tokens(*args, **kwargs):
-        yield SimpleNamespace(text="Hola")
-        yield SimpleNamespace(text=" mundo")
-    monkeypatch.setattr(mlx_vlm, "stream_generate", tokens)
-    monkeypatch.setattr(mlx_vlm.prompt_utils, "apply_chat_template", lambda *a, **k: "prompt")
-    worker = object.__new__(MLXWorker)
-    worker.model = worker.processor = worker.config = None
-    progress = []
-    assert worker.translate_text("hello world", "English", "Spanish", cancelled=lambda: False, on_progress=progress.append) == "Hola mundo"
-    assert progress == ["Hola", "Hola mundo"]
