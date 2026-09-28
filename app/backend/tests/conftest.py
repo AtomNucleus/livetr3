@@ -13,4 +13,5 @@ if platform.system() != "Darwin" or platform.machine() != "arm64":
         "test_preview_scheduling.py",
         "test_segmenter_boundaries.py",
         "test_gemma_only.py",
+        "test_worker_lifecycle.py",
     ]

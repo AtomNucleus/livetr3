@@ -375,6 +375,11 @@ class MLXWorkerService:
             self._started = True
 
     async def stop(self) -> None:
+        # Idle unloading must not tear down a worker while start() is loading it.
+        async with self._start_lock:
+            await self._stop()
+
+    async def _stop(self) -> None:
         self._closed.set()
         if self._sweeper:
             self._sweeper.cancel()
@@ -681,21 +686,29 @@ class MLXWorkerService:
         self._request_queue = request_queue
         self._response_queue = response_queue
         try:
-            response = await asyncio.to_thread(
-                response_queue.get,
-                True,
-                MLX_WORKER_START_TIMEOUT_SECONDS,
-            )
-        except queue.Empty as exc:
+            deadline = time.monotonic() + MLX_WORKER_START_TIMEOUT_SECONDS
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        f"Timed out loading MLX worker after {MLX_WORKER_START_TIMEOUT_SECONDS:.1f}s"
+                    )
+                try:
+                    response = await asyncio.to_thread(
+                        response_queue.get, True, min(0.25, remaining)
+                    )
+                    break
+                except queue.Empty:
+                    if not process.is_alive():
+                        raise RuntimeError("MLX worker exited while loading")
+            if response.get("type") != "ready":
+                raise RuntimeError(response.get("error", "MLX worker failed to report ready"))
+            await self._emit_status(WorkerStatusEvent(state="ready", message="Model worker ready"))
+        except BaseException:
+            # Disconnect cancels session warmup. Reap its child before another
+            # start can replace our only process/queue references.
             await self._stop_worker_process(force=True)
-            raise RuntimeError(
-                f"Timed out loading MLX worker after {MLX_WORKER_START_TIMEOUT_SECONDS:.1f}s"
-            ) from exc
-
-        if response.get("type") != "ready":
-            await self._stop_worker_process(force=True)
-            raise RuntimeError(response.get("error", "MLX worker failed to report ready"))
-        await self._emit_status(WorkerStatusEvent(state="ready", message="Model worker ready"))
+            raise
 
     async def _stop_worker_process(self, force: bool) -> None:
         process = self._process
