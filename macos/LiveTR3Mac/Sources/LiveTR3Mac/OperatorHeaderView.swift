@@ -119,12 +119,6 @@ struct OperatorSettingsPanel: View {
     let onOpenProjector: () -> Void
 
     @State private var customVocabText = ""
-    @AppStorage(ProjectorPresentationStyle.storageKey)
-    private var presentationStyleRawValue = ProjectorPresentationStyle.translationFocus.rawValue
-
-    private var presentationStyle: ProjectorPresentationStyle {
-        ProjectorPresentationStyle(rawValue: presentationStyleRawValue) ?? .translationFocus
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -204,17 +198,18 @@ struct OperatorSettingsPanel: View {
                         .buttonStyle(.borderedProminent)
                 }
 
-                Picker("Caption layout", selection: $presentationStyleRawValue) {
-                    ForEach(ProjectorPresentationStyle.allCases) { style in
-                        Text(style.title).tag(style.rawValue)
-                    }
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Projector look")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                    ProjectorLookPicker(selection: $sessionManager.projectorStyle)
+                    Text(sessionManager.projectorStyle.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("The previous and current passages stay visible together. Each page gets at least 4 seconds before advancing, then stays for the next page’s reading time. Drafts settle before appearing.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
-                .pickerStyle(.segmented)
-                .accessibilityLabel("Projector caption layout")
-
-                Text(presentationStyle.description)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
         }
     }

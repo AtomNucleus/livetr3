@@ -24,11 +24,14 @@ struct TeleprompterSessionSheetOperatorView: View {
                 cueReader
             }
 
-            bottomHUD
-                .padding(.horizontal, 20)
-                .padding(.bottom, 22)
-                .opacity(hudVisible || settingsPresented ? 1 : 0)
-                .animation(.easeInOut(duration: 0.2), value: hudVisible)
+            VStack(spacing: 10) {
+                bottomHUD
+                    .opacity(hudVisible || settingsPresented ? 1 : 0)
+                    .animation(.easeInOut(duration: 0.2), value: hudVisible)
+                projectorLookBar
+            }
+            .padding(.horizontal, 20)
+            .padding(.bottom, 22)
         }
         .background(Color.black.opacity(0.93))
         .onHover { hudVisible = $0 }
@@ -108,6 +111,35 @@ struct TeleprompterSessionSheetOperatorView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: frameAlignment)
+    }
+
+    private var projectorLookBar: some View {
+        HStack(spacing: 12) {
+            Text("Projector")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+
+            ProjectorLookPicker(selection: $sessionManager.projectorStyle)
+                .frame(maxWidth: 280)
+
+            Text(sessionManager.projectorStyle.detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+
+            Spacer(minLength: 8)
+
+            Button(action: onOpenProjector) {
+                Label("Open Projector", systemImage: "rectangle.on.rectangle")
+            }
+            .buttonStyle(.bordered)
+            .accessibilityHint("Opens the audience window using the selected look")
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 10)
+        .liveGlassSurface(cornerRadius: 18, interactive: true)
+        .accessibilityElement(children: .contain)
     }
 
     private var bottomHUD: some View {

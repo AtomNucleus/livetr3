@@ -273,7 +273,19 @@ class SessionHub:
         async with self._lock:
             room = self._rooms.setdefault(session_id, SharedSessionRoom(session_id=session_id))
             room.viewers.add(session)
-            return [room.transcript_state[key] for key in sorted(room.transcript_state)]
+            # Audience windows join at the live edge. Replaying an entire service into
+            # a reading-time queue would put a newly opened projector minutes behind.
+            captions = [room.transcript_state[key] for key in sorted(room.transcript_state)]
+            latest_final = next(
+                (caption for caption in reversed(captions)
+                 if caption["type"] in {"final", "polished"}),
+                None,
+            )
+            latest = captions[-1] if captions else None
+            snapshot = [latest_final] if latest_final is not None else []
+            if latest is not None and latest is not latest_final:
+                snapshot.append(latest)
+            return snapshot
 
     async def detach(self, session_id: str, session: TranscriptionSession) -> None:
         async with self._lock:
