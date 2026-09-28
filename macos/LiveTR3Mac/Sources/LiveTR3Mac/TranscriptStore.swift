@@ -28,6 +28,9 @@ final class TranscriptStore: ObservableObject {
             }
 
             let existing = entries.first(where: { $0.id == utteranceID })
+            // Delayed stream callbacks must never turn a completed caption back into a draft.
+            if type == .partial, let existing, existing.state != .partial { return }
+            if type == .final, existing?.state == .polished { return }
             let previousOriginal = existing?.original ?? ""
             let previousTranslation = existing?.translation ?? ""
 

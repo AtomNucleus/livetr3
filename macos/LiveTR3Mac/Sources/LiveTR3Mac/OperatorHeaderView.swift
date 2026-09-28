@@ -206,6 +206,9 @@ struct OperatorSettingsPanel: View {
                     Text(sessionManager.projectorStyle.detail)
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                    Text("The previous and current passages stay visible together. Each page gets at least 4 seconds before advancing, then stays for the next page’s reading time. Drafts settle before appearing.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
         }

@@ -1,4 +1,4 @@
-import AppKit
+import Combine
 import SwiftUI
 
 struct ProjectorView: View {
@@ -6,343 +6,189 @@ struct ProjectorView: View {
     @ObservedObject var sessionManager: SessionManager
     @EnvironmentObject private var session: SessionController
 
-    @State private var fittedFontSize: CGFloat = 72
-
-    private var visibleEntries: [TranscriptUtterance] {
-        connection.transcript.entries
-            .filter { !$0.translation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-            .suffix(2)
-            .map { $0 }
+    var body: some View {
+        ProjectorTranscriptView(
+            transcript: connection.transcript,
+            sessionManager: sessionManager,
+            sourceLanguage: session.config.source_lang,
+            targetLanguage: session.config.target_lang,
+            connectionError: connection.connectionError
+        )
+        .onAppear { connection.connect() }
+        .onDisappear { connection.disconnect() }
     }
+}
 
-    private var statusText: String? {
-        if let connectionError = connection.connectionError {
-            return connectionError
-        }
-        if let lastError = connection.transcript.lastError {
-            return lastError
-        }
-        if let workerStatus = connection.transcript.workerStatus, workerStatus.state != .ready {
-            return workerStatus.message
-        }
-        return nil
-    }
+/// Observe the store itself: observing its owner does not forward nested changes.
+private struct ProjectorTranscriptView: View {
+    @ObservedObject var transcript: TranscriptStore
+    @ObservedObject var sessionManager: SessionManager
+    let sourceLanguage: String
+    let targetLanguage: String
+    let connectionError: String?
+    @State private var presentation = ProjectorCaptionPresentation()
+    private let clock = Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()
 
     var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-
-            VStack(spacing: 0) {
-                if let statusText {
-                    Text(statusText)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(Color.orange.opacity(0.9))
-                        .textCase(.uppercase)
-                        .tracking(2)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 32)
-                        .padding(.top, 24)
-                        .accessibilityLabel(statusText)
-                }
-
-                GeometryReader { geometry in
-                    stage
-                        .onAppear {
-                            refitFont(containerSize: geometry.size)
-                        }
-                        .onChange(of: measurementKey) { _, _ in
-                            refitFont(containerSize: geometry.size)
-                        }
-                        .onChange(of: sessionManager.projectorFontSize) { _, _ in
-                            refitFont(containerSize: geometry.size)
-                        }
-                        .onChange(of: sessionManager.projectorStyle) { _, _ in
-                            refitFont(containerSize: geometry.size)
-                        }
-                }
-            }
-        }
-        .onAppear {
-            connection.connect()
-        }
-        .onDisappear {
-            connection.disconnect()
+        GeometryReader { geometry in
+            let layout = ProjectorCaptionLayout(
+                size: geometry.size,
+                requestedFontSize: sessionManager.projectorFontSize,
+                style: sessionManager.projectorStyle
+            )
+            ProjectorCaptionStage(
+                current: presentation.current,
+                previous: presentation.previous,
+                draft: presentation.draft,
+                layout: layout,
+                sourceLanguage: sourceLanguage,
+                targetLanguage: targetLanguage,
+                status: connectionError ?? transcript.lastError
+            )
+            .onAppear { receive(layout: layout) }
+            .onChange(of: transcript.entries) { _, _ in receive(layout: layout) }
+            .onChange(of: layout) { _, _ in advance(layout: layout) }
+            .onReceive(clock) { _ in advance(layout: layout) }
         }
     }
 
-    private var measurementKey: String {
-        visibleEntries
-            .map { "\($0.id)|\($0.original)|\($0.translation)" }
-            .joined(separator: "\n")
+    private func receive(layout: ProjectorCaptionLayout) {
+        let now = ProcessInfo.processInfo.systemUptime
+        presentation.receive(transcript.entries, at: now)
+        presentation.tick(at: now, layout: layout)
+    }
+
+    private func advance(layout: ProjectorCaptionLayout) {
+        presentation.tick(at: ProcessInfo.processInfo.systemUptime, layout: layout)
+    }
+}
+
+/// Kept separate from the connection so the real audience surface can be rendered in tests.
+struct ProjectorCaptionStage: View {
+    let current: ProjectorCaptionPresentation.Caption?
+    var previous: ProjectorCaptionPresentation.Caption? = nil
+    let draft: ProjectorCaptionPresentation.Caption?
+    let layout: ProjectorCaptionLayout
+    let sourceLanguage: String
+    let targetLanguage: String
+    var status: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 24) {
+            mainCaption
+                .frame(height: layout.mainHeight, alignment: .topLeading)
+
+            VStack(alignment: .leading, spacing: 12) {
+                Rectangle().fill(.white.opacity(0.2)).frame(height: 1)
+                if let current, let draft, current.utteranceID != draft.utteranceID {
+                    label("Live draft · may change", color: .white.opacity(0.8))
+                    draftCaption(draft)
+                } else if let status {
+                    label("Caption connection needs attention", color: .orange)
+                        .accessibilityHint(status)
+                }
+            }
+            .frame(height: layout.draftHeight, alignment: .topLeading)
+        }
+        .padding(layout.inset)
+        .frame(width: layout.size.width, height: layout.size.height, alignment: .topLeading)
+        .background(.black)
+        .foregroundStyle(.white)
+        .transaction { $0.animation = nil }
     }
 
     @ViewBuilder
-    private var stage: some View {
-        if visibleEntries.isEmpty {
-            Text("Waiting for live captions")
-                .font(.system(size: min(fittedFontSize, 64), weight: .semibold))
-                .foregroundStyle(Color.white.opacity(0.35))
-                .textCase(.uppercase)
-                .tracking(4)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .accessibilityLabel("Waiting for live captions")
-        } else {
-            switch sessionManager.projectorStyle {
+    private var mainCaption: some View {
+        if let caption = current ?? draft {
+            let isDraft = current == nil
+            let source = isDraft ? layout.prefix(caption.original, source: true, balancePages: false) : caption.original
+            let target = isDraft ? layout.prefix(caption.translation, source: false, balancePages: false) : caption.translation
+            switch layout.style {
             case .focus:
-                focusStage
+                lane(target, previous: previous?.translation, source: false,
+                     title: title(targetLanguage, draft: isDraft, continuation: caption.isContinuation),
+                     fontSize: layout.fontSize, language: targetLanguage)
             case .split:
-                splitStage
+                HStack(alignment: .top, spacing: 24) {
+                    lane(source, previous: previous?.original, source: true,
+                         title: title(sourceLanguage, draft: isDraft, continuation: caption.isContinuation),
+                         fontSize: layout.sourceFontSize, language: sourceLanguage)
+                    Rectangle().fill(.white.opacity(0.25)).frame(width: 1)
+                    lane(target, previous: previous?.translation, source: false,
+                         title: title(targetLanguage, draft: isDraft, continuation: caption.isContinuation),
+                         fontSize: layout.fontSize, language: targetLanguage)
+                }
             case .stack:
-                stackStage
-            }
-        }
-    }
-
-    private var focusStage: some View {
-        let alignment: HorizontalAlignment = targetDirection == .rightToLeft ? .trailing : .leading
-        let frameAlignment: Alignment = targetDirection == .rightToLeft ? .bottomTrailing : .bottomLeading
-        return VStack(alignment: alignment, spacing: 24) {
-            Spacer(minLength: 0)
-            ForEach(visibleEntries) { entry in
-                ProjectorCaptionText(
-                    text: entry.translation,
-                    stableLength: entry.stableTranslationLength,
-                    isPartial: entry.state == .partial,
-                    fontSize: fittedFontSize,
-                    weight: .semibold,
-                    alignment: frameAlignment,
-                    layoutDirection: targetDirection
-                )
-            }
-        }
-        .padding(40)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: frameAlignment)
-    }
-
-    private var splitStage: some View {
-        HStack(alignment: .center, spacing: 40) {
-            if targetDirection == .rightToLeft {
-                splitColumn(title: session.config.target_lang, field: .translation, direction: targetDirection)
-                splitRule
-                splitColumn(title: session.config.source_lang, field: .original, direction: sourceDirection)
-            } else {
-                splitColumn(title: session.config.source_lang, field: .original, direction: sourceDirection)
-                splitRule
-                splitColumn(title: session.config.target_lang, field: .translation, direction: targetDirection)
-            }
-        }
-        .padding(.horizontal, 48)
-        .padding(.vertical, 40)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
-    }
-
-    private var splitRule: some View {
-        Rectangle()
-            .fill(Color.white.opacity(0.12))
-            .frame(width: 1)
-            .padding(.vertical, 48)
-            .accessibilityHidden(true)
-    }
-
-    private func splitColumn(
-        title: String,
-        field: ProjectorCaptionField,
-        direction: LayoutDirection
-    ) -> some View {
-        let textAlignment: Alignment = direction == .rightToLeft ? .trailing : .leading
-        return VStack(alignment: direction == .rightToLeft ? .trailing : .leading, spacing: 22) {
-            Text(title)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(Color.white.opacity(0.45))
-                .textCase(.uppercase)
-                .tracking(1.5)
-                .frame(maxWidth: .infinity, alignment: textAlignment)
-            ForEach(visibleEntries) { entry in
-                ProjectorCaptionText(
-                    text: field.text(from: entry),
-                    stableLength: field.stableLength(from: entry),
-                    isPartial: entry.state == .partial,
-                    fontSize: fittedFontSize * field.scale,
-                    weight: field.weight,
-                    alignment: textAlignment,
-                    layoutDirection: direction
-                )
-            }
-        }
-        .padding(.horizontal, 8)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
-    }
-
-    private var stackStage: some View {
-        VStack(spacing: 32) {
-            ForEach(visibleEntries) { entry in
-                VStack(alignment: .leading, spacing: 16) {
-                    if !entry.original.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        ProjectorCaptionText(
-                            text: entry.original,
-                            stableLength: entry.stableOriginalLength,
-                            isPartial: entry.state == .partial,
-                            fontSize: fittedFontSize * 0.92,
-                            weight: .semibold,
-                            alignment: sourceDirection == .rightToLeft ? .trailing : .leading,
-                            layoutDirection: sourceDirection
-                        )
-                        Rectangle()
-                            .fill(Color.white.opacity(0.08))
-                            .frame(height: 1)
-                            .accessibilityHidden(true)
-                    }
-                    ProjectorCaptionText(
-                        text: entry.translation,
-                        stableLength: entry.stableTranslationLength,
-                        isPartial: entry.state == .partial,
-                        fontSize: fittedFontSize,
-                        weight: .semibold,
-                        alignment: targetDirection == .rightToLeft ? .trailing : .leading,
-                        layoutDirection: targetDirection
-                    )
+                VStack(alignment: .leading, spacing: 24) {
+                    lane(source, previous: previous?.original, source: true,
+                         title: title(sourceLanguage, draft: isDraft, continuation: caption.isContinuation),
+                         fontSize: layout.sourceFontSize, language: sourceLanguage)
+                        .frame(height: (layout.mainHeight - 24) / 2, alignment: .top)
+                    lane(target, previous: previous?.translation, source: false,
+                         title: title(targetLanguage, draft: isDraft, continuation: caption.isContinuation),
+                         fontSize: layout.fontSize, language: targetLanguage)
                 }
             }
+        } else {
+            Text("Listening…")
+                .font(.system(size: layout.fontSize, weight: .medium))
+                .foregroundStyle(.white.opacity(0.75))
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
         }
-        .padding(.horizontal, 64)
-        .padding(.vertical, 48)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
     }
 
-    private var sourceDirection: LayoutDirection {
-        isRtlLanguage(session.config.source_lang) ? .rightToLeft : .leftToRight
+    private func title(_ language: String, draft: Bool, continuation: Bool) -> String {
+        language + (draft ? " · Live draft" : continuation ? " · Continued" : "")
     }
 
-    private var targetDirection: LayoutDirection {
-        isRtlLanguage(session.config.target_lang) ? .rightToLeft : .leftToRight
-    }
-
-    private func refitFont(containerSize: CGSize) {
-        let maxFont = CGFloat(sessionManager.projectorFontSize)
-        guard !visibleEntries.isEmpty else {
-            fittedFontSize = maxFont
-            return
-        }
-
-        let style = sessionManager.projectorStyle
-        let horizontalInset: CGFloat = style == .split ? 160 : 144
-        let usableWidth = max(containerSize.width - horizontalInset, 200)
-        let usableHeight = max(containerSize.height - 140, 200)
-        let columnWidth = style == .split ? usableWidth / 2 : usableWidth
-
-        var next = maxFont
-        while next > 36 {
-            if measuredHeight(fontSize: next, columnWidth: columnWidth, style: style) <= usableHeight {
-                break
-            }
-            next -= 2
-        }
-        fittedFontSize = next
-    }
-
-    private func measuredHeight(
-        fontSize: CGFloat,
-        columnWidth: CGFloat,
-        style: ProjectorPresentationStyle
-    ) -> CGFloat {
-        switch style {
-        case .focus:
-            return visibleEntries.reduce(0) { total, entry in
-                total + blockHeight(entry.translation, fontSize: fontSize, width: columnWidth) + 24
-            }
-        case .split:
-            let sourceHeight = visibleEntries.reduce(CGFloat(28)) { total, entry in
-                total + blockHeight(entry.original, fontSize: fontSize * 0.72, width: columnWidth) + 22
-            }
-            let translationHeight = visibleEntries.reduce(CGFloat(28)) { total, entry in
-                total + blockHeight(entry.translation, fontSize: fontSize, width: columnWidth) + 22
-            }
-            return max(sourceHeight, translationHeight)
-        case .stack:
-            return visibleEntries.reduce(0) { total, entry in
-                let source = entry.original.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    ? 0
-                    : blockHeight(entry.original, fontSize: fontSize * 0.92, width: columnWidth) + 16
-                let translation = blockHeight(entry.translation, fontSize: fontSize, width: columnWidth)
-                return total + source + translation + 32
+    private func lane(_ text: String, previous: String?, source: Bool, title: String,
+                      fontSize: CGFloat, language: String) -> some View {
+        VStack(alignment: isRtlLanguage(language) ? .trailing : .leading, spacing: 12) {
+            label(title)
+            VStack(spacing: 20) {
+                // Refit history only for an explicit window/font/layout change. Ordinary
+                // arrivals keep the entire preceding page in this fixed reading slot.
+                captionText(layout.prefix(previous ?? "", source: source, balancePages: false)
+                    .trimmingCharacters(in: .whitespacesAndNewlines), fontSize: fontSize, language: language)
+                    .foregroundStyle(Color.white.opacity(0.88))
+                    .frame(height: layout.textHeight(source: source), alignment: .top)
+                captionText(text.trimmingCharacters(in: .whitespacesAndNewlines), fontSize: fontSize, language: language)
+                    .frame(height: layout.textHeight(source: source), alignment: .top)
             }
         }
+        .frame(maxWidth: .infinity, alignment: isRtlLanguage(language) ? .topTrailing : .topLeading)
     }
 
-    private func blockHeight(_ text: String, fontSize: CGFloat, width: CGFloat) -> CGFloat {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return 0 }
-        let font = NSFont.systemFont(ofSize: fontSize, weight: .semibold)
-        let bounding = (trimmed as NSString).boundingRect(
-            with: CGSize(width: max(width, 40), height: .greatestFiniteMagnitude),
-            options: [.usesLineFragmentOrigin, .usesFontLeading],
-            attributes: [.font: font]
-        )
-        return bounding.height
-    }
-}
-
-private enum ProjectorCaptionField {
-    case original
-    case translation
-
-    var scale: CGFloat {
-        switch self {
-        case .original: 0.72
-        case .translation: 1
+    @ViewBuilder
+    private func draftCaption(_ draft: ProjectorCaptionPresentation.Caption) -> some View {
+        if layout.style == .split {
+            HStack(alignment: .top, spacing: 48) {
+                draftText(draft.original, language: sourceLanguage, width: layout.columnWidth)
+                draftText(draft.translation, language: targetLanguage, width: layout.columnWidth)
+            }
+        } else {
+            draftText(draft.translation, language: targetLanguage, width: layout.columnWidth)
         }
     }
 
-    var weight: Font.Weight {
-        switch self {
-        case .original: .medium
-        case .translation: .semibold
-        }
+    private func draftText(_ text: String, language: String, width: CGFloat) -> some View {
+        captionText(layout.draftExcerpt(text, width: width), fontSize: layout.draftFontSize, language: language)
+            .foregroundStyle(Color(red: 0.91, green: 0.94, blue: 1))
     }
 
-    func text(from entry: TranscriptUtterance) -> String {
-        switch self {
-        case .original: entry.original
-        case .translation: entry.translation
-        }
+    private func captionText(_ text: String, fontSize: CGFloat, language: String) -> some View {
+        Text(text)
+            .font(.system(size: fontSize, weight: .semibold))
+            .lineSpacing(layout.lineSpacing)
+            .fixedSize(horizontal: false, vertical: true)
+            .multilineTextAlignment(isRtlLanguage(language) ? .trailing : .leading)
+            .frame(maxWidth: .infinity, alignment: isRtlLanguage(language) ? .trailing : .leading)
+            .environment(\.layoutDirection, isRtlLanguage(language) ? .rightToLeft : .leftToRight)
     }
 
-    func stableLength(from entry: TranscriptUtterance) -> Int {
-        switch self {
-        case .original: entry.stableOriginalLength
-        case .translation: entry.stableTranslationLength
-        }
-    }
-}
-
-private struct ProjectorCaptionText: View {
-    let text: String
-    let stableLength: Int
-    let isPartial: Bool
-    let fontSize: CGFloat
-    let weight: Font.Weight
-    let alignment: Alignment
-    let layoutDirection: LayoutDirection
-
-    private var stable: String {
-        guard isPartial else { return text }
-        return String(text.prefix(stableLength))
-    }
-
-    private var unstable: String {
-        guard isPartial else { return "" }
-        return String(text.dropFirst(stableLength))
-    }
-
-    var body: some View {
-        (
-            Text(stable).foregroundStyle(Color.white.opacity(isPartial ? 0.85 : 1))
-            + Text(unstable).foregroundStyle(Color.white.opacity(0.65))
-        )
-        .font(.system(size: fontSize, weight: weight))
-        .lineSpacing(4)
-        .multilineTextAlignment(layoutDirection == .rightToLeft ? .trailing : .leading)
-        .frame(maxWidth: .infinity, alignment: alignment)
-        .environment(\.layoutDirection, layoutDirection)
+    private func label(_ text: String, color: Color = .white.opacity(0.72)) -> some View {
+        Text(text)
+            .font(.system(size: 18, weight: .semibold))
+            .foregroundStyle(color)
     }
 }
