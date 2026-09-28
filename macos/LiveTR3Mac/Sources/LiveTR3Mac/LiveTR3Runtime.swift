@@ -13,6 +13,11 @@ final class LiveTR3Runtime: ObservableObject {
     @Published private(set) var statusMessage = "Local engine is not running."
 
     nonisolated static var engineSocketPath: URL {
+        if let configuredPath = ProcessInfo.processInfo.environment["LIVETR3_ENGINE_SOCKET"],
+           !configuredPath.isEmpty {
+            return URL(fileURLWithPath: configuredPath)
+        }
+
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appending(path: "LiveTR3")
             .appending(path: "Runtime")

@@ -119,6 +119,12 @@ struct OperatorSettingsPanel: View {
     let onOpenProjector: () -> Void
 
     @State private var customVocabText = ""
+    @AppStorage(ProjectorPresentationStyle.storageKey)
+    private var presentationStyleRawValue = ProjectorPresentationStyle.translationFocus.rawValue
+
+    private var presentationStyle: ProjectorPresentationStyle {
+        ProjectorPresentationStyle(rawValue: presentationStyleRawValue) ?? .translationFocus
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -179,22 +185,36 @@ struct OperatorSettingsPanel: View {
     }
 
     private var outputSection: some View {
-        settingsSection(title: "Output") {
-            HStack(alignment: .bottom, spacing: 12) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Projector font size")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                    HStack {
-                        Slider(value: $sessionManager.projectorFontSize, in: 36...144, step: 2)
-                        Text("\(Int(sessionManager.projectorFontSize))px")
-                            .font(.caption)
+        settingsSection(title: "Projector output") {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .bottom, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Projector font size")
+                            .font(.subheadline)
                             .foregroundStyle(.secondary)
-                            .frame(width: 48, alignment: .trailing)
+                        HStack {
+                            Slider(value: $sessionManager.projectorFontSize, in: 36...144, step: 2)
+                            Text("\(Int(sessionManager.projectorFontSize))px")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .frame(width: 48, alignment: .trailing)
+                        }
+                    }
+                    Button("Open Projector", action: onOpenProjector)
+                        .buttonStyle(.borderedProminent)
+                }
+
+                Picker("Caption layout", selection: $presentationStyleRawValue) {
+                    ForEach(ProjectorPresentationStyle.allCases) { style in
+                        Text(style.title).tag(style.rawValue)
                     }
                 }
-                Button("Open Projector", action: onOpenProjector)
-                    .buttonStyle(.borderedProminent)
+                .pickerStyle(.segmented)
+                .accessibilityLabel("Projector caption layout")
+
+                Text(presentationStyle.description)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
     }

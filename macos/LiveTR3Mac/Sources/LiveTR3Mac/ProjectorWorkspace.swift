@@ -48,9 +48,14 @@ struct ProjectorWorkspace: View {
 
 struct ProjectorWindowRoot: View {
     @EnvironmentObject private var sessionManager: SessionManager
+    @EnvironmentObject private var sessionController: SessionController
 
     var body: some View {
-        ProjectorContainer(sessionID: sessionManager.sessionID)
+        ProjectorContainer(
+            sessionID: sessionManager.sessionID,
+            sourceLanguage: sessionController.config.source_lang,
+            targetLanguage: sessionController.config.target_lang
+        )
             .environmentObject(sessionManager)
     }
 }
@@ -59,12 +64,22 @@ private struct ProjectorContainer: View {
     @StateObject private var connection: ProjectorConnection
     @EnvironmentObject private var sessionManager: SessionManager
 
-    init(sessionID: String) {
+    let sourceLanguage: String
+    let targetLanguage: String
+
+    init(sessionID: String, sourceLanguage: String, targetLanguage: String) {
+        self.sourceLanguage = sourceLanguage
+        self.targetLanguage = targetLanguage
         _connection = StateObject(wrappedValue: ProjectorConnection(sessionID: sessionID))
     }
 
     var body: some View {
-        ProjectorView(connection: connection, sessionManager: sessionManager)
+        ProjectorView(
+            connection: connection,
+            sessionManager: sessionManager,
+            sourceLanguage: sourceLanguage,
+            targetLanguage: targetLanguage
+        )
             .frame(minWidth: 1_280, minHeight: 720)
     }
 }
