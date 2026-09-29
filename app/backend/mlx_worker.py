@@ -168,9 +168,11 @@ class MLXWorker:
                         if isinstance(piece, str):
                             pieces.append(piece)
                         output = "".join(pieces)
-                        if output and output != last_progress_text and on_progress is not None:
-                            on_progress(output)
-                            last_progress_text = output
+                        if output and on_progress is not None:
+                            progress_text = _streaming_ast_progress_text(output, tgt, src)
+                            if progress_text and progress_text != last_progress_text:
+                                on_progress(progress_text)
+                                last_progress_text = progress_text
                 finally:
                     close = getattr(stream, "close", None)
                     if callable(close):
@@ -239,12 +241,12 @@ def _generation_was_truncated(result: object | None, max_tokens: int) -> bool:
     if result is None:
         return False
     finish_reason = getattr(result, "finish_reason", None)
-    if isinstance(finish_reason, str) and finish_reason.casefold() in {
-        "length",
-        "max_tokens",
-        "token_limit",
-    }:
-        return True
+    if isinstance(finish_reason, str):
+        normalized_reason = finish_reason.casefold()
+        if normalized_reason in {"length", "max_tokens", "token_limit"}:
+            return True
+        if normalized_reason == "stop":
+            return False
     generated = getattr(result, "generation_tokens", None)
     return isinstance(generated, int) and generated >= max_tokens
 
@@ -253,8 +255,18 @@ def _parse_ast_response(
     response: str,
     target_language: str,
     source_language: str | None = None,
+    *,
+    streaming: bool = False,
 ) -> tuple[str, str]:
-    """Parse Gemma's source-first output across minor label/markdown variations."""
+    """Parse Gemma's source-first output across minor label/markdown variations.
+
+    ``streaming`` is reserved for in-flight model output.  A short trailing
+    line such as ``S`` is ambiguous in a finalized transcript, so the default
+    parser preserves it as spoken text.  The streaming caller can opt into
+    treating that line as the beginning of the requested target-language
+    label because the AST prompt has already established the source/label
+    boundary.
+    """
     text = response.replace("\r\n", "\n").replace("\r", "\n").strip()
     for marker in ("<turn|>", "</s>", "<|end_of_turn|>"):
         text = text.replace(marker, "")
@@ -270,6 +282,17 @@ def _parse_ast_response(
     for index, line in enumerate(lines):
         match = label.match(line)
         if match is None:
+            continue
+        # A bare target-language word at the end of a finalized response can
+        # still be legitimate source text.  A colon/dash or a following line
+        # makes the label unambiguous; streaming output is known to follow the
+        # AST source-then-label contract, so it may accept the bare marker.
+        has_separator = re.search(r"(?::|：)|\s+[-–—]\s+", line) is not None
+        if index == 0 or (
+            not streaming
+            and not has_separator
+            and index == len(lines) - 1
+        ):
             continue
         source = "\n".join(lines[:index]).strip(" \n*`_")
         if source_language:
@@ -290,6 +313,10 @@ def _parse_ast_response(
         translation = "\n".join(translated_lines).strip(" \n*`_")
         return source, translation
 
+    if streaming and len(lines) > 1 and _is_partial_ast_label(
+        lines[-1], target_language, allow_short=True
+    ):
+        lines = lines[:-1]
     source = "\n".join(lines).strip(" \n*`_")
     if source_language:
         source = re.sub(
@@ -301,6 +328,51 @@ def _parse_ast_response(
             flags=re.IGNORECASE,
         )
     return source, ""
+
+
+def _is_partial_ast_label(
+    line: str,
+    target_language: str,
+    *,
+    allow_short: bool = False,
+) -> bool:
+    without_bullet = re.sub(r"^\s*[-*]\s*", "", line)
+    candidate = re.sub(r"[\s*`_]", "", without_bullet).casefold()
+    # A streamed markdown bullet/emphasis marker can arrive before the label.
+    if not candidate:
+        return allow_short and bool(line.strip())
+    if not allow_short and len(candidate) < 3:
+        return False
+    target = re.sub(r"\s+", "", target_language).casefold()
+    if not target:
+        return False
+    labels = (target, f"translation({target})")
+    return any(label.startswith(candidate) for label in labels)
+
+
+def _streaming_ast_progress_text(
+    response: str,
+    target_language: str,
+    source_language: str | None = None,
+) -> str:
+    """Return progress text safe for the existing session parser.
+
+    Gemma's AST prompt emits source text followed by a target-language label.
+    While that label is still being generated, forwarding its first character
+    would make the session treat it as source text.  Parse in streaming mode
+    and put completed translations back into the canonical format expected by
+    the session; source-only progress stays source-only.
+    """
+
+    original, translation = _parse_ast_response(
+        response,
+        target_language,
+        source_language,
+        streaming=True,
+    )
+    if translation:
+        return f"{original}\n{target_language.strip()}: {translation}"
+    return original
 
 
 class InferenceTimeoutError(RuntimeError):

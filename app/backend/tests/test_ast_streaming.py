@@ -13,6 +13,7 @@ from mlx_worker import (
     MLXWorkerService,
     _generation_was_truncated,
     _parse_ast_response,
+    _streaming_ast_progress_text,
 )
 
 
@@ -33,23 +34,97 @@ def test_ast_parser_accepts_small_label_format_variants(response, expected):
     assert _parse_ast_response(response, "Spanish", "English") == expected
 
 
-def test_ast_parser_does_not_treat_language_prefix_words_as_labels():
-    assert _parse_ast_response("Spanish-speaking people arrived.", "Spanish") == (
+@pytest.mark.parametrize(
+    "source",
+    [
         "Spanish-speaking people arrived.",
+        "Spanish",
+        "Spanish\nis the language I speak.",
+        "We cannot go\nS",
+        "We cannot go\nSp",
+        "We cannot go\nSpa",
+        "I speak\nSpanish",
+        "We cannot go\nTranslation (Spa",
+    ],
+)
+def test_ast_parser_preserves_source_text_that_only_resembles_a_label(source):
+    assert _parse_ast_response(source, "Spanish", "English") == (source, "")
+
+
+@pytest.mark.parametrize("word", ["S", "Sp", "Spa", "Spanish"])
+def test_final_parser_preserves_short_spoken_words_before_translation(word):
+    assert _parse_ast_response(
+        f"{word}\nSpanish: {word}", "Spanish", "English"
+    ) == (word, word)
+
+
+@pytest.mark.parametrize(
+    "partial_label",
+    [
+        "S",
+        "Sp",
+        "Spa",
+        "- S",
+        "- Sp",
+        "- Spa",
+        "**S",
+        "**Sp",
+        "**Spa",
+        "Translation (S",
+        "Translation (Sp",
+        "Translation (Spa",
+        "- **Translation (S",
+        "**Translation (Sp",
+    ],
+)
+def test_streaming_parser_hides_progressive_target_label_prefixes(partial_label):
+    response = f"We cannot go\n{partial_label}"
+
+    assert _parse_ast_response(
+        response, "Spanish", "English", streaming=True
+    ) == ("We cannot go", "")
+    assert _streaming_ast_progress_text(response, "Spanish", "English") == (
+        "We cannot go"
+    )
+
+
+def test_streaming_parser_keeps_a_source_only_short_transcript_without_label_boundary():
+    assert _parse_ast_response("S", "Spanish", "English", streaming=True) == (
+        "S",
         "",
     )
+    assert _streaming_ast_progress_text("Sp", "Spanish", "English") == "Sp"
+    assert _parse_ast_response("Spanish", "Spanish", "English", streaming=True) == (
+        "Spanish",
+        "",
+    )
+    assert _streaming_ast_progress_text("Spanish", "Spanish", "English") == "Spanish"
 
 
-def test_generation_completion_uses_token_limit_and_finish_reason():
-    assert _generation_was_truncated(
-        SimpleNamespace(generation_tokens=384, finish_reason="stop"), 384
-    )
-    assert _generation_was_truncated(
-        SimpleNamespace(generation_tokens=20, finish_reason="length"), 384
-    )
-    assert not _generation_was_truncated(
-        SimpleNamespace(generation_tokens=383, finish_reason="stop"), 384
-    )
+def test_streaming_progress_canonicalizes_completed_translation():
+    assert _streaming_ast_progress_text(
+        "English: We cannot go\n**Translation (Spanish):** No podemos ir",
+        "Spanish",
+        "English",
+    ) == "We cannot go\nSpanish: No podemos ir"
+
+
+@pytest.mark.parametrize(
+    ("metadata", "truncated"),
+    [
+        ({"generation_tokens": 384, "finish_reason": "stop"}, False),
+        ({"generation_tokens": 385, "finish_reason": "STOP"}, False),
+        ({"generation_tokens": 383, "finish_reason": "stop"}, False),
+        ({"generation_tokens": 20, "finish_reason": "length"}, True),
+        ({"generation_tokens": 20, "finish_reason": "max_tokens"}, True),
+        ({"generation_tokens": 20, "finish_reason": "token_limit"}, True),
+        ({"generation_tokens": 384}, True),
+        ({"generation_tokens": 384, "finish_reason": None}, True),
+        ({"generation_tokens": 383}, False),
+    ],
+)
+def test_generation_completion_uses_token_limit_and_finish_reason(metadata, truncated):
+    assert _generation_was_truncated(SimpleNamespace(**metadata), 384) is truncated
 
 
 def _worker(tmp_path):
@@ -222,3 +297,138 @@ def test_service_forwards_streamed_ast_progress_before_final_result():
         assert progress == ["We cannot"]
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("label", ["Spanish:", "- Spanish:", "**Translation (Spanish):**"])
+def test_ast_stream_progress_does_not_publish_partial_target_label_prefixes(
+    monkeypatch, tmp_path, label
+):
+    pieces = [
+        SimpleNamespace(text="We cannot go", generation_tokens=3, finish_reason=None),
+        *[SimpleNamespace(text=char) for char in "\n" + label],
+        SimpleNamespace(
+            text=" No podemos ir",
+            generation_tokens=40,
+            finish_reason="stop",
+        ),
+    ]
+    _patch_mlx(monkeypatch, [pieces])
+    progress = []
+
+    result = _worker(tmp_path).ast(
+        np.ones(16_000, dtype=np.float32),
+        "English",
+        "Spanish",
+        prior_context=[],
+        max_tokens=192,
+        priority="partial",
+        on_progress=progress.append,
+    )
+
+    assert result == ASTResult("We cannot go", "No podemos ir", True, False)
+    assert progress == ["We cannot go", "We cannot go\nSpanish: No podemos ir"]
+
+
+def test_stop_at_exact_token_budget_does_not_retry(monkeypatch, tmp_path):
+    stream = [
+        SimpleNamespace(
+            text="We cannot go\nSpanish: No podemos ir",
+            generation_tokens=100,
+            finish_reason="stop",
+        )
+    ]
+    budgets = _patch_mlx(monkeypatch, [stream])
+
+    result = _worker(tmp_path).ast(
+        np.ones(16_000, dtype=np.float32),
+        "English",
+        "Spanish",
+        prior_context=[],
+        max_tokens=100,
+        priority="final",
+    )
+
+    assert result == ASTResult("We cannot go", "No podemos ir", True, False)
+    assert budgets == [100]
+
+
+def test_long_final_retry_stays_inside_the_768_token_cap(monkeypatch, tmp_path):
+    first = [
+        SimpleNamespace(
+            text="We cannot go\nSpanish: No podemos ir",
+            generation_tokens=640,
+            finish_reason="length",
+        )
+    ]
+    second = [
+        SimpleNamespace(
+            text="We cannot go\nSpanish: No podemos ir",
+            generation_tokens=32,
+            finish_reason="stop",
+        )
+    ]
+    budgets = _patch_mlx(monkeypatch, [first, second])
+
+    result = _worker(tmp_path).ast(
+        np.ones(29 * 16_000, dtype=np.float32),
+        "English",
+        "Spanish",
+        prior_context=[],
+        max_tokens=640,
+        priority="final",
+    )
+
+    assert result == ASTResult("We cannot go", "No podemos ir", True, False)
+    assert budgets == [640, 768]
+    assert sum(budgets) == 1_408
+
+
+@pytest.mark.parametrize(
+    ("text", "reason", "expected"),
+    [
+        (
+            "We cannot go\nSpanish: No podemos",
+            "length",
+            ASTResult("We cannot go", "No podemos", False, True),
+        ),
+        ("We cannot go", "stop", ASTResult("We cannot go", "", False, False)),
+    ],
+)
+def test_final_stays_incomplete_after_one_failed_retry(
+    monkeypatch, tmp_path, text, reason, expected
+):
+    streams = [
+        [SimpleNamespace(text=text, generation_tokens=budget, finish_reason=reason)]
+        for budget in (100, 200)
+    ]
+    budgets = _patch_mlx(monkeypatch, streams)
+
+    result = _worker(tmp_path).ast(
+        np.ones(16_000, dtype=np.float32),
+        "English",
+        "Spanish",
+        prior_context=[],
+        max_tokens=100,
+        priority="final",
+    )
+
+    assert result == expected
+    assert budgets == [100, 200]
+
+
+def test_truncated_partial_does_not_retry(monkeypatch, tmp_path):
+    budgets = _patch_mlx(monkeypatch, [[SimpleNamespace(
+        text="We cannot go\nSpanish: No podemos", generation_tokens=100, finish_reason="length"
+    )]])
+
+    result = _worker(tmp_path).ast(
+        np.ones(16_000, dtype=np.float32),
+        "English",
+        "Spanish",
+        prior_context=[],
+        max_tokens=100,
+        priority="partial",
+    )
+
+    assert result == ASTResult("We cannot go", "No podemos", False, True)
+    assert budgets == [100]
