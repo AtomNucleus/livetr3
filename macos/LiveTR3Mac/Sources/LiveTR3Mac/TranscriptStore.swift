@@ -57,6 +57,10 @@ final class TranscriptStore: ObservableObject {
         }
     }
 
+    func clearError() {
+        lastError = nil
+    }
+
     func clear() {
         entries = []
         lastError = nil

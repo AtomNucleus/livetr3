@@ -26,6 +26,8 @@ struct ProjectorCaptionPresentation {
     private(set) var current: Caption?
     private(set) var previous: Caption?
     private(set) var draft: Caption?
+    private(set) var isTranslationPending = false
+    private var draftHasSource = false
     private(set) var holdUntil: TimeInterval = 0
     private var active: Pending?
     private var pageStart: Pending?
@@ -66,17 +68,23 @@ struct ProjectorCaptionPresentation {
             }
         }
         let newestFinalID = finalIDs.max() ?? Int.min
-        if let entry = entries.last(where: { $0.state == .partial && $0.id > newestFinalID }) {
+        if let entry = entries.last(where: {
+            $0.id > newestFinalID && ($0.state == .partial || $0.translation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }) {
             if draftID != entry.id {
                 originalDraft = SettlingCaptionText()
                 translationDraft = SettlingCaptionText()
                 draftID = entry.id
             }
+            draftHasSource = !entry.original.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            isTranslationPending = draftHasSource && entry.translation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             originalDraft.update(entry.original, at: now)
             translationDraft.update(entry.translation, at: now)
         } else {
             draftID = nil
             draft = nil
+            isTranslationPending = false
+            draftHasSource = false
         }
     }
 
@@ -99,6 +107,7 @@ struct ProjectorCaptionPresentation {
             }
             // The last page stays indefinitely during silence, even after its hold expires.
         }
+        isTranslationPending = draftID != nil && draftHasSource && translationDraft.settled(at: now).isEmpty
         if let draftID, queue.isEmpty, !hasRemainder {
             let original = originalDraft.settled(at: now)
             let translation = translationDraft.settled(at: now)

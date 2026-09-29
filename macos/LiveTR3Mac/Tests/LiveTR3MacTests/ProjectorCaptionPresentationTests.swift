@@ -262,6 +262,79 @@ final class ProjectorCaptionPresentationTests: XCTestCase {
         XCTAssertEqual(model.current?.translation, "Gracias.")
     }
 
+    func testSourceOnlyProgressRetainsFinishedHistoryUntilTranslationInEveryLayout() {
+        for style in ProjectorPresentationStyle.allCases {
+            for state in [UtteranceState.partial, .final] {
+                let layout = ProjectorCaptionLayout(size: CGSize(width: 1280, height: 720), requestedFontSize: 72, style: style)
+                var model = ProjectorCaptionPresentation()
+                let first = entry(1, "Welcome.", "Bienvenidos.")
+                let second = entry(2, "Thank you.", "Gracias.")
+                model.receive([first], at: 0)
+                model.tick(at: 0, layout: layout)
+                model.receive([first, second], at: 1)
+                model.tick(at: 4, layout: layout)
+                let deadline = model.holdUntil
+                let sourceOnly = entry(3, "Please sit down.", "  ", state: state)
+                model.receive([first, second, sourceOnly], at: 5)
+                model.tick(at: 5, layout: layout)
+                XCTAssertTrue(model.isTranslationPending, "Progress appears before draft text settles")
+                XCTAssertNil(model.draft)
+                model.tick(at: 6, layout: layout)
+                XCTAssertEqual(model.draft?.original, "Please sit down.")
+                XCTAssertEqual(model.draft?.translation, "")
+                model.tick(at: 100, layout: layout)
+                XCTAssertEqual(model.previous?.translation, "Bienvenidos.")
+                XCTAssertEqual(model.current?.translation, "Gracias.")
+                XCTAssertEqual(model.holdUntil, deadline)
+                let translated = entry(3, "Please sit down.", "Por favor, siéntense.")
+                model.receive([first, second, translated], at: 101)
+                model.tick(at: 101, layout: layout)
+                XCTAssertFalse(model.isTranslationPending)
+                XCTAssertNil(model.draft)
+                XCTAssertEqual(model.current?.translation, translated.translation)
+                XCTAssertEqual(model.previous?.translation, "Gracias.")
+                XCTAssertGreaterThanOrEqual(model.holdUntil, 105)
+            }
+        }
+    }
+
+    func testFirstSourceCaptionShowsPendingThenStabilizesTranslationAndClearResetsIt() {
+        var model = ProjectorCaptionPresentation()
+        model.receive([entry(1, "Hello everyone.", "", state: .partial)], at: 0)
+        model.tick(at: 0, layout: layout)
+        XCTAssertTrue(model.isTranslationPending)
+        XCTAssertNil(model.draft)
+        model.tick(at: 0.8, layout: layout)
+        XCTAssertEqual(model.draft?.original, "Hello everyone.")
+        XCTAssertEqual(model.draft?.translation, "")
+        model.receive([entry(1, "Hello everyone.", "Hola a todos.", state: .partial)], at: 1)
+        model.tick(at: 1.1, layout: layout)
+        XCTAssertTrue(model.isTranslationPending, "Keep progress while the translated draft settles")
+        model.tick(at: 1.8, layout: layout)
+        XCTAssertFalse(model.isTranslationPending)
+        XCTAssertEqual(model.draft?.translation, "Hola a todos.")
+        model.receive([], at: 2)
+        model.tick(at: 3, layout: layout)
+        XCTAssertFalse(model.isTranslationPending)
+        XCTAssertNil(model.draft)
+    }
+
+    func testLateSourceOnlyPartialDoesNotRestorePendingStateAfterFinal() async {
+        await MainActor.run {
+            let store = TranscriptStore()
+            var model = ProjectorCaptionPresentation()
+            store.handle(.caption(type: .final, utteranceID: 1, original: "Welcome.", translation: "Bienvenidos."))
+            model.receive(store.entries, at: 0)
+            model.tick(at: 0, layout: layout)
+            store.handle(.caption(type: .partial, utteranceID: 1, original: "Welcome", translation: ""))
+            model.receive(store.entries, at: 1)
+            model.tick(at: 2, layout: layout)
+            XCTAssertFalse(model.isTranslationPending)
+            XCTAssertNil(model.draft)
+            XCTAssertEqual(model.current?.translation, "Bienvenidos.")
+        }
+    }
+
     func testRenderAudienceLayouts() async throws {
         guard let output = ProcessInfo.processInfo.environment["LIVETR3_PROJECTOR_RENDER_DIR"] else {
             throw XCTSkip("Set LIVETR3_PROJECTOR_RENDER_DIR to render the audience layouts")
@@ -280,14 +353,28 @@ final class ProjectorCaptionPresentationTests: XCTestCase {
                     model.tick(at: model.holdUntil, layout: layout)
                     model.receive([final, second, entry(3, "Everyone who loves ", "Todo el que ama ", state: .partial)], at: 5)
                     model.tick(at: 6, layout: layout)
-                    let stage = ProjectorCaptionStage(current: model.current, previous: model.previous, draft: model.draft, layout: layout,
-                                                       sourceLanguage: "English", targetLanguage: "Spanish")
-                    let renderer = ImageRenderer(content: stage)
-                    renderer.proposedSize = ProposedViewSize(size)
-                    let image = try XCTUnwrap(renderer.nsImage)
-                    let bitmap = try XCTUnwrap(NSBitmapImageRep(data: try XCTUnwrap(image.tiffRepresentation)))
-                    let data = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
-                    try data.write(to: URL(fileURLWithPath: output).appendingPathComponent("\(style.rawValue)-\(Int(size.width)).png"))
+                    for scenario in ["translated-draft", "pending-retained", "recovered", "pending-first"] {
+                        if scenario == "pending-retained" {
+                            model.receive([final, second, entry(3, "Everyone who loves ", "", state: .partial)], at: 7)
+                            model.tick(at: 8, layout: layout)
+                        } else if scenario == "recovered" {
+                            model.receive([final, second, entry(3, "Everyone who loves knows God.", "Quien ama conoce a Dios.")], at: 9)
+                            model.tick(at: 9, layout: layout)
+                        } else if scenario == "pending-first" {
+                            model.receive([], at: 10)
+                            model.receive([entry(1, "Let us love one another.", "", state: .partial)], at: 11)
+                            model.tick(at: 12, layout: layout)
+                        }
+                        let stage = ProjectorCaptionStage(current: model.current, previous: model.previous, draft: model.draft,
+                                                           isTranslationPending: model.isTranslationPending, layout: layout,
+                                                           sourceLanguage: "English", targetLanguage: "Spanish")
+                        let renderer = ImageRenderer(content: stage)
+                        renderer.proposedSize = ProposedViewSize(size)
+                        let image = try XCTUnwrap(renderer.nsImage)
+                        let bitmap = try XCTUnwrap(NSBitmapImageRep(data: try XCTUnwrap(image.tiffRepresentation)))
+                        let data = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+                        try data.write(to: URL(fileURLWithPath: output).appendingPathComponent("\(style.rawValue)-\(Int(size.width))-\(scenario).png"))
+                    }
                 }
             }
         }

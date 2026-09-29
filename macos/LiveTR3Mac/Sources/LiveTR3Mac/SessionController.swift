@@ -336,45 +336,121 @@ final class ProjectorConnection: ObservableObject {
     let transcript = TranscriptStore()
 
     private let sessionID: String
-    private let engine: CaptionEngine
-    private var transcriptObservation: AnyCancellable? = nil
+    private let makeEngine: () -> CaptionEngine
+    private let waitForRetry: (TimeInterval) async throws -> Void
+    private var engine: CaptionEngine?
+    private var connectionTask: Task<Void, Never>?
+    private var retryTask: Task<Void, Never>?
+    private var attemptID: UUID?
+    private var wantsConnection = false
+    private var retryDelay: TimeInterval = 0.5
+    private var transcriptObservation: AnyCancellable?
 
-    init(sessionID: String) {
+    init(sessionID: String, makeEngine: (() -> CaptionEngine)? = nil,
+         waitForRetry: @escaping (TimeInterval) async throws -> Void = { delay in
+             try await Task.sleep(for: .seconds(delay))
+         }) {
         self.sessionID = sessionID
-        self.engine = ProcessInfo.processInfo.environment["LIVETR3_DEBUG_WEBSOCKET"] == "1"
-            ? LiveTR3WebSocket()
-            : LocalEngineConnection()
-        self.transcriptObservation = transcript.objectWillChange.sink { [weak self] _ in
+        self.makeEngine = makeEngine ?? {
+            if ProcessInfo.processInfo.environment["LIVETR3_DEBUG_WEBSOCKET"] == "1" {
+                return LiveTR3WebSocket()
+            }
+            return LocalEngineConnection()
+        }
+        self.waitForRetry = waitForRetry
+        transcriptObservation = transcript.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
-        }
-        engine.onMessage = { [weak self] message in
-            Task { @MainActor in
-                self?.transcript.handle(message)
-                if case .error(let message) = message {
-                    self?.connectionError = message
-                }
-            }
-        }
-        engine.onDisconnect = { [weak self] in
-            Task { @MainActor in
-                self?.connectionError = self?.connectionError ?? "Projector local engine connection closed"
-            }
         }
     }
 
     func connect() {
-        Task {
+        guard !wantsConnection else { return }
+        wantsConnection = true
+        retryDelay = 0.5
+        beginAttempt()
+    }
+
+    func disconnect() {
+        wantsConnection = false
+        retryTask?.cancel()
+        retryTask = nil
+        retireAttempt()
+        connectionError = nil
+    }
+
+    private func beginAttempt() {
+        guard wantsConnection, attemptID == nil else { return }
+        let id = UUID()
+        let engine = makeEngine()
+        // Rejoin as a viewer of this same session, never send producer `resume` or
+        // clear the store: its IDs and the presentation's reading position survive.
+        let replayFloor = transcript.entries.map(\.id).max() ?? Int.min
+        self.engine = engine
+        attemptID = id
+        engine.onMessage = { [weak self] message in
+            guard let self, self.wantsConnection, self.attemptID == id else { return }
+            if case .caption(_, let utteranceID, _, _) = message,
+               utteranceID <= replayFloor,
+               !self.transcript.entries.contains(where: { $0.id == utteranceID }) { return }
+            self.transcript.handle(message)
+            switch message {
+            case .caption, .status(state: .ready, message: _):
+                self.connectionError = nil
+                self.retryDelay = 0.5
+            default:
+                break
+            }
+        }
+        engine.onDisconnect = { [weak self] in
+            self?.connectionFailed(id: id)
+        }
+        let sessionID = self.sessionID
+        connectionTask = Task { [weak self] in
             do {
+                try Task.checkCancellation()
                 try await engine.connect(sessionID: sessionID, mode: .viewer)
-                connectionError = nil
+                try Task.checkCancellation()
+                guard let self, self.wantsConnection, self.attemptID == id else { return }
+                self.connectionTask = nil
+                self.connectionError = nil
+                self.transcript.clearError()
+                // Reset backoff on actual traffic, not an optimistic WebSocket open.
             } catch {
-                connectionError = "Projector local engine connection failed"
+                self?.connectionFailed(id: id)
             }
         }
     }
 
-    func disconnect() {
-        engine.disconnect()
+    private func connectionFailed(id: UUID) {
+        guard wantsConnection, attemptID == id else { return }
+        retireAttempt()
+        connectionError = "Projector local engine connection closed. Reconnecting…"
+        guard retryTask == nil else { return }
+        let delay = retryDelay
+        retryDelay = min(retryDelay * 2, 8)
+        let wait = waitForRetry
+        retryTask = Task { [weak self] in
+            do {
+                try await wait(delay)
+                try Task.checkCancellation()
+                guard let self, self.wantsConnection else { return }
+                self.retryTask = nil
+                self.beginAttempt()
+            } catch {
+                // Closing the projector cancels the pending delay.
+            }
+        }
+    }
+
+    private func retireAttempt() {
+        // Invalidate callbacks before cancellation, including late connect completions.
+        attemptID = nil
+        connectionTask?.cancel()
+        connectionTask = nil
+        engine?.onMessage = nil
+        engine?.onDisconnect = nil
+        engine?.disconnect()
+        engine = nil
     }
 }
 

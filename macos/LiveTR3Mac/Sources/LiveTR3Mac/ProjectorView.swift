@@ -40,6 +40,7 @@ private struct ProjectorTranscriptView: View {
                 current: presentation.current,
                 previous: presentation.previous,
                 draft: presentation.draft,
+                isTranslationPending: presentation.isTranslationPending,
                 layout: layout,
                 sourceLanguage: sourceLanguage,
                 targetLanguage: targetLanguage,
@@ -68,6 +69,7 @@ struct ProjectorCaptionStage: View {
     let current: ProjectorCaptionPresentation.Caption?
     var previous: ProjectorCaptionPresentation.Caption? = nil
     let draft: ProjectorCaptionPresentation.Caption?
+    var isTranslationPending = false
     let layout: ProjectorCaptionLayout
     let sourceLanguage: String
     let targetLanguage: String
@@ -80,7 +82,7 @@ struct ProjectorCaptionStage: View {
 
             VStack(alignment: .leading, spacing: 12) {
                 Rectangle().fill(.white.opacity(0.2)).frame(height: 1)
-                if let current, let draft, current.utteranceID != draft.utteranceID {
+                if let current, isTranslationPending || (draft != nil && current.utteranceID != draft?.utteranceID) {
                     label("Live draft · may change", color: .white.opacity(0.8))
                     draftCaption(draft)
                 } else if let status {
@@ -102,7 +104,8 @@ struct ProjectorCaptionStage: View {
         if let caption = current ?? draft {
             let isDraft = current == nil
             let source = isDraft ? layout.prefix(caption.original, source: true, balancePages: false) : caption.original
-            let target = isDraft ? layout.prefix(caption.translation, source: false, balancePages: false) : caption.translation
+            let target = isDraft && isTranslationPending ? "Translating…"
+                : isDraft ? layout.prefix(caption.translation, source: false, balancePages: false) : caption.translation
             switch layout.style {
             case .focus:
                 lane(target, previous: previous?.translation, source: false,
@@ -130,7 +133,7 @@ struct ProjectorCaptionStage: View {
                 }
             }
         } else {
-            Text("Listening…")
+            Text(isTranslationPending ? "Translating…" : "Listening…")
                 .font(.system(size: layout.fontSize, weight: .medium))
                 .foregroundStyle(.white.opacity(0.75))
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
@@ -160,14 +163,15 @@ struct ProjectorCaptionStage: View {
     }
 
     @ViewBuilder
-    private func draftCaption(_ draft: ProjectorCaptionPresentation.Caption) -> some View {
+    private func draftCaption(_ draft: ProjectorCaptionPresentation.Caption?) -> some View {
+        let target = isTranslationPending ? "Translating…" : draft?.translation ?? ""
         if layout.style == .split {
             HStack(alignment: .top, spacing: 48) {
-                draftText(draft.original, language: sourceLanguage, width: layout.columnWidth)
-                draftText(draft.translation, language: targetLanguage, width: layout.columnWidth)
+                draftText(draft?.original ?? "", language: sourceLanguage, width: layout.columnWidth)
+                draftText(target, language: targetLanguage, width: layout.columnWidth)
             }
         } else {
-            draftText(draft.translation, language: targetLanguage, width: layout.columnWidth)
+            draftText(target, language: targetLanguage, width: layout.columnWidth)
         }
     }
 

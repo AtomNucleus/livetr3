@@ -26,8 +26,10 @@ final class LocalEngineConnection: CaptionEngine {
                 switch state {
                 case .ready:
                     gate.resume()
-                case .failed(let error):
+                case .failed(let error), .waiting(let error):
                     gate.resume(throwing: error)
+                case .cancelled:
+                    gate.resume(throwing: CancellationError())
                 default:
                     break
                 }
@@ -35,6 +37,8 @@ final class LocalEngineConnection: CaptionEngine {
             connection.start(queue: .global(qos: .userInitiated))
         }
 
+        try Task.checkCancellation()
+        guard self.connection === connection else { throw CancellationError() }
         startReceiveLoop()
         sendJSON(["type": "hello", "session": sessionID])
 
