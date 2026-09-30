@@ -111,9 +111,10 @@ MIN_TRANSCRIBABLE_VOICED_MS = max(
 TRANSCRIBABLE_TRIM_PAD_SECONDS = min(
     1.0, max(0.0, float(os.getenv("TRANSCRIBABLE_TRIM_PAD_SECONDS", "0.30")))
 )
+DECODED_PREFIX_PAUSE_FRAMES = 8  # 160 ms of quiet audio at a word/phrase boundary.
 
 
-CommitReason = Literal["punctuation", "stability", "silero_end", "max_utterance_cap"]
+CommitReason = Literal["punctuation", "stability", "silero_end", "max_utterance_cap", "decoded_prefix"]
 
 
 @dataclass(slots=True)
@@ -126,6 +127,8 @@ class UtteranceRuntime:
     voiced_audio_samples: int = 0
     latest_partial_original: str = ""
     latest_partial_translation: str = ""
+    partial_audio_snapshot: np.ndarray | None = None
+    partial_last_audio_unix_seconds: float | None = None
 
 
 def _source_text_ends_sentence(text: str) -> bool:
@@ -222,6 +225,14 @@ def _trim_to_transcribable_audio(audio: np.ndarray) -> np.ndarray:
         np.float32,
         copy=False,
     )
+
+
+def _ends_with_decoded_prefix_pause(audio: np.ndarray) -> bool:
+    samples = DECODED_PREFIX_PAUSE_FRAMES * FRAME_SAMPLES
+    if audio.size < samples:
+        return False
+    frames = audio[-samples:].reshape(-1, FRAME_SAMPLES)
+    return bool(np.all(np.sqrt(np.mean(np.square(frames), axis=1)) < MIN_TRANSCRIBABLE_FRAME_RMS))
 
 
 @dataclass(slots=True)
@@ -521,19 +532,31 @@ class TranscriptionSession:
             and self.state.active_utterance_id not in self._finalizing
             and self._active_utterance_has_new_speech_for_partial()
         ):
-            audio = self.segmenter.current_audio()
+            audio = self._partial_audio_snapshot(self.segmenter.current_audio())
             trimmed_audio = _trim_to_transcribable_audio(audio)
             if (
                 trimmed_audio.size
                 and trimmed_audio.shape[0] / 16_000 >= DEFAULT_PARTIAL_MIN_AUDIO_SECONDS
                 and _audio_has_transcribable_energy(trimmed_audio)
             ):
-                # Each hypothesis replaces the previous one; preserve the whole utterance.
+                # Each hypothesis replaces the previous one. Any audio beyond
+                # the snapshot stays buffered until a later preview or final.
                 inference_audio = trimmed_audio
                 runtime = self._active_utterance_runtime()
                 if runtime is not None:
                     runtime.last_partial_wall_seconds = time.monotonic()
                     runtime.last_partial_audio_samples = runtime.voiced_audio_samples
+                    runtime.partial_audio_snapshot = audio.copy()
+                    frame_rms = np.sqrt(np.mean(
+                        np.square(audio.reshape(-1, FRAME_SAMPLES)), axis=1
+                    ))
+                    voiced = np.flatnonzero(frame_rms >= MIN_TRANSCRIBABLE_FRAME_RMS)
+                    voiced_end = (int(voiced[-1]) + 1) * FRAME_SAMPLES
+                    runtime.partial_last_audio_unix_seconds = (
+                        runtime.last_audio_frame_unix_seconds
+                        - (self.segmenter.current_audio().size - voiced_end) / 16_000
+                        if runtime.last_audio_frame_unix_seconds is not None else None
+                    )
                 self._schedule_ast("partial", self.state.active_utterance_id, inference_audio)
 
         if result.speech_ended and result.audio is not None:
@@ -640,6 +663,10 @@ class TranscriptionSession:
                 )
 
     async def _run_mlx_ast(self, priority: str, utterance_id: int, audio: np.ndarray) -> None:
+        config = self.state.config.model_copy(deep=True)
+        runtime = self._utterance_runtime.get(utterance_id)
+        snapshot = runtime.partial_audio_snapshot if priority == "partial" and runtime else None
+        snapshot_last_audio = runtime.partial_last_audio_unix_seconds if runtime else None
         async def publish_progress(text: str) -> None:
             if utterance_id in self._finalized:
                 return
@@ -719,6 +746,10 @@ class TranscriptionSession:
         if priority == "partial":
             if utterance_id in self._finalized or utterance_id in self._finalizing:
                 return
+            if await self._commit_decoded_prefix(
+                utterance_id, snapshot, audio, config, result, snapshot_last_audio
+            ):
+                return
             runtime = self._utterance_runtime.setdefault(
                 utterance_id,
                 UtteranceRuntime(partials=deque(maxlen=self._stability_window())),
@@ -745,6 +776,85 @@ class TranscriptionSession:
             await self._maybe_commit_early(utterance_id, merged_original)
             return
 
+        await self._publish_final_result(utterance_id, result)
+
+    async def _commit_decoded_prefix(
+        self,
+        utterance_id: int,
+        snapshot: np.ndarray | None,
+        decoded_audio: np.ndarray,
+        config: ConfigMessage,
+        result: ASTResult,
+        last_audio_unix_seconds: float | None,
+    ) -> bool:
+        # Reuse only a finished, exact snapshot near the configured chunk cap.
+        # Audio captured during generation belongs to the next chunk, never to
+        # this result. Any stale state falls back to ordinary final inference.
+        if snapshot is None:
+            return False
+        async with self._finalize_lock:
+            if (
+                not result.complete or result.truncated
+                or not result.original.strip() or not result.translation.strip()
+                # Model punctuation can't prove an acoustic boundary. A short
+                # quiet interval reduces the risk of splitting a spoken word.
+                or not _ends_with_decoded_prefix_pause(snapshot)
+                or not self.state.running or self.state.active_utterance_id != utterance_id
+                or utterance_id in self._finalized or utterance_id in self._finalizing
+                or utterance_id not in self._utterance_runtime
+                or self.state.config != config or self._pending_config is not None
+                or snapshot.size < self.segmenter.max_utterance_frames * FRAME_SAMPLES / 2
+                or snapshot.size >= self.segmenter.current_audio().size
+                or not np.array_equal(_trim_to_transcribable_audio(snapshot), decoded_audio)
+            ):
+                return False
+            if not self.segmenter.split_decoded_prefix(snapshot):
+                return False
+            self._finalizing[utterance_id] = "decoded_prefix"
+            self.worker.finish_partials(utterance_id)
+            runtime = self._utterance_runtime[utterance_id]
+            tail_last_audio = runtime.last_audio_frame_unix_seconds
+            runtime.last_audio_frame_unix_seconds = last_audio_unix_seconds
+            self.state.utterance_id += 1
+            next_id = self.state.utterance_id
+            self.state.active_utterance_id = next_id
+            tail = self.segmenter.current_audio()
+            voiced_samples = int(np.count_nonzero(
+                np.sqrt(np.mean(np.square(tail.reshape(-1, FRAME_SAMPLES)), axis=1))
+                >= MIN_TRANSCRIBABLE_FRAME_RMS
+            )) * FRAME_SAMPLES
+            self._utterance_runtime[next_id] = UtteranceRuntime(
+                partials=deque(maxlen=self._stability_window()),
+                last_audio_frame_unix_seconds=tail_last_audio,
+                voiced_audio_samples=voiced_samples,
+                last_voiced_audio_samples=tail.size if voiced_samples else 0,
+            )
+            trace("segment_commit", session=self.session_id, utterance=utterance_id,
+                  reason="decoded_prefix", samples=snapshot.size)
+            logger.info("final_commit reason=decoded_prefix utterance_id=%s audio_seconds=%.3f",
+                        utterance_id, snapshot.size / 16_000)
+            await self._publish_final_result(utterance_id, result)
+            await self._send_and_broadcast(SpeechStartMessage(utterance_id=next_id).model_dump())
+            return True
+
+    def _partial_audio_snapshot(self, audio: np.ndarray) -> np.ndarray:
+        # Near the cap, prefer the most recent brief pause to an arbitrary
+        # sample boundary. The omitted tail remains in the segmenter and will
+        # be decoded in the next chunk if this complete snapshot is committed.
+        minimum_frames = self.segmenter.max_utterance_frames / 2
+        total_frames = audio.size // FRAME_SAMPLES
+        runtime = self._active_utterance_runtime()
+        previous = runtime.partial_audio_snapshot if runtime else None
+        for end in range(total_frames, max(int(np.ceil(minimum_frames)), total_frames - 50) - 1, -1):
+            prefix = audio[:end * FRAME_SAMPLES]
+            if _ends_with_decoded_prefix_pause(prefix):
+                if previous is not None and prefix.size <= previous.size:
+                    return audio
+                return prefix
+        return audio
+
+    async def _publish_final_result(self, utterance_id: int, result: ASTResult) -> None:
+        original, translation = result.original, result.translation
         self._finalized.add(utterance_id)
         commit_reason = self._finalizing.pop(utterance_id, "silero_end")
         runtime = self._utterance_runtime.pop(utterance_id, None)

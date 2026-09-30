@@ -55,6 +55,21 @@ class RMSGate:
             return np.zeros(0, dtype=np.float32)
         return np.concatenate(self._current).astype(np.float32, copy=False)
 
+    def split_decoded_prefix(self, prefix: np.ndarray) -> bool:
+        """Retire an exact decoded prefix, retaining overlap and all newer audio.
+
+        This is a chunk boundary during speech, so detector state, pending VAD
+        samples and trailing-silence counters must survive it.
+        """
+        if not self._speech_active or not prefix.size or prefix.size % FRAME_SAMPLES:
+            return False
+        current = self.current_audio()
+        if prefix.size > current.size or not np.array_equal(prefix, current[:prefix.size]):
+            return False
+        boundary = prefix.size // FRAME_SAMPLES
+        self._current = self._current[max(0, boundary - self.overlap_frames):]
+        return True
+
     def reset(self) -> None:
         tail = self._current[-self.overlap_frames :] if self.overlap_frames else []
         self._pre_roll = deque((x.copy() for x in tail), maxlen=self.overlap_frames)

@@ -49,3 +49,24 @@ def test_end_of_speech_at_size_cap_still_resets_silero():
     assert result.force_flushed
     assert not vad._silero_active
     vad._vad_iterator.reset_states.assert_called_once()
+
+
+def test_decoded_prefix_split_retains_silero_state_pending_samples_and_every_tail_frame():
+    vad = fake_silero()
+    vad.max_utterance_frames = 300
+    frames = [np.full(320, .05 + i / 100, dtype=np.float32) for i in range(8)]
+    for frame in frames[:5]:
+        vad.ingest(frame)
+    snapshot = vad.current_audio().copy()
+    for frame in frames[5:]:
+        vad.ingest(frame)
+    pending = vad._pending.copy()
+    silent_frames = vad._silent_frames
+    assert vad.split_decoded_prefix(snapshot)
+    np.testing.assert_array_equal(vad.current_audio(), np.concatenate(frames[4:]))
+    np.testing.assert_array_equal(vad._pending, pending)
+    assert vad._silero_active and vad.speech_active
+    assert vad._silent_frames == silent_frames
+    vad._vad_iterator.reset_states.assert_not_called()
+    reconstructed = np.concatenate([snapshot, vad.current_audio()[320:]])
+    np.testing.assert_array_equal(reconstructed, np.concatenate(frames))

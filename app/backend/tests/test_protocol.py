@@ -83,7 +83,7 @@ def test_config_rejects_non_silero_segmenter() -> None:
 
 @pytest.mark.parametrize(
     "commit_reason",
-    ["punctuation", "stability", "silero_end", "max_utterance_cap", None],
+    ["punctuation", "stability", "silero_end", "max_utterance_cap", "decoded_prefix", None],
 )
 def test_transcript_message_accepts_documented_commit_reasons(commit_reason: str | None) -> None:
     message = TranscriptMessage(
