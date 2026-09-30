@@ -11,6 +11,7 @@ if platform.system() != "Darwin" or platform.machine() != "arm64":
         "test_streaming_stalls.py",
         "test_ast_streaming.py",
         "test_preview_scheduling.py",
+        "test_projector_join.py",
         "test_segmenter_boundaries.py",
         "test_gemma_only.py",
         "test_worker_lifecycle.py",
