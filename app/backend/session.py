@@ -122,7 +122,6 @@ class UtteranceRuntime:
     last_audio_frame_unix_seconds: float | None = None
     last_partial_wall_seconds: float = 0.0
     last_partial_audio_samples: int = 0
-    slowest_partial_turnaround_seconds: float = 0.0
     last_voiced_audio_samples: int = 0
     voiced_audio_samples: int = 0
     latest_partial_original: str = ""
@@ -615,39 +614,14 @@ class TranscriptionSession:
             or self._partial_inference_is_busy_or_backlogged()
         ):
             return
-        if priority == "partial":
-            scheduled = self._run_scheduled_partial_ast(
-                priority, utterance_id, audio.copy()
-            )
-        else:
-            scheduled = self._run_ast(priority, utterance_id, audio.copy())
         task = asyncio.create_task(
-            scheduled,
+            self._run_ast(priority, utterance_id, audio.copy()),
             name=f"{priority}-ast-{utterance_id}",
         )
         self._jobs.add(task)
         if priority == "partial":
             self._partial_ast_task = task
         task.add_done_callback(self._jobs.discard)
-
-    async def _run_scheduled_partial_ast(
-        self, priority: str, utterance_id: int, audio: np.ndarray
-    ) -> None:
-        started_at = time.monotonic()
-        try:
-            await self._run_ast(priority, utterance_id, audio)
-        finally:
-            runtime = self._utterance_runtime.get(utterance_id)
-            if (
-                runtime is not None
-                and utterance_id not in self._finalizing
-                and utterance_id not in self._finalized
-            ):
-                # This includes queue wait, so a congested worker also slows preview submissions.
-                turnaround = max(0.0, time.monotonic() - started_at)
-                runtime.slowest_partial_turnaround_seconds = max(
-                    runtime.slowest_partial_turnaround_seconds, turnaround
-                )
 
     async def _run_ast(self, priority: str, utterance_id: int, audio: np.ndarray) -> None:
         started_at = time.monotonic()
@@ -1026,18 +1000,13 @@ class TranscriptionSession:
         return 640
 
     def _partial_interval_seconds(self) -> float:
-        configured = (
+        # The active-task and worker-backlog guards already pace previews to
+        # actual inference throughput. A historical slow turn (including model
+        # startup) must not add idle time after the worker has caught up.
+        return (
             self.state.config.partial_interval_seconds
             or DEFAULT_PARTIAL_INTERVAL_SECONDS
         )
-        runtime = self._active_utterance_runtime()
-        if runtime is None:
-            return configured
-        service_interval = min(
-            PARTIAL_INTERVAL_MAX_SECONDS,
-            runtime.slowest_partial_turnaround_seconds,
-        )
-        return max(configured, service_interval)
 
     def _active_utterance_runtime(self) -> UtteranceRuntime | None:
         if self.state.active_utterance_id is None:
