@@ -380,7 +380,7 @@ struct OperatorSettingsPanel: View {
     }
 
     private var maxUtteranceBinding: Binding<Double> {
-        configDoubleBinding(keyPath: \.max_utterance_seconds, defaultValue: 12)
+        configDoubleBinding(keyPath: \.max_utterance_seconds, defaultValue: 6)
     }
 
     private var sileroThresholdBinding: Binding<Double> {

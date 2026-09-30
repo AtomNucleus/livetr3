@@ -14,6 +14,11 @@ protocol CaptionEngine: AnyObject {
     func connect(sessionID: String, mode: CaptionEngineConnectionMode) async throws
     func sendJSON(_ payload: [String: Any])
     func sendConfig(_ config: ClientConfig)
+    func audioSender() -> ((Data) -> Void)?
     func sendBinary(_ data: Data)
     func disconnect()
+}
+
+extension CaptionEngine {
+    func audioSender() -> ((Data) -> Void)? { nil }
 }

@@ -20,7 +20,39 @@ def make_session(*, interval=0.25, turnaround=0.0):
     }
     value._finalizing = {}
     value._finalized = set()
+    value._partial_ast_task = None
+    value.worker = SimpleNamespace(is_busy_or_backlogged=False)
     return value
+
+
+def test_busy_worker_defers_preview_without_consuming_new_audio():
+    session = make_session()
+    runtime = session._utterance_runtime[7]
+    runtime.voiced_audio_samples = 16_000
+    session.worker.is_busy_or_backlogged = True
+    assert not session._active_utterance_has_new_speech_for_partial()
+    assert runtime.last_partial_audio_samples == 0
+    session.worker.is_busy_or_backlogged = False
+    assert session._active_utterance_has_new_speech_for_partial()
+
+
+def test_batched_frames_schedule_only_one_preview_before_task_starts():
+    async def run():
+        session = make_session()
+        session._jobs = set()
+        session._run_ast = AsyncMock()
+        session._run_scheduled_partial_ast = AsyncMock()
+        audio = np.ones(16000, dtype=np.float32)
+        session._schedule_ast("partial", 7, audio)
+        session._schedule_ast("partial", 7, audio)
+        assert len(session._jobs) == 1
+        # A required final still enters the queue immediately.
+        session._schedule_ast("final", 7, audio)
+        assert len(session._jobs) == 2
+        await asyncio.gather(*session._jobs)
+        session._run_scheduled_partial_ast.assert_awaited_once()
+        session._run_ast.assert_awaited_once()
+    asyncio.run(run())
 
 
 def test_partial_interval_tracks_turnaround_but_respects_configured_floor():

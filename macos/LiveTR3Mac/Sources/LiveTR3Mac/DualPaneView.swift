@@ -39,38 +39,19 @@ struct DualPaneView: View {
             .padding(.vertical, 10)
             .background(.bar)
 
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 2) {
-                        ForEach(entries.filter { !field.text(from: $0).isEmpty }) { entry in
-                            TranscriptLineView(
-                                entry: entry,
-                                field: field,
-                                layoutDirection: layoutDirection
-                            )
-                            .id(entry.id)
-                        }
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 14)
-                }
-                .onChange(of: entries.count) { _, _ in
-                    if let last = entries.last {
-                        withAnimation(.easeOut(duration: 0.15)) {
-                            proxy.scrollTo(last.id, anchor: .bottom)
-                        }
+            LiveCaptionScrollView {
+                LazyVStack(alignment: .leading, spacing: 2) {
+                    ForEach(entries.filter { !field.text(from: $0).isEmpty }) { entry in
+                        TranscriptLineView(
+                            entry: entry,
+                            field: field,
+                            layoutDirection: layoutDirection
+                        )
+                        .equatable()
                     }
                 }
-                .onChange(of: entries.last?.translation) { _, _ in
-                    if let last = entries.last {
-                        proxy.scrollTo(last.id, anchor: .bottom)
-                    }
-                }
-                .onChange(of: entries.last?.original) { _, _ in
-                    if let last = entries.last {
-                        proxy.scrollTo(last.id, anchor: .bottom)
-                    }
-                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 14)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

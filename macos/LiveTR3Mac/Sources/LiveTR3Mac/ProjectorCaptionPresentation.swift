@@ -121,6 +121,8 @@ struct ProjectorCaptionPresentation {
         }
     }
 
+    var queuedUtteranceCount: Int { queue.reduce(0) { $0 + $1.captions.count } }
+
     private var hasRemainder: Bool {
         guard let active, let layout else { return false }
         return (layout.style != .focus && active.originalOffset < active.caption.original.count)

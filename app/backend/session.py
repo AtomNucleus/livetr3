@@ -32,6 +32,7 @@ from protocol import (
 )
 from segmenter import FRAME_SAMPLES, RMSGate, make_segmenter
 from transport import SessionTransport
+from latency_trace import trace
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -43,7 +44,7 @@ MAINTENANCE_INTERVAL_UTTERANCES = max(
 )
 ARCHIVE_AUTOSAVE_SECONDS = max(5, int(os.getenv("SESSION_AUTOSAVE_SECONDS", "60")))
 ARCHIVE_ROOT = (
-    Path.home() / "Library" / "Application Support" / "LiveTR3" / "sessions"
+    Path(os.getenv("LIVETR3_ARCHIVE_ROOT", str(Path.home() / "Library" / "Application Support" / "LiveTR3" / "sessions")))
 )
 LEARNING_PROFILE_PATH = (
     Path.home() / "Library" / "Application Support" / "LiveTR3" / "learning_profile.json"
@@ -341,7 +342,9 @@ class TranscriptionSession:
         self.segmenter: RMSGate = self._build_segmenter(self.state.config)
         self.ring: deque[np.ndarray] = deque(maxlen=int(30 / 0.02))
         self._send_lock = asyncio.Lock()
+        self._trace_audio_frame = 0
         self._jobs: set[asyncio.Task] = set()
+        self._partial_ast_task: asyncio.Task | None = None
         self._last_level_at = 0.0
         self._finalized: set[int] = set()
         self._finalizing: dict[int, CommitReason] = {}
@@ -464,6 +467,8 @@ class TranscriptionSession:
             await self._send_error("Audio frame was not float32-aligned")
             return
 
+        self._trace_audio_frame += 1
+        trace("backend_audio", session=self.session_id, frame=self._trace_audio_frame, bytes=len(data))
         samples = np.frombuffer(data, dtype="<f4").astype(np.float32, copy=True)
         if samples.size < FRAME_SAMPLES:
             return
@@ -509,6 +514,10 @@ class TranscriptionSession:
 
         if (
             result.speech_active
+            # During trailing silence a final is imminent. Starting another
+            # preview here makes that final wait for a redundant prefill before
+            # the worker can observe cancellation. Keep recording every frame.
+            and result.rms >= MIN_TRANSCRIBABLE_FRAME_RMS
             and DEFAULT_PARTIAL_AST_ENABLED
             and self.state.active_utterance_id not in self._finalizing
             and self._active_utterance_has_new_speech_for_partial()
@@ -551,6 +560,7 @@ class TranscriptionSession:
     ) -> bool:
         if utterance_id is None or not audio.size:
             return False
+        trace("segment_commit", session=self.session_id, utterance=utterance_id, reason=reason, samples=audio.size)
         transcribable_audio = _trim_to_transcribable_audio(audio)
         if not _audio_has_transcribable_energy(transcribable_audio):
             rms, peak, voiced_frames, required_frames = _audio_energy_stats(transcribable_audio)
@@ -602,6 +612,7 @@ class TranscriptionSession:
             return
         if priority == "partial" and (
             utterance_id in self._finalized or utterance_id in self._finalizing
+            or self._partial_inference_is_busy_or_backlogged()
         ):
             return
         if priority == "partial":
@@ -615,6 +626,8 @@ class TranscriptionSession:
             name=f"{priority}-ast-{utterance_id}",
         )
         self._jobs.add(task)
+        if priority == "partial":
+            self._partial_ast_task = task
         task.add_done_callback(self._jobs.discard)
 
     async def _run_scheduled_partial_ast(
@@ -690,6 +703,7 @@ class TranscriptionSession:
             )
 
         try:
+            trace("inference_submit", session=getattr(self, "session_id", ""), utterance=utterance_id, priority=priority, samples=audio.size)
             result = await self.worker.submit_ast(
                 priority="final" if priority == "final" else "partial",
                 utterance_id=utterance_id,
@@ -812,7 +826,13 @@ class TranscriptionSession:
             ])
 
     def _partial_inference_is_busy_or_backlogged(self) -> bool:
-        return self.worker.is_busy_or_backlogged
+        # Audio continues accumulating while inference runs. Submit the freshest
+        # snapshot when the worker is free, instead of spending its next turn on
+        # an older queued preview. The task check also covers a batch of frames
+        # arriving before the scheduled coroutine gets its first turn.
+        return (
+            self._partial_ast_task is not None and not self._partial_ast_task.done()
+        ) or bool(self._finalizing) or self.worker.is_busy_or_backlogged
 
     def _schedule_worker_warmup(self) -> None:
         task = asyncio.create_task(self._warm_mlx_worker(), name="mlx-worker-warmup")
@@ -882,6 +902,8 @@ class TranscriptionSession:
     async def _send(self, payload: dict) -> None:
         self._record_archive_payload(payload)
         async with self._send_lock:
+            if payload.get("type") in {"partial", "final", "speech_start", "error"}:
+                trace("backend_caption", session=self.session_id, utterance=payload.get("utterance_id"), type=payload.get("type"), source_chars=len(payload.get("original", "")), translation_chars=len(payload.get("translation", "")))
             await self.websocket.send_json(payload)
 
     async def _send_and_broadcast(self, payload: dict) -> None:
@@ -983,7 +1005,7 @@ class TranscriptionSession:
         silero_threshold = min(max(config.silero_threshold or 0.5, 0.1), 0.95)
         speech_pad_ms = min(max(config.speech_pad_ms or 300, 0), 2000)
         min_silence_ms = min(max(config.min_silence_ms or 300, 100), 5000)
-        max_utterance_seconds = min(max(config.max_utterance_seconds or 12.0, 5.0), 29.0)
+        max_utterance_seconds = min(max(config.max_utterance_seconds or 6.0, 5.0), 29.0)
         return make_segmenter(
             config.segmenter,
             rms_threshold,
@@ -1023,6 +1045,8 @@ class TranscriptionSession:
         return self._utterance_runtime.get(self.state.active_utterance_id)
 
     def _active_utterance_has_new_speech_for_partial(self) -> bool:
+        if self._partial_inference_is_busy_or_backlogged():
+            return False
         runtime = self._active_utterance_runtime()
         if runtime is None:
             return False

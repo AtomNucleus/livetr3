@@ -44,7 +44,7 @@ struct ClientConfig: Codable, Equatable {
         polish_enabled: false,
         code_switching_enabled: false,
         partial_interval_seconds: 0.25,
-        max_utterance_seconds: 12,
+        max_utterance_seconds: 6,
         silero_threshold: 0.5,
         speech_pad_ms: 300,
         min_silence_ms: 150,

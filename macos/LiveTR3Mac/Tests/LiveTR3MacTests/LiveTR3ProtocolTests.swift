@@ -12,7 +12,7 @@ final class LiveTR3ProtocolTests: XCTestCase {
         XCTAssertEqual(config.custom_vocab, [])
         XCTAssertEqual(config.polish_enabled, false)
         XCTAssertEqual(config.partial_interval_seconds, 0.25)
-        XCTAssertEqual(config.max_utterance_seconds, 12)
+        XCTAssertEqual(config.max_utterance_seconds, 6)
     }
 
     func testCaptionMessageParses() throws {

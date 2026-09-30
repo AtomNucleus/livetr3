@@ -26,41 +26,108 @@ private struct ProjectorTranscriptView: View {
     let sourceLanguage: String
     let targetLanguage: String
     let connectionError: String?
-    @State private var presentation = ProjectorCaptionPresentation()
-    private let clock = Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()
-
     var body: some View {
+        if ProcessInfo.processInfo.environment["LIVETR3_PROJECTOR_READING_QUEUE"] == "1" {
+            ProjectorReadingQueueDiagnosticView(transcript: transcript, sessionManager: sessionManager,
+                sourceLanguage: sourceLanguage, targetLanguage: targetLanguage, connectionError: connectionError)
+        } else {
         GeometryReader { geometry in
-            let layout = ProjectorCaptionLayout(
-                size: geometry.size,
-                requestedFontSize: sessionManager.projectorFontSize,
-                style: sessionManager.projectorStyle
-            )
-            ProjectorCaptionStage(
-                current: presentation.current,
-                previous: presentation.previous,
-                draft: presentation.draft,
-                isTranslationPending: presentation.isTranslationPending,
-                layout: layout,
+            ProjectorLiveCaptionStage(
+                entries: transcript.displayEntries,
+                layout: ProjectorCaptionLayout(size: geometry.size,
+                    requestedFontSize: sessionManager.projectorFontSize,
+                    style: sessionManager.projectorStyle),
                 sourceLanguage: sourceLanguage,
                 targetLanguage: targetLanguage,
                 status: connectionError ?? transcript.lastError
             )
-            .onAppear { receive(layout: layout) }
-            .onChange(of: transcript.entries) { _, _ in receive(layout: layout) }
-            .onChange(of: layout) { _, _ in advance(layout: layout) }
-            .onReceive(clock) { _ in advance(layout: layout) }
+        }
         }
     }
+}
 
-    private func receive(layout: ProjectorCaptionLayout) {
-        let now = ProcessInfo.processInfo.systemUptime
-        presentation.receive(transcript.entries, at: now)
-        presentation.tick(at: now, layout: layout)
+/// Follow the same revisions as the operator. Full captions remain in scrollable history;
+/// no reading-time queue can withhold a newer utterance or hide its live translation.
+struct ProjectorLiveCaptionStage: View {
+    let entries: [TranscriptUtterance]
+    let layout: ProjectorCaptionLayout
+    let sourceLanguage: String
+    let targetLanguage: String
+    var status: String?
+
+    var body: some View {
+        VStack(spacing: 16) {
+            switch layout.style {
+            case .focus:
+                lane(source: false)
+            case .split:
+                HStack(spacing: 24) {
+                    lane(source: true)
+                    Rectangle().fill(.white.opacity(0.25)).frame(width: 1)
+                    lane(source: false)
+                }
+            case .stack:
+                VStack(spacing: 24) {
+                    lane(source: true)
+                    Rectangle().fill(.white.opacity(0.25)).frame(height: 1)
+                    lane(source: false)
+                }
+            }
+            if let status {
+                Text(status).font(.system(size: 18)).foregroundStyle(.orange)
+            }
+        }
+        .padding(layout.inset)
+        .frame(width: layout.size.width, height: layout.size.height)
+        .background(.black)
+        .foregroundStyle(.white)
+        .transaction { $0.animation = nil }
     }
 
-    private func advance(layout: ProjectorCaptionLayout) {
-        presentation.tick(at: ProcessInfo.processInfo.systemUptime, layout: layout)
+    private func lane(source: Bool) -> some View {
+        let language = source ? sourceLanguage : targetLanguage
+        let fontSize = source ? layout.sourceFontSize : layout.fontSize
+        let ordered = Self.orderedEntries(entries)
+        return VStack(alignment: .leading, spacing: 12) {
+            Text(language).font(.system(size: 18, weight: .semibold)).foregroundStyle(.white.opacity(0.6))
+            LiveCaptionScrollView {
+                LazyVStack(alignment: .leading, spacing: fontSize * 0.3) {
+                    ForEach(ordered) { entry in
+                        let text = source ? entry.original : entry.translation
+                        StableCaptionLayout(fontSize: fontSize) {
+                            Text(text.isEmpty && !source ? "Translating…" : text)
+                                .font(.system(size: fontSize, weight: .semibold))
+                                .lineSpacing(layout.lineSpacing)
+                                .foregroundStyle(entry.state == .partial ? .white.opacity(0.75) : .white)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .multilineTextAlignment(isRtlLanguage(language) ? .trailing : .leading)
+                                .frame(maxWidth: .infinity, alignment: isRtlLanguage(language) ? .trailing : .leading)
+                                .onAppear { trace(entry, source: source) }
+                                .onChange(of: text) { _, _ in trace(entry, source: source) }
+                                .onChange(of: entry.state) { _, _ in trace(entry, source: source) }
+                        }
+                    }
+                }
+                .padding(.vertical, 8)
+            }
+            .overlay {
+                if ordered.isEmpty {
+                    Text("Listening…").font(.system(size: fontSize)).foregroundStyle(.white.opacity(0.75))
+                }
+            }
+        }
+        .environment(\.layoutDirection, isRtlLanguage(language) ? .rightToLeft : .leftToRight)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    static func orderedEntries(_ entries: [TranscriptUtterance]) -> [TranscriptUtterance] {
+        entries.sorted { $0.id < $1.id }
+    }
+
+    private func trace(_ entry: TranscriptUtterance, source: Bool) {
+        guard LatencyTrace.shared.isEnabled else { return }
+        let text = source ? entry.original : entry.translation
+        LatencyTrace.shared.record("view_text_update_proxy", ["surface": "projector", "utterance": entry.id, "field": source ? "original" : "translation", "chars": text.count, "signature": text.hashValue, "type": String(describing: entry.state)])
     }
 }
 
@@ -194,5 +261,44 @@ struct ProjectorCaptionStage: View {
         Text(text)
             .font(.system(size: 18, weight: .semibold))
             .foregroundStyle(color)
+    }
+}
+
+/// The prior policy is retained only for an explicit diagnostic A/B replay.
+private struct ProjectorReadingQueueDiagnosticView: View {
+    @ObservedObject var transcript: TranscriptStore
+    @ObservedObject var sessionManager: SessionManager
+    let sourceLanguage: String
+    let targetLanguage: String
+    let connectionError: String?
+    @State private var presentation = ProjectorCaptionPresentation()
+    private let clock = Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()
+    var body: some View {
+        GeometryReader { geometry in
+            let layout = ProjectorCaptionLayout(size: geometry.size,
+                requestedFontSize: sessionManager.projectorFontSize, style: sessionManager.projectorStyle)
+            ProjectorCaptionStage(current: presentation.current, previous: presentation.previous,
+                draft: presentation.draft, isTranslationPending: presentation.isTranslationPending,
+                layout: layout, sourceLanguage: sourceLanguage, targetLanguage: targetLanguage,
+                status: connectionError ?? transcript.lastError)
+                .onAppear { receive(layout) }
+                .onChange(of: transcript.displayEntries) { _, _ in receive(layout) }
+                .onChange(of: layout) { _, _ in advance(layout) }
+                .onReceive(clock) { _ in advance(layout) }
+                .onChange(of: presentation.current) { _, current in
+                    if let current { LatencyTrace.shared.record("projector_page_update_proxy", ["utterance": current.utteranceID, "source_chars": current.original.count, "translation_chars": current.translation.count]) }
+                }
+        }
+    }
+    private func receive(_ layout: ProjectorCaptionLayout) {
+        presentation.receive(transcript.displayEntries, at: ProcessInfo.processInfo.systemUptime)
+        advance(layout)
+    }
+    private func advance(_ layout: ProjectorCaptionLayout) {
+        let now = ProcessInfo.processInfo.systemUptime
+        presentation.tick(at: now, layout: layout)
+        LatencyTrace.shared.record("projector_reading_queue", ["current_utterance": presentation.current?.utteranceID ?? -1,
+            "newest_received": transcript.entries.map(\.id).max() ?? -1,
+            "queued_utterances": presentation.queuedUtteranceCount, "hold_remaining": max(0, presentation.holdUntil-now)])
     }
 }

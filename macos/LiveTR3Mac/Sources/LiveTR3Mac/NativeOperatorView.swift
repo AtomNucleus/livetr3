@@ -5,6 +5,14 @@ struct NativeOperatorView: View {
     @ObservedObject var session: SessionController
     @ObservedObject var sessionManager: SessionManager
     let onOpenProjector: () -> Void
+    @ObservedObject private var transcript: TranscriptStore
+
+    init(session: SessionController, sessionManager: SessionManager, onOpenProjector: @escaping () -> Void) {
+        self.session = session
+        self.sessionManager = sessionManager
+        self.onOpenProjector = onOpenProjector
+        self.transcript = session.transcript
+    }
 
     @State private var settingsOpen = false
 
@@ -17,7 +25,7 @@ struct NativeOperatorView: View {
                 onOpenProjector: onOpenProjector
             )
 
-            if let workerStatus = session.transcript.workerStatus, workerStatus.state != .ready {
+            if let workerStatus = transcript.workerStatus, workerStatus.state != .ready {
                 banner(text: workerStatus.message, tint: .orange)
             }
 
@@ -26,7 +34,7 @@ struct NativeOperatorView: View {
             }
 
             DualPaneView(
-                entries: session.transcript.entries,
+                entries: transcript.displayEntries,
                 sourceLanguage: session.config.source_lang,
                 targetLanguage: session.config.target_lang
             )
@@ -44,7 +52,7 @@ struct NativeOperatorView: View {
     }
 
     private var displayedError: String? {
-        session.transcript.lastError ?? session.error
+        transcript.lastError ?? session.error
     }
 
     @ViewBuilder
@@ -60,7 +68,7 @@ struct NativeOperatorView: View {
 
     private func exportTXT() {
         TranscriptExporter.exportTXT(
-            entries: session.transcript.entries,
+            entries: transcript.entries,
             source: session.config.source_lang,
             target: session.config.target_lang
         )

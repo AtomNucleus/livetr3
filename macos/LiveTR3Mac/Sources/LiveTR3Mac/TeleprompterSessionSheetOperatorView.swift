@@ -5,15 +5,24 @@ struct TeleprompterSessionSheetOperatorView: View {
     @ObservedObject var session: SessionController
     @ObservedObject var sessionManager: SessionManager
     let onOpenProjector: () -> Void
+    @ObservedObject private var transcript: TranscriptStore
+
+    init(session: SessionController, sessionManager: SessionManager, onOpenProjector: @escaping () -> Void) {
+        self.session = session
+        self.sessionManager = sessionManager
+        self.onOpenProjector = onOpenProjector
+        self.transcript = session.transcript
+    }
 
     @State private var hudVisible = true
     @State private var settingsPresented = false
     @State private var partialPulseActive = false
+    @State private var controlsHeight: CGFloat = 150
 
     var body: some View {
         ZStack(alignment: .bottom) {
             VStack(spacing: 0) {
-                if let workerStatus = session.transcript.workerStatus, workerStatus.state != .ready {
+                if let workerStatus = transcript.workerStatus, workerStatus.state != .ready {
                     banner(text: workerStatus.message, tint: .orange)
                 }
 
@@ -32,18 +41,26 @@ struct TeleprompterSessionSheetOperatorView: View {
             }
             .padding(.horizontal, 20)
             .padding(.bottom, 22)
+            .background {
+                GeometryReader { geometry in
+                    Color.clear.preference(key: OperatorControlsHeightKey.self, value: geometry.size.height)
+                }
+            }
         }
         .background(Color.black.opacity(0.93))
+        .onPreferenceChange(OperatorControlsHeightKey.self) { controlsHeight = $0 }
         .onHover { hudVisible = $0 }
         .onAppear {
             session.refreshDevices()
         }
-        .onChange(of: session.transcript.partialTickAt) { _, tick in
-            guard tick != nil else { return }
+        .task(id: transcript.partialTickAt) {
+            guard transcript.partialTickAt != nil else { return }
             partialPulseActive = true
-            Task {
-                try? await Task.sleep(nanoseconds: 150_000_000)
+            do {
+                try await Task.sleep(nanoseconds: 150_000_000)
                 partialPulseActive = false
+            } catch {
+                // A newer partial owns the pulse; an older task must not switch it off.
             }
         }
         .sheet(isPresented: $settingsPresented) {
@@ -58,59 +75,17 @@ struct TeleprompterSessionSheetOperatorView: View {
     }
 
     private var displayedError: String? {
-        session.transcript.lastError ?? session.error
+        transcript.lastError ?? session.error
     }
 
     private var cueReader: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: cueAlignment, spacing: 18) {
-                    ForEach(session.transcript.entries) { entry in
-                        cueBlock(for: entry)
-                            .id(entry.id)
-                    }
-                }
-                .padding(.horizontal, 48)
-                .padding(.vertical, 48)
-                .frame(maxWidth: .infinity, alignment: frameAlignment)
-            }
-            .environment(\.layoutDirection, isRtlLanguage(session.config.target_lang) ? .rightToLeft : .leftToRight)
-            .onChange(of: session.transcript.entries.count) { _, _ in
-                scrollToLatest(using: proxy)
-            }
-            .onChange(of: session.transcript.entries.last?.translation) { _, _ in
-                scrollToLatest(using: proxy)
-            }
-            .overlay {
-                if session.transcript.entries.isEmpty {
-                    emptyState
-                }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func cueBlock(for entry: TranscriptUtterance) -> some View {
-        VStack(alignment: cueAlignment, spacing: 6) {
-            if !entry.original.isEmpty {
-                Text(entry.original)
-                    .font(.title3)
-                    .foregroundStyle(.white.opacity(0.48))
-                    .multilineTextAlignment(textAlignment)
-            }
-
-            if entry.translation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                Text("Translating to \(session.config.target_lang)…")
-                    .font(.title3)
-                    .foregroundStyle(.white.opacity(0.48))
-            } else {
-                Text(entry.translation)
-                    .font(.system(size: sessionManager.projectorFontSize, weight: .semibold))
-                    .foregroundStyle(entry.state == .partial ? .white.opacity(0.72) : .white)
-                    .multilineTextAlignment(textAlignment)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: frameAlignment)
+        TeleprompterCueReader(
+            transcript: transcript,
+            targetLanguage: session.config.target_lang,
+            fontSize: sessionManager.projectorFontSize
+        )
+        // Keep the latest caption above the floating controls, including while they fade.
+        .padding(.bottom, controlsHeight + 12)
     }
 
     private var projectorLookBar: some View {
@@ -242,19 +217,6 @@ struct TeleprompterSessionSheetOperatorView: View {
         .frame(width: 620, height: 660)
     }
 
-    private var emptyState: some View {
-        VStack(spacing: 12) {
-            Text("Ready for live translation")
-                .font(.title.weight(.semibold))
-                .foregroundStyle(.white)
-            Text("Start a session to fill the teleprompter.")
-                .font(.title3)
-                .foregroundStyle(.white.opacity(0.52))
-        }
-        .multilineTextAlignment(.center)
-        .padding(.bottom, 80)
-    }
-
     @ViewBuilder
     private func banner(text: String, tint: Color) -> some View {
         Text(text)
@@ -264,18 +226,6 @@ struct TeleprompterSessionSheetOperatorView: View {
             .padding(.horizontal, 20)
             .padding(.vertical, 8)
             .background(tint.opacity(0.12))
-    }
-
-    private var cueAlignment: HorizontalAlignment {
-        isRtlLanguage(session.config.target_lang) ? .trailing : .leading
-    }
-
-    private var textAlignment: TextAlignment {
-        isRtlLanguage(session.config.target_lang) ? .trailing : .leading
-    }
-
-    private var frameAlignment: Alignment {
-        isRtlLanguage(session.config.target_lang) ? .trailing : .leading
     }
 
     private var startStopTitle: String {
@@ -302,19 +252,104 @@ struct TeleprompterSessionSheetOperatorView: View {
         }
     }
 
-    private func scrollToLatest(using proxy: ScrollViewProxy) {
-        guard let last = session.transcript.entries.last else { return }
-        withAnimation(.easeOut(duration: 0.2)) {
-            proxy.scrollTo(last.id, anchor: .bottom)
-        }
-    }
-
     private func exportTXT() {
         TranscriptExporter.exportTXT(
-            entries: session.transcript.entries,
+            entries: transcript.entries,
             source: session.config.source_lang,
             target: session.config.target_lang
         )
+    }
+}
+
+// Observing the transcript here keeps caption delivery independent of audio-meter updates.
+private struct TeleprompterCueReader: View {
+    @ObservedObject var transcript: TranscriptStore
+    let targetLanguage: String
+    let fontSize: Double
+
+    var body: some View {
+        LiveCaptionScrollView {
+            LazyVStack(alignment: cueAlignment, spacing: 18) {
+                ForEach(transcript.displayEntries) { entry in
+                    cueBlock(for: entry)
+                        .id(entry.id)
+                }
+            }
+            .padding(.horizontal, 48)
+            .padding(.vertical, 48)
+            .frame(maxWidth: .infinity, alignment: frameAlignment)
+        }
+        .environment(\.layoutDirection, isRtlLanguage(targetLanguage) ? .rightToLeft : .leftToRight)
+        .overlay {
+            if transcript.displayEntries.isEmpty {
+                emptyState
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func cueBlock(for entry: TranscriptUtterance) -> some View {
+        VStack(alignment: cueAlignment, spacing: 6) {
+            StableCaptionLayout(fontSize: 20) {
+                Text(entry.original)
+                    .font(.title3)
+                    .foregroundStyle(.white.opacity(0.48))
+                    .multilineTextAlignment(textAlignment)
+            }
+
+            StableCaptionLayout(fontSize: fontSize) {
+                if entry.translation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Text("Translating to \(targetLanguage)…")
+                        .font(.title3)
+                        .foregroundStyle(.white.opacity(0.48))
+                } else {
+                    Text(entry.translation)
+                        .font(.system(size: fontSize, weight: .semibold))
+                        .foregroundStyle(entry.state == .partial ? .white.opacity(0.72) : .white)
+                        .multilineTextAlignment(textAlignment)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: frameAlignment)
+        .onAppear { traceCue(entry) }
+                .onChange(of: entry.original) { _, _ in traceCueField(entry, field: "original", text: entry.original) }
+        .onChange(of: entry.translation) { _, _ in traceCueField(entry, field: "translation", text: entry.translation) }
+        .onChange(of: entry.state) { _, _ in traceCue(entry) }
+    }
+
+    private func traceCue(_ entry: TranscriptUtterance) {
+        traceCueField(entry, field: "original", text: entry.original)
+        traceCueField(entry, field: "translation", text: entry.translation)
+    }
+
+    private func traceCueField(_ entry: TranscriptUtterance, field: String, text: String) {
+        guard LatencyTrace.shared.isEnabled else { return }
+        LatencyTrace.shared.record("view_text_update_proxy", ["surface": "operator", "utterance": entry.id, "field": field, "chars": text.count, "signature": text.hashValue, "type": String(describing: entry.state)])
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 12) {
+            Text("Ready for live translation")
+                .font(.title.weight(.semibold))
+                .foregroundStyle(.white)
+            Text("Start a session to fill the teleprompter.")
+                .font(.title3)
+                .foregroundStyle(.white.opacity(0.52))
+        }
+        .multilineTextAlignment(.center)
+        .padding(.bottom, 80)
+    }
+
+    private var cueAlignment: HorizontalAlignment {
+        isRtlLanguage(targetLanguage) ? .trailing : .leading
+    }
+
+    private var textAlignment: TextAlignment {
+        isRtlLanguage(targetLanguage) ? .trailing : .leading
+    }
+
+    private var frameAlignment: Alignment {
+        isRtlLanguage(targetLanguage) ? .trailing : .leading
     }
 }
 
@@ -396,4 +431,9 @@ private struct TeleprompterShortcutMonitor: NSViewRepresentable {
             return responder is NSTextView || responder is NSTextField
         }
     }
+}
+
+private struct OperatorControlsHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 150
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
 }

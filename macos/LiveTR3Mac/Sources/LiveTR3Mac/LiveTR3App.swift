@@ -57,6 +57,10 @@ struct LiveTR3App: App {
             .task {
                 guard startsRuntimeAutomatically else { return }
                 await runtime.start()
+                await sessionController.startDiagnosticReplayIfRequested()
+                if ProcessInfo.processInfo.environment["LIVETR3_NATIVE_REPLAY"] != nil {
+                    openWindow(id: LiveTR3WindowID.projector)
+                }
             }
             .onDisappear {
                 runtime.stop()

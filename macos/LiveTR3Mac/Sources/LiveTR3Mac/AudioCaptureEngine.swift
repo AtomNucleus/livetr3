@@ -17,6 +17,8 @@ final class AudioCaptureEngine {
     private var converter: StreamingAudioConverter?
     private var pendingSamples: [Float] = []
     private var isPaused = false
+    private var replayTask: Task<Void, Never>?
+    private var frameSequence = 0
 
     static func listInputDevices() -> [AudioInputDevice] {
         let session = AVCaptureDevice.DiscoverySession(
@@ -45,8 +47,8 @@ final class AudioCaptureEngine {
         converter = try StreamingAudioConverter(inputFormat: format)
 
         input.removeTap(onBus: 0)
-        input.installTap(onBus: 0, bufferSize: 1_024, format: format) { [weak self] buffer, _ in
-            self?.enqueue(buffer: buffer)
+        input.installTap(onBus: 0, bufferSize: 1_024, format: format) { [weak self] buffer, time in
+            self?.enqueue(buffer: buffer, hostTime: time.isHostTimeValid ? time.hostTime : nil)
         }
 
         engine.prepare()
@@ -54,6 +56,8 @@ final class AudioCaptureEngine {
     }
 
     func stop() {
+        replayTask?.cancel()
+        replayTask = nil
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         processingQueue.sync {
@@ -90,14 +94,56 @@ final class AudioCaptureEngine {
             converter = try StreamingAudioConverter(inputFormat: format)
             pendingSamples = []
 
-            input.installTap(onBus: 0, bufferSize: 1_024, format: format) { [weak self] buffer, _ in
-                self?.enqueue(buffer: buffer)
+            input.installTap(onBus: 0, bufferSize: 1_024, format: format) { [weak self] buffer, time in
+                self?.enqueue(buffer: buffer, hostTime: time.isHostTimeValid ? time.hostTime : nil)
             }
             try engine.start()
         }
     }
 
-    private func enqueue(buffer: AVAudioPCMBuffer) {
+    /// File replay uses the same owned-buffer queue, converter, framing and callback as a tap.
+    /// It deliberately does not open the microphone or validate device/hardware buffering.
+    func startReplay(url: URL, onFrame: @escaping (Data) -> Void,
+                     onLevel: @escaping (Float) -> Void, onEnd: @escaping () -> Void) throws {
+        stop()
+        let file = try AVAudioFile(forReading: url)
+        converter = try StreamingAudioConverter(inputFormat: file.processingFormat)
+        self.onFrame = onFrame
+        self.onLevel = onLevel
+        isPaused = false
+        frameSequence = 0
+        replayTask = Task.detached { [weak self] in
+            let origin = ProcessInfo.processInfo.systemUptime
+            var samples: Int64 = 0
+            while !Task.isCancelled {
+                guard let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: 1024) else { break }
+                do { try file.read(into: buffer) } catch { break }
+                guard buffer.frameLength > 0 else { break }
+                samples += Int64(buffer.frameLength)
+                let deadline = origin + Double(samples) / file.processingFormat.sampleRate
+                let remaining = deadline - ProcessInfo.processInfo.systemUptime
+                if remaining > 0 {
+                    do { try await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000)) } catch { return }
+                }
+                self?.enqueue(buffer: buffer)
+            }
+            guard !Task.isCancelled else { return }
+            let totalSamples = samples
+            self?.processingQueue.async { [weak self] in
+                // Preserve the final sub-frame with zero padding, never discard captured samples.
+                if let self, !self.pendingSamples.isEmpty {
+                    self.pendingSamples += Array(repeating: 0, count: self.frameSize - self.pendingSamples.count)
+                    self.emitFrames()
+                }
+                LatencyTrace.shared.record("replay_end", ["input_samples": totalSamples])
+                onEnd()
+            }
+        }
+    }
+
+    private func enqueue(buffer: AVAudioPCMBuffer, hostTime: UInt64? = nil) {
+        let capturedAt = ProcessInfo.processInfo.systemUptime
+        LatencyTrace.shared.record("capture_callback", ["samples": buffer.frameLength, "rate": buffer.format.sampleRate, "hardware_host_seconds": hostTime.map { AVAudioTime.seconds(forHostTime: $0) } ?? -1])
         // Audio taps reuse their buffers after returning; own the samples before dispatching.
         guard let copy = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: buffer.frameLength) else { return }
         copy.frameLength = buffer.frameLength
@@ -108,10 +154,11 @@ final class AudioCaptureEngine {
                 memcpy(dstData, srcData, Int(src.mDataByteSize))
             }
         }
-        processingQueue.async { [weak self] in self?.process(buffer: copy) }
+        processingQueue.async { [weak self] in self?.process(buffer: copy, capturedAt: capturedAt) }
     }
 
-    private func process(buffer: AVAudioPCMBuffer) {
+    private func process(buffer: AVAudioPCMBuffer, capturedAt: TimeInterval) {
+        LatencyTrace.shared.record("capture_process", ["capture_uptime": capturedAt])
         guard let channelData = buffer.floatChannelData else { return }
         let frameCount = Int(buffer.frameLength)
         let channelCount = Int(buffer.format.channelCount)
@@ -140,6 +187,7 @@ final class AudioCaptureEngine {
 
         guard !isPaused else { return }
         guard let resampled = try? converter?.convert(buffer) else { return }
+        LatencyTrace.shared.record("converted", ["samples": resampled.count, "pending_samples": pendingSamples.count, "capture_uptime": capturedAt])
         pendingSamples.append(contentsOf: resampled)
         emitFrames()
     }
@@ -150,6 +198,8 @@ final class AudioCaptureEngine {
             let frame = Array(pendingSamples.prefix(frameSize))
             pendingSamples.removeFirst(frameSize)
             let data = frame.withUnsafeBufferPointer { Data(buffer: $0) }
+            frameSequence += 1
+            LatencyTrace.shared.record("audio_frame", ["frame": frameSequence, "samples": frameSize])
             onFrame?(data)
         }
     }

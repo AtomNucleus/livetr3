@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from latency_trace import trace
+
 import asyncio
 import itertools
 import logging
@@ -593,9 +595,11 @@ class MLXWorkerService:
                     continue
                 self._active_job_kind = job.kind
                 self._active_job = job
+                trace("worker_dispatch", utterance=job.payload.get("utterance_id"), priority=job.payload.get("priority"), queue_seconds=time.monotonic()-job.enqueued_at, queue_depth=self._queue.qsize(), kind=job.kind)
                 dispatched_at = time.monotonic()
                 result = await self._execute_job(job)
                 finished_at = time.monotonic()
+                trace("worker_complete", utterance=job.payload.get("utterance_id"), priority=job.payload.get("priority"), inference_seconds=finished_at-dispatched_at, kind=job.kind)
                 if finished_at - job.enqueued_at >= 1.0:
                     logger.warning(
                         "slow_inference engine=gemma priority=%s utterance_id=%s queue_seconds=%.3f inference_seconds=%.3f",

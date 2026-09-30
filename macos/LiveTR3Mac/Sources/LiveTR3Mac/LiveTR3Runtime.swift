@@ -19,7 +19,7 @@ final class LiveTR3Runtime: ObservableObject {
         }
 
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appending(path: "LiveTR3")
+            .appending(path: Bundle.main.bundleIdentifier == "com.livetr3.native-diagnostic" ? "LiveTR3 Native Diagnostic" : "LiveTR3")
             .appending(path: "Runtime")
         return base.appending(path: "engine.sock")
     }
@@ -31,7 +31,7 @@ final class LiveTR3Runtime: ObservableObject {
 
     init() {
         self.repoRoot = Self.findRepoRoot()
-        self.logDirectory = Self.findRepoRoot().appending(path: "dist/logs")
+        self.logDirectory = Self.findRepoRoot().appending(path: Bundle.main.bundleIdentifier == "com.livetr3.native-diagnostic" ? "dist/logs/native-diagnostic-runtime" : "dist/logs")
     }
 
     func start() async {
@@ -41,7 +41,9 @@ final class LiveTR3Runtime: ObservableObject {
         statusMessage = "Starting local caption engine..."
 
         do {
-            try launchBackend()
+            if ProcessInfo.processInfo.environment["LIVETR3_DIAGNOSTIC_EXTERNAL_ENGINE"] != "1" {
+                try launchBackend()
+            }
             try await waitForReady()
             state = .ready
             statusMessage = "Local engine is ready."
@@ -125,7 +127,8 @@ final class LiveTR3Runtime: ObservableObject {
 
     private func launch(executable: String, arguments: [String], workingDirectory: URL) throws -> Process {
         try FileManager.default.createDirectory(at: logDirectory, withIntermediateDirectories: true)
-        let logURL = logDirectory.appending(path: "\(workingDirectory.lastPathComponent)-runtime.log")
+        let logURL = ProcessInfo.processInfo.environment["LIVETR3_RUNTIME_LOG"].map { URL(fileURLWithPath: $0) }
+            ?? logDirectory.appending(path: "\(workingDirectory.lastPathComponent)-runtime.log")
         FileManager.default.createFile(atPath: logURL.path, contents: nil)
         let logHandle = try FileHandle(forWritingTo: logURL)
 
@@ -173,6 +176,9 @@ final class LiveTR3Runtime: ObservableObject {
     private static func engineEnvironment(backend: URL) -> [String: String] {
         var environment = ProcessInfo.processInfo.environment
         environment["LIVETR3_ENGINE_SOCKET"] = engineSocketPath.path
+        if Bundle.main.bundleIdentifier == "com.livetr3.native-diagnostic" {
+            environment["LIVETR3_ARCHIVE_ROOT"] = environment["LIVETR3_ARCHIVE_ROOT"] ?? Self.findRepoRoot().appending(path: "dist/logs/native-diagnostic-runtime/sessions").path
+        }
         environment["PYTHONNOUSERSITE"] = "1"
         environment["PYTHONPATH"] = backend.path
         environment["HF_HUB_OFFLINE"] = environment["HF_HUB_OFFLINE"] ?? "1"

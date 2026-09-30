@@ -1,11 +1,11 @@
 import SwiftUI
 
-struct TranscriptLineView: View {
+struct TranscriptLineView: View, Equatable {
     let entry: TranscriptUtterance
     let field: TranscriptField
     let layoutDirection: LayoutDirection
 
-    enum TranscriptField {
+    enum TranscriptField: Equatable {
         case original
         case translation
 
@@ -39,32 +39,34 @@ struct TranscriptLineView: View {
     }
 
     var body: some View {
-        Text(attributedCaption)
-            .font(.system(size: 30, weight: .regular))
-            .lineSpacing(6)
-            .frame(maxWidth: .infinity, alignment: layoutDirection == .rightToLeft ? .trailing : .leading)
-            .environment(\.layoutDirection, layoutDirection)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
+        StableCaptionLayout(fontSize: 30) {
+            Text(attributedCaption)
+                .font(.system(size: 30, weight: .regular))
+                .lineSpacing(6)
+                .frame(maxWidth: .infinity, alignment: layoutDirection == .rightToLeft ? .trailing : .leading)
+                .environment(\.layoutDirection, layoutDirection)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .onAppear { traceLayout() }
+                .onChange(of: text) { _, _ in traceLayout() }
+        }
+    }
+
+    private func traceLayout() {
+        LatencyTrace.shared.record("view_text_update_proxy", ["utterance": entry.id, "field": String(describing: field), "chars": text.count, "type": String(describing: entry.state)])
     }
 
     private var attributedCaption: AttributedString {
         var result = AttributedString(stableText)
         result.foregroundColor = isPartial ? Color.secondary : Color.primary
-        result.font = .system(size: 30, weight: .regular).italic(isPartial)
+        result.font = .system(size: 30, weight: .regular)
 
         if !unstableText.isEmpty {
             var unstable = AttributedString(unstableText)
             unstable.foregroundColor = Color.secondary.opacity(0.7)
-            unstable.font = .system(size: 30, weight: .regular).italic()
+            unstable.font = .system(size: 30, weight: .regular)
             result.append(unstable)
         }
         return result
-    }
-}
-
-private extension Font {
-    func italic(_ active: Bool) -> Font {
-        active ? self.italic() : self
     }
 }

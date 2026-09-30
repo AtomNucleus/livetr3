@@ -6,8 +6,10 @@ final class LocalEngineConnection: CaptionEngine {
     var onMessage: ((LiveTR3ServerMessage) -> Void)?
     var onDisconnect: (() -> Void)?
 
+    private var traceRole = "unknown"
     private let socketPath: String
     private var connection: NWConnection?
+    private let audioTransport = NativeAudioTransport()
     private var receiveTask: Task<Void, Never>?
 
     init(socketPath: String = LiveTR3Runtime.engineSocketPath.path) {
@@ -16,6 +18,7 @@ final class LocalEngineConnection: CaptionEngine {
 
     func connect(sessionID: String, mode: CaptionEngineConnectionMode) async throws {
         disconnect()
+        traceRole = mode == .viewer ? "projector" : "operator"
 
         let connection = NWConnection(to: .unix(path: socketPath), using: .tcp)
         self.connection = connection
@@ -50,6 +53,8 @@ final class LocalEngineConnection: CaptionEngine {
         case .start:
             break
         }
+        // Publish only after hello/resume are queued; capture can run during reconnect.
+        audioTransport.setConnection(connection)
     }
 
     func sendJSON(_ payload: [String: Any]) {
@@ -73,15 +78,25 @@ final class LocalEngineConnection: CaptionEngine {
         sendFrame(type: .binary, payload: data)
     }
 
+    func audioSender() -> ((Data) -> Void)? {
+        let transport = audioTransport
+        return { data in transport.send(data) }
+    }
+
     func disconnect() {
         receiveTask?.cancel()
         receiveTask = nil
+        audioTransport.setConnection(nil)
         connection?.cancel()
         connection = nil
     }
 
     private func sendFrame(type: LocalEngineFrameType, payload: Data) {
         guard let connection else { return }
+        Self.sendFrame(connection: connection, type: type, payload: payload)
+    }
+
+    nonisolated fileprivate static func sendFrame(connection: NWConnection, type: LocalEngineFrameType, payload: Data) {
         var framed = Data()
         framed.append(type.rawValue)
         framed.append(UInt8((payload.count >> 24) & 0xff))
@@ -107,6 +122,7 @@ final class LocalEngineConnection: CaptionEngine {
                     let payload = try await self.receiveExact(length: length)
                     if frameType == .text,
                        let parsed = LiveTR3ServerMessage.parse(payload) {
+                        LatencyTrace.shared.record("socket_caption", Self.traceFields(parsed).merging(["surface": self.traceRole]) { _, next in next })
                         self.onMessage?(parsed)
                     }
                 } catch {
@@ -117,6 +133,13 @@ final class LocalEngineConnection: CaptionEngine {
                 }
             }
         }
+    }
+
+    nonisolated static func traceFields(_ message: LiveTR3ServerMessage) -> [String: Any] {
+        if case .caption(let type, let id, let original, let translation) = message {
+            return ["utterance": id, "type": String(describing: type), "source_chars": original.count, "translation_chars": translation.count, "source_signature": original.hashValue, "translation_signature": translation.hashValue]
+        }
+        return ["type": "other"]
     }
 
     private func receiveExact(length: Int) async throws -> Data {
@@ -150,7 +173,7 @@ final class LocalEngineConnection: CaptionEngine {
     }
 }
 
-private enum LocalEngineFrameType: UInt8 {
+fileprivate enum LocalEngineFrameType: UInt8 {
     case text = 0x01
     case binary = 0x02
 }
@@ -182,5 +205,24 @@ private final class ConnectionContinuationGate: @unchecked Sendable {
         }
         didResume = true
         return true
+    }
+}
+
+/// Connection ownership changes on MainActor; audio submissions stay on the capture queue.
+/// The lock also ensures reconnecting updates an already captured sender closure.
+final class NativeAudioTransport: @unchecked Sendable {
+    private let lock = NSLock()
+    private var connection: NWConnection?
+    func setConnection(_ next: NWConnection?) {
+        lock.lock()
+        defer { lock.unlock() }
+        connection = next
+    }
+    func send(_ data: Data) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let connection else { return }
+        LatencyTrace.shared.record("audio_send", ["bytes": data.count])
+        LocalEngineConnection.sendFrame(connection: connection, type: .binary, payload: data)
     }
 }

@@ -67,6 +67,12 @@ final class SessionController: ObservableObject {
         }
     }
 
+    func startDiagnosticReplayIfRequested() async {
+        guard ProcessInfo.processInfo.environment["LIVETR3_NATIVE_REPLAY"] != nil else { return }
+        config = .default
+        await start()
+    }
+
     func pauseResume() {
         guard status == .running else { return }
         paused.toggle()
@@ -143,24 +149,42 @@ final class SessionController: ObservableObject {
         status = .connecting
 
         do {
-            try await requestMicrophoneAccess()
+            let replayPath = ProcessInfo.processInfo.environment["LIVETR3_NATIVE_REPLAY"]
+            if replayPath == nil { try await requestMicrophoneAccess() }
             try await ensureRuntimeReady()
             try await connectEngine(mode: .start)
-            try audio.start(
-                deviceID: selectedDeviceID.nilIfEmpty,
-                onFrame: { [weak self] data in
-                    Task { @MainActor in
-                        self?.engine.sendBinary(data)
-                    }
-                },
-                onLevel: { [weak self] rms in
-                    Task { @MainActor in
-                        self?.appendLevel(rms)
-                    }
-                }
-            )
             sendConfig(applyTarget: "immediate")
             engine.sendJSON(["type": "start"])
+            let directSender = ProcessInfo.processInfo.environment["LIVETR3_AUDIO_MAIN_ACTOR"] == "1"
+                ? nil : engine.audioSender()
+            let onFrame: (Data) -> Void = { [weak self] data in
+                if let directSender { directSender(data) }
+                else {
+                    Task { @MainActor in
+                        LatencyTrace.shared.record("audio_send", ["bytes": data.count])
+                        self?.engine.sendBinary(data)
+                    }
+                }
+            }
+            let onLevel: (Float) -> Void = { [weak self] rms in
+                Task { @MainActor in self?.appendLevel(rms) }
+            }
+            if let replayPath {
+                // Start only after the actual model worker reports readiness.
+                for _ in 0..<1200 {
+                    if transcript.workerStatus?.state == .ready { break }
+                    try await Task.sleep(nanoseconds: 100_000_000)
+                }
+                guard transcript.workerStatus?.state == .ready else {
+                    throw LiveTR3SessionError(message: "Diagnostic replay model did not become ready.")
+                }
+                LatencyTrace.shared.record("replay_start", ["config": String(describing: config)])
+                try audio.startReplay(url: URL(fileURLWithPath: replayPath), onFrame: onFrame, onLevel: onLevel) { [weak self] in
+                    Task { @MainActor in self?.engine.sendJSON(["type": "commit_now"]) }
+                }
+            } else {
+                try audio.start(deviceID: selectedDeviceID.nilIfEmpty, onFrame: onFrame, onLevel: onLevel)
+            }
             reconnectAttempt = 0
             status = .running
             paused = false
@@ -308,6 +332,9 @@ final class SessionController: ObservableObject {
 
     private static func optimizedConfig(_ config: ClientConfig) -> ClientConfig {
         var next = config
+        if next.max_utterance_seconds == nil || next.max_utterance_seconds == 12 {
+            next.max_utterance_seconds = 6
+        }
         if next.partial_interval_seconds == nil
             || next.partial_interval_seconds == 0.75
             || next.partial_interval_seconds == 0.45 {
@@ -333,7 +360,7 @@ final class SessionController: ObservableObject {
 @MainActor
 final class ProjectorConnection: ObservableObject {
     @Published private(set) var connectionError: String?
-    let transcript = TranscriptStore()
+    let transcript = TranscriptStore(traceLabel: "projector")
 
     private let sessionID: String
     private let makeEngine: () -> CaptionEngine
