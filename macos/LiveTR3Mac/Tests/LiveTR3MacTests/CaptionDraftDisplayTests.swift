@@ -27,7 +27,13 @@ final class CaptionDraftDisplayTests: XCTestCase {
             store.handle(.caption(type: .partial, utteranceID: 1, original: original, translation: translation))
         }
         XCTAssertEqual(store.displayEntries[0].original, "Nine boxes")
-        try await Task.sleep(nanoseconds: 100_000_000)
+        // Both lane timers run on the main actor; a busy CI runner can resume
+        // this test before the translation callback despite its elapsed delay.
+        for _ in 0..<100 {
+            if store.displayEntries[0].original == "Six boxes"
+                && store.displayEntries[0].translation == "Seis cajas" { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
         XCTAssertEqual(store.displayEntries[0].original, "Six boxes")
         XCTAssertEqual(store.displayEntries[0].translation, "Seis cajas")
     }
