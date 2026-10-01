@@ -13,6 +13,7 @@ import time
 import numpy as np
 import soundfile as sf
 from scipy.signal import resample_poly
+from chunk_limit_replay import competing_workers
 
 
 def events(path):
@@ -27,7 +28,14 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--routes', default='main,direct,direct,main')
     parser.add_argument('--projector-modes', default='live,live,live,live')
+    parser.add_argument('--silence-ms', help='Comma-separated 150/300/400 ms settings, one per route')
     args = parser.parse_args()
+    routes = args.routes.split(',')
+    silence_values = args.silence_ms.split(',') if args.silence_ms else ['150'] * len(routes)
+    if len(silence_values) != len(routes) or any(value not in {'150', '300', '400'} for value in silence_values):
+        raise ValueError('--silence-ms must supply one 150/300/400 value per route')
+    if competing_workers():
+        raise RuntimeError('Stop live model inference before native file replay')
     root = Path(__file__).resolve().parents[1]
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -54,11 +62,12 @@ def main():
                 if host.poll() is not None or time.monotonic() > deadline:
                     raise RuntimeError('Diagnostic backend did not start')
                 time.sleep(.1)
-            for index, route in enumerate(args.routes.split(','), 1):
+            for index, route in enumerate(routes, 1):
                 mode = args.projector_modes.split(',')[index-1]
                 path = output / f'{index}-{route}.jsonl'
                 app_env = {**env, 'LIVETR3_DIAGNOSTIC_EXTERNAL_ENGINE': '1',
                            'LIVETR3_NATIVE_TRACE': str(path), 'LIVETR3_NATIVE_REPLAY': str(fixture),
+                           'LIVETR3_DIAGNOSTIC_MIN_SILENCE_MS': silence_values[index-1],
                            'LIVETR3_AUDIO_MAIN_ACTOR': '1' if route == 'main' else '0',
                            'LIVETR3_PROJECTOR_READING_QUEUE': '1' if mode == 'reading' else '0'}
                 with (output / f'{index}-{route}.log').open('w') as app_log:
@@ -68,6 +77,8 @@ def main():
                         deadline = time.monotonic() + 180
                         ended_at = None
                         while time.monotonic() < deadline:
+                            if competing_workers(exclude_host_pids=(host.pid,)):
+                                raise RuntimeError('Other live model inference resumed; native replay aborted')
                             if app.poll() is not None:
                                 raise RuntimeError(f'Diagnostic app exited: {app.returncode}')
                             rows = events(path)

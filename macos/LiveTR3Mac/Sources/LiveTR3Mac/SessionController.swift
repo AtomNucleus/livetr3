@@ -32,7 +32,9 @@ final class SessionController: ObservableObject {
         self.sessionManager = sessionManager
         self.runtime = runtime
         self.engine = Self.makeEngine()
-        self.config = Self.loadConfig()
+        let environment = ProcessInfo.processInfo.environment
+        self.config = environment["LIVETR3_DIAGNOSTIC_MIN_SILENCE_MS"] == nil
+            ? Self.loadConfig() : .diagnosticConfig(environment: environment)
 
         engine.onMessage = { [weak self] message in
             Task { @MainActor in
@@ -69,7 +71,7 @@ final class SessionController: ObservableObject {
 
     func startDiagnosticReplayIfRequested() async {
         guard ProcessInfo.processInfo.environment["LIVETR3_NATIVE_REPLAY"] != nil else { return }
-        config = .default
+        config = .diagnosticConfig(environment: ProcessInfo.processInfo.environment)
         await start()
     }
 
@@ -332,6 +334,9 @@ final class SessionController: ObservableObject {
 
     private static func optimizedConfig(_ config: ClientConfig) -> ClientConfig {
         var next = config
+        if next.min_silence_ms == nil || next.min_silence_ms == 150 {
+            next.min_silence_ms = ClientConfig.default.min_silence_ms
+        }
         if next.max_utterance_seconds == nil || next.max_utterance_seconds == 12 {
             next.max_utterance_seconds = 6
         }

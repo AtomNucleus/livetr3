@@ -47,13 +47,23 @@ struct ClientConfig: Codable, Equatable {
         max_utterance_seconds: 6,
         silero_threshold: 0.5,
         speech_pad_ms: 300,
-        min_silence_ms: 150,
+        min_silence_ms: 400,
         early_commit_enabled: false,
         early_commit_min_seconds: 1.0,
         early_commit_punctuation: true,
         early_commit_stability: true,
         stability_window: 2
     )
+
+    /// Opt-in replay/test bundles use identical defaults apart from silence.
+    static func diagnosticConfig(environment: [String: String]) -> ClientConfig {
+        var config = Self.default
+        if let raw = environment["LIVETR3_DIAGNOSTIC_MIN_SILENCE_MS"],
+           let value = Double(raw), [150.0, 300.0, 400.0].contains(value) {
+            config.min_silence_ms = value
+        }
+        return config
+    }
 }
 
 enum UtteranceState: String, Codable {

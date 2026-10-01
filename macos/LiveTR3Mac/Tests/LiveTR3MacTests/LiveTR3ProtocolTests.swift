@@ -13,6 +13,25 @@ final class LiveTR3ProtocolTests: XCTestCase {
         XCTAssertEqual(config.polish_enabled, false)
         XCTAssertEqual(config.partial_interval_seconds, 0.25)
         XCTAssertEqual(config.max_utterance_seconds, 6)
+        XCTAssertEqual(config.min_silence_ms, 400)
+    }
+
+    func testDiagnosticSilenceComparisonPreservesOtherSettings() {
+        for silence in [150.0, 300.0, 400.0] {
+            let config = ClientConfig.diagnosticConfig(environment: [
+                "LIVETR3_DIAGNOSTIC_MIN_SILENCE_MS": String(silence)
+            ])
+            XCTAssertEqual(config.min_silence_ms, silence)
+            var restored = config
+            restored.min_silence_ms = ClientConfig.default.min_silence_ms
+            XCTAssertEqual(restored, ClientConfig.default)
+        }
+        for raw in ["", "NaN", "-1", "250", "5001"] {
+            XCTAssertEqual(ClientConfig.diagnosticConfig(environment: [
+                "LIVETR3_DIAGNOSTIC_MIN_SILENCE_MS": raw
+            ]), ClientConfig.default)
+        }
+        XCTAssertEqual(ClientConfig.diagnosticConfig(environment: [:]), ClientConfig.default)
     }
 
     func testCaptionMessageParses() throws {
