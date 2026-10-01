@@ -30,7 +30,7 @@ mkdir -p "$bundle_dir/Contents/Resources/Engine/venv/bin"
 # A local test shim uses the existing environment without installing/upgrading it.
 # zsh's quoted expansion protects paths that contain shell metacharacters.
 print -r -- '#!/bin/zsh' > "$bundle_dir/Contents/Resources/Engine/venv/bin/python"
-print -r -- "exec ${(q)python_bin} \"\$@\"" >> "$bundle_dir/Contents/Resources/Engine/venv/bin/python"
+print -r -- "exec ${(q)python_bin} -B \"\$@\"" >> "$bundle_dir/Contents/Resources/Engine/venv/bin/python"
 chmod +x "$bundle_dir/Contents/Resources/Engine/venv/bin/python"
 codesign --force --deep --sign - "$bundle_dir"
 codesign --verify --deep --strict "$bundle_dir"
