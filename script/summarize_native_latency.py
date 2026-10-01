@@ -21,13 +21,14 @@ def stats(values):
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('directory',type=Path)
+    parser.add_argument('--reference', type=Path, help='Private human source reference')
     args=parser.parse_args()
     d=args.directory
     back=load(d/'backend.jsonl')
     archives=sorted((d/'archives').glob('*/transcript.json'))
     runs=[]
     traces=sorted(d.glob('[0-9]*-*.jsonl'))
-    ref=(Path(__file__).resolve().parents[1]/'app/backend/validation/sermon-clip.txt').read_text()
+    ref=(args.reference or Path(__file__).resolve().parents[1]/'app/backend/validation/sermon-clip.txt').read_text()
     for path, archive in zip(traces,archives):
         rows=load(path)
         start=next(x for x in rows if x['stage']=='replay_start')['unix']

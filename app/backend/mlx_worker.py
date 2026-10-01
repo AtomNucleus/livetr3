@@ -68,6 +68,16 @@ class ASTResult:
     complete: bool
     truncated: bool
 
+class MTPGenerationError(RuntimeError):
+    """One candidate attempt failed; the next attempt uses ordinary decoding."""
+
+
+def _mtp_counters(draft: object) -> tuple[int, float, int]:
+    return (getattr(draft, "speculative_total_rounds", 0),
+            getattr(draft, "speculative_total_accepted", 0.0),
+            getattr(draft, "speculative_total_drafted", 0))
+
+
 class MLXWorker:
     def __init__(self, temp_wav_root: Path | None = None) -> None:
         from mlx_vlm import load
@@ -77,6 +87,22 @@ class MLXWorker:
         sweep_stale_temp_wavs(self._temp_wav_root, TEMP_WAV_STALE_SECONDS)
         self.model, self.processor = load(MODEL_PATH)
         self.config = self.model.config
+        self._draft_model = None
+        if os.getenv("LIVETR3_GEMMA_MTP", "0") == "1":
+            try:
+                from mlx_vlm.speculative.drafters import load_drafter, validate_drafter_compatibility
+                draft, kind = load_drafter(
+                    os.getenv("LIVETR3_MTP_MODEL", "mlx-community/gemma-4-E4B-it-assistant-bf16"),
+                    kind="mtp",
+                )
+                if kind != "mtp":
+                    raise ValueError("LiveTR3 requires an MTP drafter")
+                validate_drafter_compatibility(self.model, draft, kind)
+                self._draft_model = draft
+                trace("mtp_loaded", kind=kind)
+            except Exception as error:
+                logger.exception("MTP unavailable; retaining ordinary Gemma decoding")
+                trace("mtp_fallback", phase="load", error=type(error).__name__)
         self._warmup()
 
     def _warmup(self) -> None:
@@ -148,16 +174,36 @@ class MLXWorker:
             def generate_once(token_budget: int) -> ASTResult | None:
                 if cancelled is not None and cancelled():
                     return None
-                stream = stream_generate(
-                    self.model,
-                    self.processor,
-                    formatted,
-                    audio=[str(wav_path)],
-                    max_tokens=token_budget,
-                    temperature=0.0,
-                    top_p=0.95,
-                    top_k=64,
-                )
+                draft = getattr(self, "_draft_model", None)
+                draft_kwargs = {}
+                counters_before = (0, 0, 0)
+                if draft is not None:
+                    draft_kwargs = dict(draft_model=draft, draft_kind="mtp", draft_block_size=3)
+                    counters_before = _mtp_counters(draft)
+                started = time.monotonic()
+                first_response_seconds = None
+                def guarded_responses():
+                    try:
+                        yield from stream_generate(
+                            self.model,
+                            self.processor,
+                            formatted,
+                            audio=[str(wav_path)],
+                            max_tokens=token_budget,
+                            temperature=0.0,
+                            top_p=0.95,
+                            top_k=64,
+                            **draft_kwargs,
+                        )
+                    except Exception as error:
+                        if draft is None:
+                            raise
+                        # Restart with fresh target caches, never combine hypotheses.
+                        self._draft_model = None
+                        logger.exception("MTP audio generation failed; disabling candidate")
+                        trace("mtp_fallback", phase="generate", error=type(error).__name__)
+                        raise MTPGenerationError from error
+                stream = guarded_responses()
                 pieces: list[str] = []
                 latest_response: object | None = None
                 last_progress_text = ""
@@ -165,6 +211,8 @@ class MLXWorker:
                     for response in stream:
                         if cancelled is not None and cancelled():
                             return None
+                        if first_response_seconds is None:
+                            first_response_seconds = time.monotonic() - started
                         latest_response = response
                         piece = getattr(response, "text", None)
                         if isinstance(piece, str):
@@ -176,6 +224,18 @@ class MLXWorker:
                                 on_progress(progress_text)
                                 last_progress_text = progress_text
                 finally:
+                    elapsed = time.monotonic() - started
+                    after = _mtp_counters(draft) if draft is not None else counters_before
+                    trace("ast_decode", mtp=draft is not None, priority=priority,
+                          token_budget=token_budget, elapsed_seconds=elapsed,
+                          first_response_seconds=first_response_seconds,
+                          prompt_tokens=getattr(latest_response, "prompt_tokens", None),
+                          prompt_tps=getattr(latest_response, "prompt_tps", None),
+                          generation_tokens=getattr(latest_response, "generation_tokens", None),
+                          generation_tps=getattr(latest_response, "generation_tps", None),
+                          finish_reason=getattr(latest_response, "finish_reason", None),
+                          rounds=after[0]-counters_before[0],
+                          accepted=after[1]-counters_before[1], drafted=after[2]-counters_before[2])
                     close = getattr(stream, "close", None)
                     if callable(close):
                         close()
@@ -186,13 +246,19 @@ class MLXWorker:
                 complete = bool(original and translation and not truncated)
                 return ASTResult(original, translation, complete, truncated)
 
-            result = generate_once(max_tokens)
+            try:
+                result = generate_once(max_tokens)
+            except MTPGenerationError:
+                result = generate_once(max_tokens)
             if result is None:
                 return None
             if priority == "final" and not result.complete:
                 retry_budget = min(768, max_tokens * 2)
                 if retry_budget > max_tokens:
-                    result = generate_once(retry_budget)
+                    try:
+                        result = generate_once(retry_budget)
+                    except MTPGenerationError:
+                        result = generate_once(retry_budget)
             return result
         finally:
             _safe_unlink(wav_path)

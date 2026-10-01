@@ -25,6 +25,7 @@ def events(path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--bundle', type=Path, required=True)
+    parser.add_argument('--audio', type=Path, help='Private source audio; defaults to local validation clip')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--routes', default='main,direct,direct,main')
     parser.add_argument('--projector-modes', default='live,live,live,live')
@@ -39,7 +40,7 @@ def main():
     root = Path(__file__).resolve().parents[1]
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
-    audio, rate = sf.read(root / 'app/backend/validation/sermon-clip.wav', dtype='float32')
+    audio, rate = sf.read(args.audio or root / 'app/backend/validation/sermon-clip.wav', dtype='float32')
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
     import math

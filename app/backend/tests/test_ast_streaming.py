@@ -432,3 +432,124 @@ def test_truncated_partial_does_not_retry(monkeypatch, tmp_path):
 
     assert result == ASTResult("We cannot go", "No podemos", False, True)
     assert budgets == [100]
+
+
+@pytest.mark.parametrize('priority,reason,budgets_expected', [
+    ('final', 'length', [100, 200]),
+    ('partial', 'length', [100]),
+    ('final', 'stop', [100]),
+])
+def test_mtp_keeps_greedy_audio_completion_and_retry_policy(
+    monkeypatch, tmp_path, priority, reason, budgets_expected
+):
+    _patch_mlx(monkeypatch, [])
+    calls, closed, progress = [], [], []
+    draft = SimpleNamespace()
+    def generate(*args, **kwargs):
+        calls.append(kwargs)
+        try:
+            yield SimpleNamespace(text='We cannot go', generation_tokens=3)
+            yield SimpleNamespace(text='\nSpanish: No podemos ir', generation_tokens=100,
+                                  finish_reason=reason if len(calls) == 1 else 'stop')
+        finally:
+            closed.append(True)
+    sys.modules['mlx_vlm'].stream_generate = generate
+    worker = _worker(tmp_path)
+    worker._draft_model = draft
+    result = worker.ast(np.ones(16000), 'English', 'Spanish', [], max_tokens=100,
+                        priority=priority, on_progress=progress.append)
+    assert [call['max_tokens'] for call in calls] == budgets_expected
+    assert all(call['draft_model'] is draft and call['draft_kind'] == 'mtp'
+               and call['temperature'] == 0 and len(call['audio']) == 1 for call in calls)
+    assert len(closed) == len(calls)
+    assert progress[0] == 'We cannot go'
+    assert progress[-1] == 'We cannot go\nSpanish: No podemos ir'
+    assert result.complete is (priority == 'final' or reason == 'stop')
+    assert not list(tmp_path.glob('*.wav'))
+
+
+def test_mtp_failure_discards_failed_hypothesis_disables_candidate_and_bounds_fallback(
+    monkeypatch, tmp_path
+):
+    _patch_mlx(monkeypatch, [])
+    calls, closed = [], []
+    def generate(*args, **kwargs):
+        calls.append(kwargs)
+        try:
+            if 'draft_model' in kwargs:
+                yield SimpleNamespace(text='Incorrect partial', generation_tokens=1)
+                raise ValueError('packed embedding cannot reshape')
+            yield SimpleNamespace(text='We cannot go\nSpanish: No podemos ir',
+                                  generation_tokens=100, finish_reason='length')
+        finally:
+            closed.append(True)
+    sys.modules['mlx_vlm'].stream_generate = generate
+    worker = _worker(tmp_path)
+    worker._draft_model = object()
+    result = worker.ast(np.ones(16000), 'English', 'Spanish', [], max_tokens=100)
+    assert [call['max_tokens'] for call in calls] == [100, 100, 200]
+    assert ['draft_model' in call for call in calls] == [True, False, False]
+    assert worker._draft_model is None
+    assert result.original == 'We cannot go'
+    assert not result.complete and result.truncated
+    assert len(closed) == 3
+    assert not list(tmp_path.glob('*.wav'))
+
+
+def test_mtp_cancellation_closes_stream_without_fallback(monkeypatch, tmp_path):
+    _patch_mlx(monkeypatch, [])
+    calls, closed, cancelled = [], [], [False]
+    def generate(*args, **kwargs):
+        calls.append(kwargs)
+        try:
+            yield SimpleNamespace(text='We cannot', generation_tokens=1)
+            cancelled[0] = True
+            yield SimpleNamespace(text=' go', generation_tokens=2)
+        finally:
+            closed.append(True)
+    sys.modules['mlx_vlm'].stream_generate = generate
+    worker = _worker(tmp_path)
+    draft = worker._draft_model = object()
+    assert worker.ast(np.ones(16000), 'English', 'Spanish', [],
+                      cancelled=lambda: cancelled[0]) is None
+    assert worker._draft_model is draft
+    assert len(calls) == len(closed) == 1
+    assert not list(tmp_path.glob('*.wav'))
+
+
+@pytest.mark.parametrize('enabled,compatible', [(False, True), (True, True), (True, False)])
+def test_mtp_load_is_opt_in_and_incompatibility_preserves_target(
+    monkeypatch, tmp_path, enabled, compatible
+):
+    _patch_mlx(monkeypatch, [])
+    target = SimpleNamespace(config=object())
+    sys.modules['mlx_vlm'].load = lambda path: (target, object())
+    module = ModuleType('mlx_vlm.speculative.drafters')
+    draft, loads = object(), []
+    def load(path, kind):
+        loads.append(path)
+        return draft, kind
+    def validate(*args):
+        if not compatible:
+            raise ValueError('wrong architecture')
+    module.load_drafter = load
+    module.validate_drafter_compatibility = validate
+    monkeypatch.setitem(sys.modules, 'mlx_vlm.speculative.drafters', module)
+    monkeypatch.setenv('LIVETR3_GEMMA_MTP', '1' if enabled else '0')
+    monkeypatch.setattr(MLXWorker, '_warmup', lambda self: None)
+    worker = MLXWorker(tmp_path)
+    assert worker.model is target
+    assert len(loads) == int(enabled)
+    assert worker._draft_model is (draft if enabled and compatible else None)
+
+
+def test_mtp_does_not_treat_progress_callback_failure_as_decoder_failure(monkeypatch, tmp_path):
+    _patch_mlx(monkeypatch, [[SimpleNamespace(text='We cannot', generation_tokens=1)]])
+    worker = _worker(tmp_path)
+    draft = worker._draft_model = object()
+    def broken_callback(text):
+        raise RuntimeError('consumer stopped')
+    with pytest.raises(RuntimeError, match='consumer stopped'):
+        worker.ast(np.ones(16000), 'English', 'Spanish', [], on_progress=broken_callback)
+    assert worker._draft_model is draft
+    assert not list(tmp_path.glob('*.wav'))
