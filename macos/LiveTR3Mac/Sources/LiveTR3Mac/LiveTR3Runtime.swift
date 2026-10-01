@@ -12,11 +12,20 @@ final class LiveTR3Runtime: ObservableObject {
     @Published private(set) var state: State = .idle
     @Published private(set) var statusMessage = "Local engine is not running."
 
+    nonisolated private static var bundledConfiguration: BundledEngineConfiguration? {
+        guard Bundle.main.object(forInfoDictionaryKey: "LiveTR3BundledMTP") as? Bool == true,
+              let resources = Bundle.main.resourceURL else { return nil }
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        return BundledEngineConfiguration(resources: resources, applicationSupport: support)
+    }
+
     nonisolated static var engineSocketPath: URL {
         if let configuredPath = ProcessInfo.processInfo.environment["LIVETR3_ENGINE_SOCKET"],
            !configuredPath.isEmpty {
             return URL(fileURLWithPath: configuredPath)
         }
+
+        if let bundledConfiguration { return bundledConfiguration.socket }
 
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appending(path: Bundle.main.bundleIdentifier == "com.livetr3.native-diagnostic" ? "LiveTR3 Native Diagnostic" : "LiveTR3")
@@ -31,7 +40,7 @@ final class LiveTR3Runtime: ObservableObject {
 
     init() {
         self.repoRoot = Self.findRepoRoot()
-        self.logDirectory = Self.findRepoRoot().appending(path: Bundle.main.bundleIdentifier == "com.livetr3.native-diagnostic" ? "dist/logs/native-diagnostic-runtime" : "dist/logs")
+        self.logDirectory = Self.bundledConfiguration?.logs ?? Self.findRepoRoot().appending(path: Bundle.main.bundleIdentifier == "com.livetr3.native-diagnostic" ? "dist/logs/native-diagnostic-runtime" : "dist/logs")
     }
 
     func start() async {
@@ -153,7 +162,7 @@ final class LiveTR3Runtime: ObservableObject {
         for _ in 0..<80 {
             if await check() { return }
             if let backendProcess, !backendProcess.isRunning {
-                throw RuntimeError(message: "Local engine exited before becoming ready. Check dist/logs/backend-runtime.log.")
+                throw RuntimeError(message: "Local engine exited before becoming ready. Check the engine runtime log.")
             }
             try await Task.sleep(nanoseconds: 250_000_000)
         }
@@ -174,7 +183,8 @@ final class LiveTR3Runtime: ObservableObject {
     }
 
     private static func engineEnvironment(backend: URL) -> [String: String] {
-        var environment = ProcessInfo.processInfo.environment
+        var environment = Self.bundledConfiguration?.environment(inheriting: ProcessInfo.processInfo.environment)
+            ?? ProcessInfo.processInfo.environment
         environment["LIVETR3_ENGINE_SOCKET"] = engineSocketPath.path
         if Bundle.main.bundleIdentifier == "com.livetr3.native-diagnostic" {
             environment["LIVETR3_ARCHIVE_ROOT"] = environment["LIVETR3_ARCHIVE_ROOT"] ?? Self.findRepoRoot().appending(path: "dist/logs/native-diagnostic-runtime/sessions").path

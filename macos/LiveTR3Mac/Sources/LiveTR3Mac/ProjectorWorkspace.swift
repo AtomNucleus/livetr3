@@ -51,6 +51,7 @@ struct ProjectorWindowRoot: View {
 
     var body: some View {
         ProjectorContainer(sessionID: sessionManager.sessionID)
+            .background(ProjectorWindowFullscreen())
             .environmentObject(sessionManager)
     }
 }

@@ -41,6 +41,7 @@ struct LiveTR3App: App {
                 .environmentObject(sessionManager)
                 .environmentObject(sessionController)
         }
+        .windowResizability(.automatic)
         .defaultSize(width: 1440, height: 900)
 
         Settings {
