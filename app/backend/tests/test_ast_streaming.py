@@ -517,7 +517,7 @@ def test_mtp_cancellation_closes_stream_without_fallback(monkeypatch, tmp_path):
     assert not list(tmp_path.glob('*.wav'))
 
 
-@pytest.mark.parametrize('enabled,compatible', [(False, True), (True, True), (True, False)])
+@pytest.mark.parametrize('enabled,compatible', [(False, True), (True, True), (True, False), (None, True)])
 def test_mtp_load_is_opt_in_and_incompatibility_preserves_target(
     monkeypatch, tmp_path, enabled, compatible
 ):
@@ -535,12 +535,15 @@ def test_mtp_load_is_opt_in_and_incompatibility_preserves_target(
     module.load_drafter = load
     module.validate_drafter_compatibility = validate
     monkeypatch.setitem(sys.modules, 'mlx_vlm.speculative.drafters', module)
-    monkeypatch.setenv('LIVETR3_GEMMA_MTP', '1' if enabled else '0')
+    if enabled is None:
+        monkeypatch.delenv('LIVETR3_GEMMA_MTP', raising=False)
+    else:
+        monkeypatch.setenv('LIVETR3_GEMMA_MTP', '1' if enabled else '0')
     monkeypatch.setattr(MLXWorker, '_warmup', lambda self: None)
     worker = MLXWorker(tmp_path)
     assert worker.model is target
-    assert len(loads) == int(enabled)
-    assert worker._draft_model is (draft if enabled and compatible else None)
+    assert len(loads) == int(enabled is not False)
+    assert worker._draft_model is (draft if enabled is not False and compatible else None)
 
 
 def test_mtp_does_not_treat_progress_callback_failure_as_decoder_failure(monkeypatch, tmp_path):

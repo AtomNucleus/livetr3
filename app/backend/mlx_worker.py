@@ -88,7 +88,7 @@ class MLXWorker:
         self.model, self.processor = load(MODEL_PATH)
         self.config = self.model.config
         self._draft_model = None
-        if os.getenv("LIVETR3_GEMMA_MTP", "0") == "1":
+        if os.getenv("LIVETR3_GEMMA_MTP", "1") == "1":
             try:
                 from mlx_vlm.speculative.drafters import load_drafter, validate_drafter_compatibility
                 draft, kind = load_drafter(
