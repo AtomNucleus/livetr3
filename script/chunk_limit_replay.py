@@ -166,13 +166,13 @@ def summarize(rows, reference, clip_seconds, feed_seconds, drain_seconds):
                 source=source, finals=finals, **scoring)
 
 
-async def replay(cap, name, worker, audio, output, reference, clip_seconds, id_base, silence_ms=150):
+async def replay(cap, name, worker, audio, output, reference, clip_seconds, id_base, silence_ms=150, session_type=None):
     from protocol import ConfigMessage
     from session import SessionHub, TranscriptionSession
     if competing_workers():
         raise RuntimeError('Live engine worker exists; stop capture before replay')
     capture = Capture(output / f'{name}.jsonl')
-    value = TranscriptionSession(capture, worker, SessionHub())
+    value = (session_type or TranscriptionSession)(capture, worker, SessionHub())
     value.state.config = ConfigMessage(max_utterance_seconds=cap,
         partial_interval_seconds=.25, polish_enabled=False, min_silence_ms=silence_ms,
         speech_pad_ms=300, silero_threshold=.5, early_commit_enabled=False,

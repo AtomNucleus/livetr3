@@ -7,6 +7,7 @@ collect_ignore = []
 if platform.system() != "Darwin" or platform.machine() != "arm64":
     collect_ignore = [
         "test_caption_accuracy.py",
+        "test_ending_preview_reuse.py",
         "test_chunk_rollover.py",
         "test_streaming_stalls.py",
         "test_ast_streaming.py",

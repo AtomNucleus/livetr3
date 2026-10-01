@@ -118,6 +118,15 @@ CommitReason = Literal["punctuation", "stability", "silero_end", "max_utterance_
 
 
 @dataclass(slots=True)
+class CompletedPreview:
+    snapshot: np.ndarray
+    decoded_audio: np.ndarray
+    config: ConfigMessage
+    config_revision: int
+    result: ASTResult
+
+
+@dataclass(slots=True)
 class UtteranceRuntime:
     partials: deque[str] = field(default_factory=deque)
     last_audio_frame_unix_seconds: float | None = None
@@ -129,6 +138,7 @@ class UtteranceRuntime:
     latest_partial_translation: str = ""
     partial_audio_snapshot: np.ndarray | None = None
     partial_last_audio_unix_seconds: float | None = None
+    completed_preview: CompletedPreview | None = None
 
 
 def _source_text_ends_sentence(text: str) -> bool:
@@ -359,6 +369,12 @@ class TranscriptionSession:
         self._finalized: set[int] = set()
         self._finalizing: dict[int, CommitReason] = {}
         self._finalize_lock = asyncio.Lock()
+        self._config_revision = 0
+        # Keep this experiment opt-in until exact coverage produces a measured
+        # benefit with the current preview and trailing-silence policy.
+        self._ending_preview_reuse_enabled = os.getenv(
+            "LIVETR3_ENDING_PREVIEW_REUSE", "false"
+        ).lower() in {"1", "true", "yes", "on"}
         self._utterance_runtime: dict[int, UtteranceRuntime] = {}
         self._pending_config: ConfigMessage | None = None
         self._skip_next_polish = False
@@ -609,6 +625,27 @@ class TranscriptionSession:
         async with self._finalize_lock:
             if utterance_id in self._finalized or utterance_id in self._finalizing:
                 return False
+            runtime = self._utterance_runtime.get(utterance_id)
+            preview = runtime.completed_preview if runtime else None
+            reuse = (
+                self._ending_preview_reuse_enabled
+                and reason == "silero_end"
+                and self.state.running and self.state.active_utterance_id == utterance_id
+                and preview is not None
+                and preview.config_revision == getattr(self, "_config_revision", 0)
+                and self.state.config == preview.config and self._pending_config is None
+                and preview.result.complete and not preview.result.truncated
+                and bool(preview.result.original.strip()) and bool(preview.result.translation.strip())
+                # Require the same raw prefix AND the exact committed
+                # transcribable window. Extra padding inside that window requires a
+                # final; quiet energy or punctuation cannot prove equivalence.
+                and preview.snapshot.size <= audio.size
+                and np.array_equal(preview.snapshot, audio[:preview.snapshot.size])
+                # Even below-threshold newer samples may contain quiet speech.
+                # Only digital silence outside the decoded window is provable.
+                and not np.any(audio[preview.snapshot.size:])
+                and np.array_equal(preview.decoded_audio, transcribable_audio)
+            )
             self._finalizing[utterance_id] = reason
             self.worker.finish_partials(utterance_id)
             if self.state.active_utterance_id == utterance_id:
@@ -621,7 +658,14 @@ class TranscriptionSession:
                 utterance_id,
                 audio.shape[0] / 16_000,
             )
-            self._schedule_ast("final", utterance_id, audio)
+            if reuse:
+                trace("ending_preview_reuse", session=self.session_id,
+                      utterance=utterance_id, samples=transcribable_audio.size)
+                await self._publish_final_result(utterance_id, preview.result)
+            else:
+                # Never wait for an in-flight preview at an ending. Retire it
+                # normally; a late completion cannot replace this final.
+                self._schedule_ast("final", utterance_id, audio)
             return True
 
     def _schedule_ast(
@@ -664,7 +708,9 @@ class TranscriptionSession:
 
     async def _run_mlx_ast(self, priority: str, utterance_id: int, audio: np.ndarray) -> None:
         config = self.state.config.model_copy(deep=True)
+        config_revision = getattr(self, "_config_revision", 0)
         runtime = self._utterance_runtime.get(utterance_id)
+        preview_runtime = runtime
         snapshot = runtime.partial_audio_snapshot if priority == "partial" and runtime else None
         snapshot_last_audio = runtime.partial_last_audio_unix_seconds if runtime else None
         async def publish_progress(text: str) -> None:
@@ -750,6 +796,22 @@ class TranscriptionSession:
                 utterance_id, snapshot, audio, config, result, snapshot_last_audio
             ):
                 return
+            if snapshot is not None and self._ending_preview_reuse_enabled:
+                async with self._finalize_lock:
+                    if utterance_id in self._finalized or utterance_id in self._finalizing:
+                        return
+                    if (
+                        preview_runtime is not None
+                        and self._utterance_runtime.get(utterance_id) is preview_runtime
+                        and self.state.running and self.state.active_utterance_id == utterance_id
+                        and config_revision == getattr(self, "_config_revision", 0)
+                        and self.state.config == config and self._pending_config is None
+                        and not result.truncated and result.original.strip() and result.translation.strip()
+                        and np.array_equal(_trim_to_transcribable_audio(snapshot), audio)
+                    ):
+                        preview_runtime.completed_preview = CompletedPreview(
+                            snapshot.copy(), audio.copy(), config, config_revision, result
+                        )
             runtime = self._utterance_runtime.setdefault(
                 utterance_id,
                 UtteranceRuntime(partials=deque(maxlen=self._stability_window())),
@@ -1037,6 +1099,7 @@ class TranscriptionSession:
         await self._send(payload)
 
     async def _apply_config(self, config: ConfigMessage) -> None:
+        self._config_revision = getattr(self, "_config_revision", 0) + 1
         partial_interval_seconds = config.partial_interval_seconds
         if partial_interval_seconds is not None:
             partial_interval_seconds = _bounded_partial_interval_seconds(
