@@ -89,7 +89,7 @@ class TranscriptMessage(BaseModel):
     utterance_id: int
     original: str
     translation: str
-    commit_reason: Literal["punctuation", "stability", "silero_end", "max_utterance_cap"] | None = None
+    commit_reason: Literal["punctuation", "stability", "silero_end", "max_utterance_cap", "decoded_prefix"] | None = None
     last_audio_frame_unix_seconds: float | None = None
 
 
