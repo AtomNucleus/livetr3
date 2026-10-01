@@ -10,6 +10,7 @@ if platform.system() != "Darwin" or platform.machine() != "arm64":
         "test_chunk_rollover.py",
         "test_streaming_stalls.py",
         "test_ast_streaming.py",
+        "test_phrase_ast.py",
         "test_preview_scheduling.py",
         "test_projector_join.py",
         "test_segmenter_boundaries.py",

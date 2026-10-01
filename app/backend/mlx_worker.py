@@ -53,6 +53,16 @@ AST_PROMPT = (
     "then output the string '{tgt}: ', then the translation in {tgt}."
 )
 
+PHRASE_AST_PROMPT = (
+    "Transcribe exactly as spoken in {src} and translate into {tgt}. "
+    "Preserve all words, negation, names and quantities. Output ONLY "
+    "alternating lines labeled Source: and Target:. Each Source line contains "
+    "one short natural phrase from the audio, and the next Target line "
+    "translates that phrase. After translating, continue with the next phrase "
+    "until all speech is included. Begin with Source:, do not produce an "
+    "unlabelled transcript, and do not stop at the first translated phrase."
+)
+
 POLISH_PROMPT = (
     "You will receive a rough transcription. Remove filler words "
     "(um, uh, er, you know, like), fix punctuation, fix capitalization, "
@@ -102,6 +112,7 @@ class MLXWorker:
         priority: Literal["partial", "final"] = "final",
         cancelled: Callable[[], bool] | None = None,
         on_progress: Callable[[str], None] | None = None,
+        phrase_bilingual: bool = False,
     ) -> ASTResult | None:
         audio_f32_16k = np.asarray(audio_f32_16k, dtype=np.float32).reshape(-1)
         if audio_f32_16k.shape[0] > AST_MAX_AUDIO_SECONDS * 16_000:
@@ -122,7 +133,7 @@ class MLXWorker:
 
         try:
             sf.write(wav_path, audio_f32_16k, 16_000, subtype="FLOAT")
-            prompt_text = AST_PROMPT.format(src=src, tgt=tgt)
+            prompt_text = (PHRASE_AST_PROMPT if phrase_bilingual else AST_PROMPT).format(src=src, tgt=tgt)
             if custom_vocab:
                 vocabulary = [" ".join(item.split()) for item in custom_vocab if item.strip()]
                 vocabulary = vocabulary[:12]
@@ -171,7 +182,11 @@ class MLXWorker:
                             pieces.append(piece)
                         output = "".join(pieces)
                         if output and on_progress is not None:
-                            progress_text = _streaming_ast_progress_text(output, tgt, src)
+                            if phrase_bilingual:
+                                original, translation, _ = _parse_phrase_ast_response(output, streaming=True)
+                                progress_text = _canonical_ast_progress(original, translation, tgt)
+                            else:
+                                progress_text = _streaming_ast_progress_text(output, tgt, src)
                             if progress_text and progress_text != last_progress_text:
                                 on_progress(progress_text)
                                 last_progress_text = progress_text
@@ -181,9 +196,13 @@ class MLXWorker:
                         close()
 
                 output = "".join(pieces)
-                original, translation = _parse_ast_response(output, tgt, src)
+                if phrase_bilingual:
+                    original, translation, well_formed = _parse_phrase_ast_response(output)
+                else:
+                    original, translation = _parse_ast_response(output, tgt, src)
+                    well_formed = True
                 truncated = _generation_was_truncated(latest_response, token_budget)
-                complete = bool(original and translation and not truncated)
+                complete = bool(original and translation and well_formed and not truncated)
                 return ASTResult(original, translation, complete, truncated)
 
             result = generate_once(max_tokens)
@@ -352,6 +371,56 @@ def _is_partial_ast_label(
     return any(label.startswith(candidate) for label in labels)
 
 
+def _parse_phrase_ast_response(response: str, *, streaming: bool = False) -> tuple[str, str, bool]:
+    """Flatten alternating phrases without exposing format labels as captions.
+
+    An unmatched source can be shown as a draft, but never accepted as a final.
+    Source/Target are roles, so the format also works when both languages match.
+    """
+    text = response.replace("\r\n", "\n").replace("\r", "\n")
+    for marker in ("<turn|>", "</s>", "<|end_of_turn|>"):
+        text = text.replace(marker, "")
+    lines = text.strip().splitlines()
+    blocks: list[tuple[str, str]] = []
+    partial_label = False
+    header = re.compile(r"^\s*(?:[-*]\s+)?(?:\*{1,2}|__)?(Source|Target)(?:\*{1,2}|__)?\s*[:：]\s*(.*)$", re.IGNORECASE)
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        match = header.match(line)
+        if match:
+            kind, content = match.group(1).casefold(), match.group(2).strip()
+            expected = "source" if not blocks or blocks[-1][0] == "target" else "target"
+            if kind != expected or (blocks and not blocks[-1][1]):
+                return "", "", False
+            blocks.append((kind, content))
+            continue
+        # Hold a token-split next header until its colon arrives. Even after
+        # complete pairs, a dangling header makes a finished output incomplete.
+        candidate = re.sub(r"[\s*_-]", "", line).casefold()
+        if index == len(lines) - 1 and candidate and any(label.startswith(candidate) for label in ("source:", "target:")):
+            partial_label = True
+            break
+        if not blocks:
+            return "", "", False
+        kind, content = blocks[-1]
+        blocks[-1] = (kind, " ".join((content, line.strip())).strip())
+    original = " ".join(content for kind, content in blocks if kind == "source").strip()
+    translation = " ".join(content for kind, content in blocks if kind == "target").strip()
+    complete = bool(blocks and blocks[-1][0] == "target" and all(content for _, content in blocks) and not partial_label)
+    if partial_label and not streaming:
+        complete = False
+    return original, translation, complete
+
+
+def _canonical_ast_progress(original: str, translation: str, target_language: str) -> str:
+    if not original:
+        return ""
+    if translation:
+        return f"{original}\n{target_language.strip()}: {translation}"
+    return original
+
+
 def _streaming_ast_progress_text(
     response: str,
     target_language: str,
@@ -372,9 +441,7 @@ def _streaming_ast_progress_text(
         source_language,
         streaming=True,
     )
-    if translation:
-        return f"{original}\n{target_language.strip()}: {translation}"
-    return original
+    return _canonical_ast_progress(original, translation, target_language)
 
 
 class InferenceTimeoutError(RuntimeError):
@@ -406,6 +473,8 @@ class MLXWorkerService:
     """Async facade around one synchronous MLXWorker and one Metal context."""
 
     def __init__(self) -> None:
+        # Experimental output format; normal launches retain the established prompt.
+        self._phrase_bilingual_enabled = os.getenv("LIVETR3_PHRASE_BILINGUAL", "0") == "1"
         self._queue: asyncio.PriorityQueue[_QueuedJob] = asyncio.PriorityQueue()
         self._sequence = itertools.count()
         self._runner: asyncio.Task | None = None
@@ -503,6 +572,7 @@ class MLXWorkerService:
                 "custom_vocab": custom_vocab,
                 "code_switching_enabled": code_switching_enabled,
                 "max_tokens": max_tokens,
+                "phrase_bilingual": self._phrase_bilingual_enabled,
             },
         )
         if utterance_id is not None:
