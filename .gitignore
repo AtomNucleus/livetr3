@@ -23,3 +23,7 @@ app/backend/sample.wav
 app/backend/scripts/soak_*.backend.log
 app/backend/scripts/soak_*.csv
 app/backend/scripts/soak_*.summary.json
+
+# Isolated local pipeline experiment
+.venv-pipeline/
+.venv-baseline/
