@@ -10,6 +10,14 @@ SAMPLE_RATE = 16_000
 FRAME_SAMPLES = 320
 MAX_UTTERANCE_SECONDS = 29.0
 FRAME_SECONDS = FRAME_SAMPLES / SAMPLE_RATE
+# A size cap is not a pause. Cut at the quietest point in the last second instead,
+# so neither side of the seam re-transcribes (duplicates) or splits a word.
+CAP_CUT_SEARCH_FRAMES = 50
+CAP_CUT_QUIET_RATIO = 0.25
+# The digital-silence flush is relative to the speaker so quiet speech is not
+# mistaken for a pause; it never exceeds the original absolute level.
+SILENCE_FLUSH_MAX_RMS = 0.001
+SILENCE_FLUSH_LEVEL_RATIO = 0.1
 
 
 @dataclass(slots=True)
@@ -70,6 +78,22 @@ class RMSGate:
         self._current = self._current[max(0, boundary - self.overlap_frames):]
         return True
 
+    def _cap_cut(self) -> tuple[int, int]:
+        """Frames to flush at the size cap, and frames of overlap to repeat."""
+        frames = len(self._current)
+        if self._cap_is_end_of_speech():
+            return frames, 0
+        rms = np.sqrt(np.mean(np.square(np.stack(self._current)), axis=1))
+        local = lambda cut: float(np.mean(rms[max(0, cut - 2):cut + 2]))
+        # Ties keep the latest cut, i.e. the longest chunk.
+        cut = min(range(frames, max(frames // 2, frames - CAP_CUT_SEARCH_FRAMES) - 1, -1), key=local)
+        if local(cut) <= CAP_CUT_QUIET_RATIO * float(np.median(rms)):
+            return cut, 0
+        return frames, self.overlap_frames
+
+    def _cap_is_end_of_speech(self) -> bool:
+        return False
+
     def reset(self) -> None:
         tail = self._current[-self.overlap_frames :] if self.overlap_frames else []
         self._pre_roll = deque((x.copy() for x in tail), maxlen=self.overlap_frames)
@@ -111,10 +135,13 @@ class RMSGate:
             self._below_threshold_frames += 1
 
         if len(self._current) >= self.max_utterance_frames:
-            audio = self.current_audio()
+            cut, overlap = self._cap_cut()
+            audio = np.concatenate(self._current[:cut]).astype(np.float32, copy=False)
+            carry = self._current[max(0, cut - overlap):]
             force_flushed = True
             speech_ended = True
             self._rollover()
+            self._pre_roll = deque(carry, maxlen=max(self.overlap_frames, len(carry)))
         elif self._below_threshold_frames >= self.trailing_silence_frames:
             if len(self._current) >= self.min_utterance_frames:
                 audio = self.current_audio()
@@ -170,19 +197,26 @@ class SileroVAD(RMSGate):
         self._silero_active = False
         self._silence_flush_frames = max(1, min_silence_ms // 20)
         self._silent_frames = 0
+        self._speech_rms: deque[float] = deque(maxlen=int(MAX_UTTERANCE_SECONDS / FRAME_SECONDS))
+        self._end_event_pending = False
 
     def reset(self) -> None:
         super().reset()
         self._silero_active = False
         self._silent_frames = 0
+        self._speech_rms.clear()
         try:
             self._vad_iterator.reset_states()
         except AttributeError:
             pass
 
+    def _cap_is_end_of_speech(self) -> bool:
+        # Nothing follows a real end of speech, so carry nothing past it.
+        return self._end_event_pending
+
     def _rollover(self) -> None:
         # A size limit is not end-of-speech. Carry the detector state and pending
-        # samples into the next chunk, with the existing audio overlap.
+        # samples into the next chunk; RMSGate.ingest then sets the carried audio.
         RMSGate.reset(self)
 
     def ingest(self, frame: np.ndarray) -> SegmentResult:
@@ -203,7 +237,10 @@ class SileroVAD(RMSGate):
             self._silero_active = True
             self._silent_frames = 0
         if self._silero_active:
-            self._silent_frames = self._silent_frames + 1 if rms <= 0.001 else 0
+            self._speech_rms.append(rms)
+            level = float(np.percentile(self._speech_rms, 90))
+            silence = min(SILENCE_FLUSH_MAX_RMS, SILENCE_FLUSH_LEVEL_RATIO * level)
+            self._silent_frames = self._silent_frames + 1 if rms <= silence else 0
         else:
             self._silent_frames = 0
         end_event = bool(event and "end" in event) or (
@@ -211,8 +248,12 @@ class SileroVAD(RMSGate):
         )
         active_for_parent = self._silero_active
         self.threshold = -1.0 if active_for_parent else 2.0
-        result = super().ingest(frame)
-        self.threshold = parent_threshold
+        self._end_event_pending = end_event
+        try:
+            result = super().ingest(frame)
+        finally:
+            self.threshold = parent_threshold
+            self._end_event_pending = False
         if end_event and result.force_flushed:
             # Real end-of-speech on the cap frame still resets the detector.
             self.reset()

@@ -11,7 +11,7 @@ dependencies = [
   "numpy>=2.1.0",
   "soundfile>=0.12.1",
   "mlx>=0.22.0",
-  "mlx-vlm>=0.7.3",
+  "mlx-vlm>=0.7.4",
   "python-dotenv>=1.0.1",
   "silero-vad>=5.1.2",
 ]

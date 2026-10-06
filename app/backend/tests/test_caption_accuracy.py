@@ -87,3 +87,28 @@ def test_streamed_final_progress_stays_partial_when_result_is_incomplete():
         assert args["prior_context"] == []
 
     asyncio.run(run())
+
+
+def test_prior_source_context_is_sent_only_when_experiment_enabled(monkeypatch):
+    import asyncio
+    from unittest.mock import AsyncMock
+    import numpy as np
+    from mlx_worker import ASTResult
+
+    async def run(flag):
+        monkeypatch.setenv("LIVETR3_AST_SOURCE_CONTEXT", flag)
+        value = session()
+        value.worker = SimpleNamespace(
+            submit_ast=AsyncMock(return_value=ASTResult("of the church", "de la iglesia", True, False))
+        )
+        value.state.prior_context = [("and the response", "y la respuesta")]
+        value._finalized = set()
+        value._finalizing = {}
+        value._utterance_runtime = {1: UtteranceRuntime()}
+        value._send_and_broadcast = AsyncMock()
+        value._maybe_commit_early = AsyncMock()
+        await value._run_mlx_ast("partial", 1, np.zeros(16000, dtype=np.float32))
+        return value.worker.submit_ast.call_args.kwargs["prior_context"]
+
+    assert asyncio.run(run("0")) == []
+    assert asyncio.run(run("1")) == [("and the response", "y la respuesta")]

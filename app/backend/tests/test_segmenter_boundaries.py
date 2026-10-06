@@ -44,3 +44,32 @@ def test_size_rollover_repeats_only_the_configured_overlap_and_loses_no_frames()
     # Removing the two-frame overlap reconstructs the input exactly once.
     reconstructed = np.concatenate([first_audio, result.audio[2 * FRAME_SAMPLES :]])
     np.testing.assert_array_equal(reconstructed, np.concatenate(frames[:8]))
+
+
+def test_size_cap_cuts_at_a_quiet_gap_without_repeating_or_losing_frames():
+    loud = [np.full(FRAME_SAMPLES, 0.1 + i / 1000, dtype=np.float32) for i in range(30)]
+    quiet = [np.full(FRAME_SAMPLES, 0.001, dtype=np.float32) for _ in range(4)]
+    frames = loud[:20] + quiet + loud[20:26]
+    segmenter = RMSGate(max_utterance_s=0.6, overlap_s=0.1)
+
+    for frame in frames:
+        result = segmenter.ingest(frame)
+    assert result.force_flushed
+    # The cut lands inside the gap; the speech after it starts the next chunk.
+    cut = result.audio.size // FRAME_SAMPLES
+    assert 20 < cut < 24
+    later = [np.full(FRAME_SAMPLES, 0.2, dtype=np.float32) for _ in range(3)]
+    for frame in later:
+        segmenter.ingest(frame)
+    reconstructed = np.concatenate([result.audio, segmenter.current_audio()])
+    np.testing.assert_array_equal(reconstructed, np.concatenate(frames + later))
+
+
+def test_size_cap_without_a_pause_keeps_the_configured_overlap():
+    frames = [np.full(FRAME_SAMPLES, 0.1, dtype=np.float32) for _ in range(30)]
+    segmenter = RMSGate(max_utterance_s=0.6, overlap_s=0.1)
+    for frame in frames:
+        result = segmenter.ingest(frame)
+    assert result.force_flushed and result.audio.size == 30 * FRAME_SAMPLES
+    segmenter.ingest(frames[0])
+    assert segmenter.current_audio().size == 6 * FRAME_SAMPLES
