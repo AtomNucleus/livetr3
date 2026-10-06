@@ -1,3 +1,4 @@
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -17,6 +18,8 @@ def fake_silero():
     vad._silero_active = False
     vad._silent_frames = 0
     vad._silence_flush_frames = 20
+    vad._speech_rms = deque(maxlen=1450)
+    vad._end_event_pending = False
     return vad
 
 
@@ -70,3 +73,26 @@ def test_decoded_prefix_split_retains_silero_state_pending_samples_and_every_tai
     vad._vad_iterator.reset_states.assert_not_called()
     reconstructed = np.concatenate([snapshot, vad.current_audio()[320:]])
     np.testing.assert_array_equal(reconstructed, np.concatenate(frames))
+
+
+def test_quiet_speech_is_not_flushed_as_digital_silence():
+    vad = fake_silero()
+    vad.max_utterance_frames = 1000
+    quiet_speech = np.full(320, 0.0005, dtype=np.float32)
+    for _ in range(60):
+        result = vad.ingest(quiet_speech)
+    assert result.speech_active and not result.speech_ended
+    silence = np.full(320, 0.00001, dtype=np.float32)
+    for _ in range(20):
+        result = vad.ingest(silence)
+    assert result.speech_ended
+
+
+def test_loud_speech_keeps_the_absolute_silence_flush_level():
+    vad = fake_silero()
+    vad.max_utterance_frames = 1000
+    for _ in range(30):
+        vad.ingest(np.full(320, 0.1, dtype=np.float32))
+    for _ in range(20):
+        result = vad.ingest(np.full(320, 0.0009, dtype=np.float32))
+    assert result.speech_ended

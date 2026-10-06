@@ -556,3 +556,30 @@ def test_mtp_does_not_treat_progress_callback_failure_as_decoder_failure(monkeyp
         worker.ast(np.ones(16000), 'English', 'Spanish', [], on_progress=broken_callback)
     assert worker._draft_model is draft
     assert not list(tmp_path.glob('*.wav'))
+
+
+def test_prior_source_context_precedes_instruction_and_is_bounded(monkeypatch, tmp_path):
+    import sys
+
+    from mlx_worker import AST_PROMPT, AST_SOURCE_CONTEXT_CHARS
+
+    pieces = [SimpleNamespace(text="And now\nSpanish: Y ahora", finish_reason="stop")]
+    prompts = []
+
+    def run(prior_context):
+        _patch_mlx(monkeypatch, [pieces])
+        sys.modules["mlx_vlm.prompt_utils"].apply_chat_template = (
+            lambda processor, config, text, **kwargs: prompts.append(text) or "formatted"
+        )
+        _worker(tmp_path).ast(np.ones(16_000, dtype=np.float32), "English", "Spanish",
+                              prior_context=prior_context, priority="final")
+
+    instruction = AST_PROMPT.format(src="English", tgt="Spanish")
+    run([])
+    run([("x" * 500, "ignored"), ("the  response\nof the church", "la respuesta")])
+    assert prompts[0] == instruction
+    assert prompts[1].endswith(instruction)
+    quoted = prompts[1].split('"')[1]
+    assert quoted.endswith("the response of the church")
+    assert len(quoted) == AST_SOURCE_CONTEXT_CHARS
+    assert "la respuesta" not in prompts[1]

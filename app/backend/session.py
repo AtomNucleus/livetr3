@@ -711,8 +711,10 @@ class TranscriptionSession:
                 audio_f32_16k=audio,
                 src=self.state.config.source_lang,
                 tgt=self.state.config.target_lang,
-                # Model-generated prior captions can repeat an earlier recognition error.
-                prior_context=[],
+                # Model-generated prior captions can repeat an earlier recognition error,
+                # so earlier source text is a default-off replay experiment.
+                prior_context=(list(self.state.prior_context)
+                               if os.getenv("LIVETR3_AST_SOURCE_CONTEXT", "0") == "1" else []),
                 custom_vocab=self.state.config.custom_vocab,
                 code_switching_enabled=self.state.config.code_switching_enabled,
                 max_tokens=self._max_tokens_for_ast(priority, audio),

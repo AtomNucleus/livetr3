@@ -53,6 +53,8 @@ AST_PROMPT = (
     "then output the string '{tgt}: ', then the translation in {tgt}."
 )
 
+AST_SOURCE_CONTEXT_CHARS = 240
+
 POLISH_PROMPT = (
     "You will receive a rough transcription. Remove filler words "
     "(um, uh, er, you know, like), fix punctuation, fix capitalization, "
@@ -164,7 +166,15 @@ class MLXWorker:
                     f"transcribe in the spoken language, translate to {tgt}.\n\n"
                     + prompt_text
                 )
-            # mlx-vlm expands num_audios before the prompt text; do not hand-roll templates.
+            earlier = " ".join(" ".join(original.split()) for original, _ in prior_context)
+            if earlier.strip():
+                # Source text only, bounded; the audio remains the sole thing to transcribe.
+                prompt_text = (
+                    f"Earlier speech, for context only (already transcribed; do not repeat "
+                    f"it): \"{earlier[-AST_SOURCE_CONTEXT_CHARS:].strip()}\"\n\n"
+                    + prompt_text
+                )
+            # mlx-vlm renders prompt text before the audio placeholder; do not hand-roll templates.
             formatted = apply_chat_template(
                 self.processor,
                 self.config,
