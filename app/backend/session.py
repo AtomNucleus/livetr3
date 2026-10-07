@@ -123,7 +123,6 @@ class UtteranceRuntime:
     last_audio_frame_unix_seconds: float | None = None
     last_partial_wall_seconds: float = 0.0
     last_partial_audio_samples: int = 0
-    last_voiced_audio_samples: int = 0
     voiced_audio_samples: int = 0
     latest_partial_original: str = ""
     latest_partial_translation: str = ""
@@ -519,7 +518,6 @@ class TranscriptionSession:
                 UtteranceRuntime(partials=deque(maxlen=self._stability_window())),
             )
             runtime.last_audio_frame_unix_seconds = time.time()
-            runtime.last_voiced_audio_samples = self.segmenter.current_audio().shape[0]
             runtime.voiced_audio_samples += FRAME_SAMPLES
 
         if (
@@ -829,7 +827,6 @@ class TranscriptionSession:
                 partials=deque(maxlen=self._stability_window()),
                 last_audio_frame_unix_seconds=tail_last_audio,
                 voiced_audio_samples=voiced_samples,
-                last_voiced_audio_samples=tail.size if voiced_samples else 0,
             )
             trace("segment_commit", session=self.session_id, utterance=utterance_id,
                   reason="decoded_prefix", samples=snapshot.size)

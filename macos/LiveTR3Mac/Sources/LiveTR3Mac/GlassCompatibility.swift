@@ -19,15 +19,6 @@ extension View {
     }
 
     @ViewBuilder
-    func liveBackgroundExtension() -> some View {
-        if #available(macOS 26.0, *) {
-            self.backgroundExtensionEffect()
-        } else {
-            self
-        }
-    }
-
-    @ViewBuilder
     func liveGlassGroup() -> some View {
         if #available(macOS 26.0, *) {
             GlassEffectContainer {
