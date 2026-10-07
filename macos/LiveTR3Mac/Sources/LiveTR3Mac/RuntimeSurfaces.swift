@@ -6,21 +6,30 @@ struct RuntimeOverlay: View {
 
     var body: some View {
         VStack(spacing: 14) {
-            ProgressView()
-                .controlSize(.large)
-                .opacity(state == .failed ? 0 : 1)
-            Image(systemName: state.symbolName)
-                .font(.system(size: 34, weight: .semibold))
-                .foregroundStyle(state.tint)
+            ZStack {
+                if state == .starting {
+                    ProgressView()
+                        .controlSize(.large)
+                } else {
+                    Image(systemName: state.symbolName)
+                        .font(.system(size: 40, weight: .semibold))
+                        .foregroundStyle(state.tint)
+                        .symbolRenderingMode(.hierarchical)
+                }
+            }
+            .frame(height: 48)
+
             Text(state.label)
                 .font(.title2.weight(.semibold))
+
             Text(message)
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
-                .frame(maxWidth: 480)
+                .frame(maxWidth: 420)
         }
-        .padding(30)
-        .liveGlassSurface(cornerRadius: 26)
+        .padding(.horizontal, 36)
+        .padding(.vertical, 30)
+        .liveGlassSurface(cornerRadius: 28)
     }
 }

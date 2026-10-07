@@ -1,221 +1,148 @@
 import SwiftUI
 
+/// Session settings shown in the operator window's inspector.
 struct OperatorSettingsPanel: View {
     @ObservedObject var session: SessionController
     @ObservedObject var sessionManager: SessionManager
-    let onOpenProjector: () -> Void
 
     @State private var customVocabText = ""
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        Form {
             languageSection
             inputSection
-            outputSection
-            sessionActionsSection
-            exportSection
-            customVocabSection
+            projectorSection
+            vocabularySection
             advancedSection
         }
-        .padding(16)
+        .formStyle(.grouped)
         .onAppear {
             customVocabText = session.config.custom_vocab.joined(separator: ", ")
         }
     }
 
     private var languageSection: some View {
-        settingsSection(title: "Caption setup") {
-            HStack(alignment: .bottom, spacing: 12) {
-                languagePicker(title: "Source language", selection: sourceBinding)
-                Button("Swap next", action: session.swapDirection)
-                    .buttonStyle(.bordered)
-                    .disabled(session.status != .running)
-                languagePicker(title: "Target language", selection: targetBinding)
-            }
+        Section("Languages") {
+            languagePicker("From", symbol: "waveform", selection: sourceBinding)
+            languagePicker("To", symbol: "captions.bubble", selection: targetBinding)
         }
     }
 
     private var inputSection: some View {
-        settingsSection(title: "Input") {
-            HStack(alignment: .bottom, spacing: 12) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Mic")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                    Picker("Mic", selection: $session.selectedDeviceID) {
-                        Text("System default").tag("")
-                        ForEach(session.devices) { device in
-                            Text(device.name).tag(device.id)
-                        }
-                    }
-                    .labelsHidden()
-                    .frame(maxWidth: 280)
-                    .onChange(of: session.selectedDeviceID) { _, newValue in
-                        session.setSelectedDeviceID(newValue)
-                    }
+        Section("Input") {
+            Picker(selection: $session.selectedDeviceID) {
+                Text("System Default").tag("")
+                ForEach(session.devices) { device in
+                    Text(device.name).tag(device.id)
                 }
+            } label: {
+                Label("Microphone", systemImage: "mic")
+            }
+            .onChange(of: session.selectedDeviceID) { _, newValue in
+                session.setSelectedDeviceID(newValue)
+            }
 
-                Text("VAD: Silero")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
+            Toggle(isOn: polishBinding) {
+                Label("Polish Finals", systemImage: "wand.and.sparkles")
+            }
 
-                Toggle("Polish finals", isOn: polishBinding)
-                    .font(.subheadline)
+            LabeledContent {
+                Text("Silero")
+            } label: {
+                Label("Voice Detection", systemImage: "person.wave.2")
             }
         }
     }
 
-    private var outputSection: some View {
-        settingsSection(title: "Projector output") {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(alignment: .bottom, spacing: 12) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Projector font size")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                        HStack {
-                            Slider(value: $sessionManager.projectorFontSize, in: 36...144, step: 2)
-                            Text("\(Int(sessionManager.projectorFontSize))px")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .frame(width: 48, alignment: .trailing)
-                        }
-                    }
-                    Button("Open Projector", action: onOpenProjector)
-                        .buttonStyle(.borderedProminent)
+    private var projectorSection: some View {
+        Section {
+            LabeledContent {
+                ProjectorLookPicker(selection: $sessionManager.projectorStyle, iconsOnly: true)
+                    .fixedSize()
+            } label: {
+                Label("Look", systemImage: "display")
+            }
+
+            LabeledContent {
+                HStack {
+                    Slider(value: $sessionManager.projectorFontSize, in: 36...144, step: 2)
+                    Text("\(Int(sessionManager.projectorFontSize)) pt")
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                        .frame(width: 48, alignment: .trailing)
                 }
+            } label: {
+                Label("Size", systemImage: "textformat.size")
+            }
+        } header: {
+            Text("Projector")
+        } footer: {
+            Text(sessionManager.projectorStyle.detail)
+        }
+    }
 
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Projector look")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                    ProjectorLookPicker(selection: $sessionManager.projectorStyle)
-                    Text(sessionManager.projectorStyle.detail)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Text("The previous and current passages stay visible together. Each page gets at least 4 seconds before advancing, then stays for the next page’s reading time. Drafts settle before appearing.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+    private var vocabularySection: some View {
+        Section {
+            TextEditor(text: $customVocabText)
+                .font(.body)
+                .frame(minHeight: 64)
+                .scrollContentBackground(.hidden)
+                .accessibilityLabel("Custom vocabulary")
+                .onChange(of: customVocabText) { _, value in
+                    var next = session.config
+                    next.custom_vocab = value
+                        .split(separator: ",")
+                        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                        .filter { !$0.isEmpty }
+                    session.updateConfig(next)
                 }
-            }
+        } header: {
+            Text("Vocabulary")
+        } footer: {
+            Text("Names and terms, separated by commas.")
         }
-    }
-
-    private var sessionActionsSection: some View {
-        settingsSection(title: "Live session actions") {
-            HStack(spacing: 8) {
-                Button("Commit Now", action: session.commitNow)
-                    .disabled(session.status != .running)
-                Button("Skip Next Polish", action: session.skipNextPolish)
-                    .disabled(session.status != .running || !session.config.polish_enabled)
-                Button("Clear Transcript", action: session.clearTranscript)
-            }
-            .buttonStyle(.bordered)
-        }
-    }
-
-    private var exportSection: some View {
-        settingsSection(title: "Export") {
-            HStack(spacing: 8) {
-                Button("TXT") { exportTXT() }
-                Button("SRT") { exportSRT() }
-                Button("VTT") { exportVTT() }
-            }
-            .buttonStyle(.bordered)
-        }
-    }
-
-    private var customVocabSection: some View {
-        DisclosureGroup("Custom vocabulary") {
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Vocabulary hints")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                TextEditor(text: $customVocabText)
-                    .font(.body)
-                    .frame(minHeight: 72)
-                    .onChange(of: customVocabText) { _, value in
-                        var next = session.config
-                        next.custom_vocab = value
-                            .split(separator: ",")
-                            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                            .filter { !$0.isEmpty }
-                        session.updateConfig(next)
-                    }
-            }
-            .padding(.top, 8)
-        }
-        .font(.caption.weight(.semibold))
-        .foregroundStyle(.secondary)
-        .textCase(.uppercase)
     }
 
     private var advancedSection: some View {
-        DisclosureGroup("Advanced timing") {
-            VStack(alignment: .leading, spacing: 12) {
-                Toggle("Code-switch aware prompting", isOn: codeSwitchBinding)
-                HStack(spacing: 12) {
-                    numberField(title: "Partial interval (s)", value: partialIntervalBinding, range: 0.3...3, step: 0.05)
-                    numberField(title: "Max utterance (s)", value: maxUtteranceBinding, range: 5...29, step: 1)
-                    numberField(title: "Silero threshold", value: sileroThresholdBinding, range: 0.1...0.95, step: 0.05)
-                }
-                HStack(spacing: 12) {
-                    numberField(title: "Speech pad (ms)", value: speechPadBinding, range: 0...2_000, step: 50)
-                    numberField(title: "Min silence (ms)", value: minSilenceBinding, range: 100...5_000, step: 50)
+        Section {
+            DisclosureGroup {
+                Toggle("Code-Switch Aware Prompting", isOn: codeSwitchBinding)
+                numberField("Partial Interval", unit: "s", value: partialIntervalBinding)
+                numberField("Max Utterance", unit: "s", value: maxUtteranceBinding)
+                numberField("Silero Threshold", unit: nil, value: sileroThresholdBinding)
+                numberField("Speech Pad", unit: "ms", value: speechPadBinding)
+                numberField("Min Silence", unit: "ms", value: minSilenceBinding)
+            } label: {
+                Label("Advanced Timing", systemImage: "timer")
+            }
+        }
+    }
+
+    private func languagePicker(_ title: String, symbol: String, selection: Binding<String>) -> some View {
+        Picker(selection: selection) {
+            ForEach(LiveTR3Language.allCases) { language in
+                Text(language.rawValue).tag(language.rawValue)
+            }
+        } label: {
+            Label(title, systemImage: symbol)
+        }
+    }
+
+    private func numberField(_ title: String, unit: String?, value: Binding<Double>) -> some View {
+        LabeledContent(title) {
+            HStack(spacing: 4) {
+                TextField(title, value: value, format: .number)
+                    .labelsHidden()
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 64)
+                    .onSubmit { session.updateConfig(session.config) }
+                if let unit {
+                    Text(unit)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 22, alignment: .leading)
                 }
             }
-            .padding(.top, 8)
         }
-        .font(.caption.weight(.semibold))
-        .foregroundStyle(.secondary)
-        .textCase(.uppercase)
-    }
-
-    @ViewBuilder
-    private func settingsSection<Content: View>(title: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text(title)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .textCase(.uppercase)
-            content()
-        }
-        .padding(.bottom, 4)
-        .overlay(alignment: .bottom) {
-            Divider()
-        }
-    }
-
-    private func languagePicker(title: String, selection: Binding<String>) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(title)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-            Picker(title, selection: selection) {
-                ForEach(LiveTR3Language.allCases) { language in
-                    Text(language.rawValue).tag(language.rawValue)
-                }
-            }
-            .labelsHidden()
-            .frame(maxWidth: 220)
-        }
-    }
-
-    private func numberField(
-        title: String,
-        value: Binding<Double>,
-        range: ClosedRange<Double>,
-        step: Double
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(title)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-            TextField(title, value: value, format: .number)
-                .textFieldStyle(.roundedBorder)
-                .onSubmit { session.updateConfig(session.config) }
-        }
-        .frame(maxWidth: 180)
     }
 
     private var sourceBinding: Binding<String> {
@@ -293,30 +220,6 @@ struct OperatorSettingsPanel: View {
                 next[keyPath: keyPath] = newValue
                 session.updateConfig(next)
             }
-        )
-    }
-
-    private func exportTXT() {
-        TranscriptExporter.exportTXT(
-            entries: session.transcript.entries,
-            source: session.config.source_lang,
-            target: session.config.target_lang
-        )
-    }
-
-    private func exportSRT() {
-        TranscriptExporter.exportSRT(
-            entries: session.transcript.entries,
-            source: session.config.source_lang,
-            target: session.config.target_lang
-        )
-    }
-
-    private func exportVTT() {
-        TranscriptExporter.exportVTT(
-            entries: session.transcript.entries,
-            source: session.config.source_lang,
-            target: session.config.target_lang
         )
     }
 }

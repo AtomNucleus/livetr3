@@ -12,7 +12,12 @@ let package = Package(
     ],
     targets: [
         .executableTarget(
-            name: "LiveTR3Mac"
+            name: "LiveTR3Mac",
+            linkerSettings: [
+                // SwiftPM's default build system stamps the deployment target as the SDK version,
+                // which keeps AppKit in its pre-Liquid Glass compatibility appearance.
+                .unsafeFlags(["-Xlinker", "-platform_version", "-Xlinker", "macos", "-Xlinker", "14.0", "-Xlinker", "26.0"])
+            ]
         ),
         .testTarget(
             name: "LiveTR3MacTests",
