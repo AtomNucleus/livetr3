@@ -14,42 +14,38 @@ struct TeleprompterSessionSheetOperatorView: View {
         self.transcript = session.transcript
     }
 
-    @State private var hudVisible = true
-    @State private var settingsPresented = false
+    @State private var pointerInside = true
+    @State private var inspectorPresented = false
     @State private var partialPulseActive = false
-    @State private var controlsHeight: CGFloat = 150
 
     var body: some View {
-        ZStack(alignment: .bottom) {
-            VStack(spacing: 0) {
-                if let workerStatus = transcript.workerStatus, workerStatus.state != .ready {
-                    banner(text: workerStatus.message, tint: .orange)
-                }
-
-                if let error = displayedError {
-                    banner(text: error, tint: .red)
-                }
-
-                cueReader
-            }
-
-            VStack(spacing: 10) {
-                bottomHUD
-                    .opacity(hudVisible || settingsPresented ? 1 : 0)
-                    .animation(.easeInOut(duration: 0.2), value: hudVisible)
-                projectorLookBar
-            }
-            .padding(.horizontal, 20)
-            .padding(.bottom, 22)
-            .background {
-                GeometryReader { geometry in
-                    Color.clear.preference(key: OperatorControlsHeightKey.self, value: geometry.size.height)
-                }
-            }
+        TeleprompterCueReader(
+            transcript: transcript,
+            targetLanguage: session.config.target_lang,
+            fontSize: sessionManager.projectorFontSize
+        )
+        .liveSafeAreaBar(edge: .top) { alerts }
+        .liveSafeAreaBar(edge: .bottom) {
+            transportBar
+                .padding(.horizontal, 20)
+                .padding(.bottom, 18)
+                .opacity(hudVisible ? 1 : 0)
+                .animation(.easeInOut(duration: 0.25), value: hudVisible)
         }
-        .background(Color.black.opacity(0.93))
-        .onPreferenceChange(OperatorControlsHeightKey.self) { controlsHeight = $0 }
-        .onHover { hudVisible = $0 }
+        .background {
+            LinearGradient(
+                colors: [Color(white: 0.075), .black],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .ignoresSafeArea()
+        }
+        .onHover { pointerInside = $0 }
+        .toolbar { toolbarContent }
+        .inspector(isPresented: $inspectorPresented) {
+            OperatorSettingsPanel(session: session, sessionManager: sessionManager)
+                .inspectorColumnWidth(min: 300, ideal: 340, max: 440)
+        }
         .onAppear {
             session.refreshDevices()
         }
@@ -63,201 +59,315 @@ struct TeleprompterSessionSheetOperatorView: View {
                 // A newer partial owns the pulse; an older task must not switch it off.
             }
         }
-        .sheet(isPresented: $settingsPresented) {
-            sessionControlsSheet
-        }
         .background {
             TeleprompterShortcutMonitor(
                 onStartStop: session.startStop,
-                onExportTXT: exportTXT
+                onExportTXT: { export(.txt) }
             )
         }
+    }
+
+    /// Keep transport reachable whenever the operator could need it; fade it only while live and idle-pointer.
+    private var hudVisible: Bool {
+        pointerInside || inspectorPresented || session.status != .running
+    }
+
+    // MARK: Toolbar
+
+    @ToolbarContentBuilder
+    private var toolbarContent: some ToolbarContent {
+        ToolbarItemGroup(placement: .principal) {
+            ProjectorLookPicker(selection: $sessionManager.projectorStyle, iconsOnly: true)
+
+            Button(action: onOpenProjector) {
+                Label("Open Projector", systemImage: "display")
+            }
+            .help("Open the audience projector window (⇧⌘P)")
+        }
+
+        ToolbarItemGroup(placement: .automatic) {
+            Menu {
+                Button(action: session.commitNow) {
+                    Label("Commit Now", systemImage: "text.badge.checkmark")
+                }
+                .disabled(session.status != .running)
+
+                Button(action: session.skipNextPolish) {
+                    Label("Skip Next Polish", systemImage: "wand.and.sparkles.inverse")
+                }
+                .disabled(session.status != .running || !session.config.polish_enabled)
+
+                Divider()
+
+                Button(role: .destructive, action: session.clearTranscript) {
+                    Label("Clear Transcript", systemImage: "trash")
+                }
+            } label: {
+                Label("Session Actions", systemImage: "ellipsis")
+            }
+            .menuIndicator(.hidden)
+            .accessibilityLabel("Session actions")
+            .help("Session actions")
+
+            Menu {
+                ForEach(TranscriptFormat.allCases) { format in
+                    Button(format.title) { export(format) }
+                }
+            } label: {
+                Label("Export Transcript", systemImage: "square.and.arrow.up")
+            }
+            .menuIndicator(.hidden)
+            .accessibilityLabel("Export transcript")
+            .help("Export transcript (⌘E for text)")
+            .disabled(transcript.entries.isEmpty)
+        }
+
+        ToolbarItem(placement: .automatic) {
+            Button {
+                inspectorPresented.toggle()
+            } label: {
+                Label("Session Settings", systemImage: "sidebar.trailing")
+            }
+            .keyboardShortcut("i", modifiers: [.command, .option])
+            .help(inspectorPresented ? "Hide session settings (⌥⌘I)" : "Show session settings (⌥⌘I)")
+        }
+    }
+
+    // MARK: Transport
+
+    private var transportBar: some View {
+        HStack(spacing: 14) {
+            HStack(spacing: 8) {
+                startStopButton
+                pauseButton
+            }
+            .controlSize(.large)
+
+            liveStatus
+
+            WaveformMeterView(levels: session.levels, rms: session.levels.last ?? 0)
+
+            Circle()
+                .fill(Color.green)
+                .frame(width: 7, height: 7)
+                .opacity(partialPulseActive ? 1 : 0.2)
+                .help("Partial captions arriving")
+                .accessibilityLabel("Partial caption activity")
+
+            Divider().frame(height: 22)
+
+            languagePair
+
+            Divider().frame(height: 22)
+
+            captionSizeControl
+        }
+        .padding(.leading, 8)
+        .padding(.trailing, 18)
+        .padding(.vertical, 8)
+        .liveGlassCapsule()
+        .liveGlassGroup()
+        .fixedSize()
+    }
+
+    private var startStopButton: some View {
+        Button(action: session.startStop) {
+            Group {
+                switch session.status {
+                case .idle:
+                    Image(systemName: "mic.fill")
+                case .connecting:
+                    ProgressView().controlSize(.small)
+                case .running:
+                    Image(systemName: "stop.fill")
+                }
+            }
+            .frame(width: 22, height: 22)
+        }
+        .buttonBorderShape(.circle)
+        .liveGlassButtonStyle(prominent: true)
+        .tint(session.status == .running ? .red : .accentColor)
+        .disabled(session.status == .connecting)
+        .help(session.status == .running ? "End session (Space)" : "Start session (Space)")
+        .accessibilityLabel(session.status == .running ? "End session" : "Start session")
+    }
+
+    private var pauseButton: some View {
+        Button(action: session.pauseResume) {
+            Image(systemName: session.paused ? "play.fill" : "pause.fill")
+                .frame(width: 22, height: 22)
+        }
+        .buttonBorderShape(.circle)
+        .liveGlassButtonStyle()
+        .disabled(session.status != .running)
+        .help(session.paused ? "Resume capture" : "Pause capture")
+        .accessibilityLabel(session.paused ? "Resume capture" : "Pause capture")
+    }
+
+    @ViewBuilder
+    private var liveStatus: some View {
+        switch session.status {
+        case .running:
+            Text(session.paused ? "PAUSED" : "LIVE")
+                .font(.caption.weight(.heavy))
+                .tracking(0.8)
+                .foregroundStyle(.white)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(session.paused ? Color.orange : Color.red, in: Capsule())
+                .accessibilityLabel(session.paused ? "Paused" : "Live")
+        case .connecting:
+            Image(systemName: "antenna.radiowaves.left.and.right")
+                .symbolEffect(.variableColor.iterative)
+                .foregroundStyle(.yellow)
+                .help("Connecting")
+                .accessibilityLabel("Connecting")
+        case .idle:
+            EmptyView()
+        }
+    }
+
+    private var languagePair: some View {
+        HStack(spacing: 6) {
+            Button {
+                inspectorPresented = true
+            } label: {
+                HStack(spacing: 5) {
+                    Text(LiveTR3Language.shortCode(session.config.source_lang))
+                    Image(systemName: "arrow.right")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(.secondary)
+                    Text(LiveTR3Language.shortCode(session.config.target_lang))
+                }
+                .font(.callout.weight(.semibold).monospaced())
+            }
+            .buttonStyle(.plain)
+            .help("\(session.config.source_lang) to \(session.config.target_lang)")
+            .accessibilityLabel("\(session.config.source_lang) to \(session.config.target_lang)")
+
+            Button(action: swapLanguages) {
+                Image(systemName: "arrow.left.arrow.right")
+            }
+            .buttonStyle(.borderless)
+            .help(session.status == .running ? "Swap languages from the next utterance" : "Swap languages")
+            .accessibilityLabel("Swap languages")
+        }
+    }
+
+    private var captionSizeControl: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "textformat.size.smaller")
+                .foregroundStyle(.secondary)
+            Slider(value: $sessionManager.projectorFontSize, in: 36...144, step: 2)
+                .controlSize(.small)
+                .frame(width: 110)
+                .accessibilityLabel("Caption size")
+                .accessibilityValue("\(Int(sessionManager.projectorFontSize)) points")
+            Image(systemName: "textformat.size.larger")
+                .foregroundStyle(.secondary)
+        }
+        .help("Caption size: \(Int(sessionManager.projectorFontSize)) pt")
+    }
+
+    // MARK: Alerts
+
+    @ViewBuilder
+    private var alerts: some View {
+        let workerMessage = transcript.workerStatus.flatMap { $0.state == .ready ? nil : $0.message }
+        if workerMessage != nil || displayedError != nil {
+            VStack(spacing: 8) {
+                if let workerMessage {
+                    alertPill(workerMessage, symbol: "hourglass", tint: .orange)
+                }
+                if let displayedError {
+                    alertPill(displayedError, symbol: "exclamationmark.triangle.fill", tint: .red)
+                }
+            }
+            .liveGlassGroup()
+            .padding(.top, 8)
+            .padding(.horizontal, 20)
+        }
+    }
+
+    private func alertPill(_ text: String, symbol: String, tint: Color) -> some View {
+        Label {
+            Text(text)
+                .lineLimit(2)
+        } icon: {
+            Image(systemName: symbol)
+                .foregroundStyle(tint)
+        }
+        .font(.callout)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .liveGlassCapsule(tint: tint.opacity(0.35))
     }
 
     private var displayedError: String? {
         transcript.lastError ?? session.error
     }
 
-    private var cueReader: some View {
-        TeleprompterCueReader(
-            transcript: transcript,
-            targetLanguage: session.config.target_lang,
-            fontSize: sessionManager.projectorFontSize
-        )
-        // Keep the latest caption above the floating controls, including while they fade.
-        .padding(.bottom, controlsHeight + 12)
-    }
+    // MARK: Actions
 
-    private var projectorLookBar: some View {
-        HStack(spacing: 12) {
-            Text("Projector")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .textCase(.uppercase)
-
-            ProjectorLookPicker(selection: $sessionManager.projectorStyle)
-                .frame(maxWidth: 280)
-
-            Text(sessionManager.projectorStyle.detail)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-
-            Spacer(minLength: 8)
-
-            Button(action: onOpenProjector) {
-                Label("Open Projector", systemImage: "rectangle.on.rectangle")
-            }
-            .buttonStyle(.bordered)
-            .accessibilityHint("Opens the audience window using the selected look")
-        }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 10)
-        .liveGlassSurface(cornerRadius: 18, interactive: true)
-        .accessibilityElement(children: .contain)
-    }
-
-    private var bottomHUD: some View {
-        HStack(spacing: 16) {
-            statusBadge
-            WaveformMeterView(levels: session.levels, rms: session.levels.last ?? 0)
-            partialsIndicator
-
-            Divider().frame(height: 22)
-
-            HStack(spacing: 8) {
-                Text("Aa")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Slider(value: $sessionManager.projectorFontSize, in: 36...144, step: 2)
-                    .frame(width: 120)
-            }
-
-            Divider().frame(height: 22)
-
-            Button(action: session.startStop) {
-                Text(startStopTitle)
-                    .font(.subheadline.weight(.semibold))
-                    .frame(minWidth: 72)
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(session.status == .running ? .red : .accentColor)
-            .disabled(session.status == .connecting)
-
-            Button(session.paused ? "Resume" : "Pause", action: session.pauseResume)
-                .buttonStyle(.bordered)
-                .disabled(session.status != .running)
-
-            Button {
-                settingsPresented = true
-            } label: {
-                Label("Controls", systemImage: "slider.horizontal.3")
-            }
-            .buttonStyle(.bordered)
-        }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 12)
-        .liveGlassSurface(cornerRadius: 24, interactive: true)
-        .liveGlassGroup()
-        .shadow(color: .black.opacity(0.35), radius: 18, y: 8)
-    }
-
-    private var statusBadge: some View {
-        HStack(spacing: 8) {
-            Circle()
-                .fill(statusColor)
-                .frame(width: 10, height: 10)
-            Text(statusLabel)
-                .font(.subheadline.weight(.semibold))
-            Text("/")
-                .foregroundStyle(.tertiary)
-            Text("\(session.config.source_lang) to \(session.config.target_lang)")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-        }
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(statusLabel), \(session.config.source_lang) to \(session.config.target_lang)")
-    }
-
-    private var partialsIndicator: some View {
-        HStack(spacing: 6) {
-            Circle()
-                .fill(Color.green)
-                .frame(width: 9, height: 9)
-                .opacity(partialPulseActive ? 1 : 0.25)
-            Text("Partials")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .textCase(.uppercase)
+    private func swapLanguages() {
+        if session.status == .running {
+            session.swapDirection()
+        } else {
+            var next = session.config
+            (next.source_lang, next.target_lang) = (next.target_lang, next.source_lang)
+            session.updateConfig(next)
         }
     }
 
-    private var sessionControlsSheet: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text("Session controls")
-                    .font(.headline)
-                Spacer()
-                Button("Done") { settingsPresented = false }
-                    .keyboardShortcut(.defaultAction)
-            }
-            .padding()
-
-            Divider()
-
-            ScrollView {
-                OperatorSettingsPanel(
-                    session: session,
-                    sessionManager: sessionManager,
-                    onOpenProjector: onOpenProjector
-                )
-            }
-        }
-        .frame(width: 620, height: 660)
-    }
-
-    @ViewBuilder
-    private func banner(text: String, tint: Color) -> some View {
-        Text(text)
-            .font(.subheadline)
-            .foregroundStyle(tint == .red ? Color.red.opacity(0.9) : Color.orange.opacity(0.95))
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 20)
-            .padding(.vertical, 8)
-            .background(tint.opacity(0.12))
-    }
-
-    private var startStopTitle: String {
-        switch session.status {
-        case .running: "End"
-        case .connecting: "Connecting"
-        case .idle: "Start"
-        }
-    }
-
-    private var statusLabel: String {
-        switch session.status {
-        case .running: "Live"
-        case .connecting: "Connecting"
-        case .idle: "Ready"
-        }
-    }
-
-    private var statusColor: Color {
-        switch session.status {
-        case .running: .green
-        case .connecting: .yellow
-        case .idle: .gray
-        }
-    }
-
-    private func exportTXT() {
-        TranscriptExporter.exportTXT(
+    private func export(_ format: TranscriptFormat) {
+        format.export(
             entries: transcript.entries,
             source: session.config.source_lang,
             target: session.config.target_lang
         )
+    }
+}
+
+enum TranscriptFormat: String, CaseIterable, Identifiable {
+    case txt, srt, vtt
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .txt: "Plain Text (.txt)"
+        case .srt: "SubRip Subtitles (.srt)"
+        case .vtt: "WebVTT Subtitles (.vtt)"
+        }
+    }
+
+    func export(entries: [TranscriptUtterance], source: String, target: String) {
+        switch self {
+        case .txt: TranscriptExporter.exportTXT(entries: entries, source: source, target: target)
+        case .srt: TranscriptExporter.exportSRT(entries: entries, source: source, target: target)
+        case .vtt: TranscriptExporter.exportVTT(entries: entries, source: source, target: target)
+        }
+    }
+}
+
+extension LiveTR3Language {
+    var shortCode: String {
+        switch self {
+        case .english: "EN"
+        case .spanish: "ES"
+        case .french: "FR"
+        case .german: "DE"
+        case .italian: "IT"
+        case .portuguese: "PT"
+        case .japanese: "JA"
+        case .korean: "KO"
+        case .mandarin: "ZH"
+        case .arabic: "AR"
+        }
+    }
+
+    static func shortCode(_ name: String) -> String {
+        LiveTR3Language(rawValue: name)?.shortCode ?? String(name.prefix(2)).uppercased()
     }
 }
 
@@ -276,7 +386,7 @@ private struct TeleprompterCueReader: View {
                 }
             }
             .padding(.horizontal, 48)
-            .padding(.vertical, 48)
+            .padding(.vertical, 32)
             .frame(maxWidth: .infinity, alignment: frameAlignment)
         }
         .environment(\.layoutDirection, isRtlLanguage(targetLanguage) ? .rightToLeft : .leftToRight)
@@ -299,7 +409,7 @@ private struct TeleprompterCueReader: View {
 
             StableCaptionLayout(fontSize: fontSize) {
                 if entry.translation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    Text("Translating to \(targetLanguage)…")
+                    Label("Translating to \(targetLanguage)…", systemImage: "ellipsis")
                         .font(.title3)
                         .foregroundStyle(.white.opacity(0.48))
                 } else {
@@ -312,7 +422,7 @@ private struct TeleprompterCueReader: View {
         }
         .frame(maxWidth: .infinity, alignment: frameAlignment)
         .onAppear { traceCue(entry) }
-                .onChange(of: entry.original) { _, _ in traceCueField(entry, field: "original", text: entry.original) }
+        .onChange(of: entry.original) { _, _ in traceCueField(entry, field: "original", text: entry.original) }
         .onChange(of: entry.translation) { _, _ in traceCueField(entry, field: "translation", text: entry.translation) }
         .onChange(of: entry.state) { _, _ in traceCue(entry) }
     }
@@ -328,16 +438,12 @@ private struct TeleprompterCueReader: View {
     }
 
     private var emptyState: some View {
-        VStack(spacing: 12) {
-            Text("Ready for live translation")
-                .font(.title.weight(.semibold))
-                .foregroundStyle(.white)
-            Text("Start a session to fill the teleprompter.")
-                .font(.title3)
-                .foregroundStyle(.white.opacity(0.52))
+        ContentUnavailableView {
+            Label("Ready to Translate", systemImage: "captions.bubble")
+        } description: {
+            Text("Press Space to start.")
         }
-        .multilineTextAlignment(.center)
-        .padding(.bottom, 80)
+        .foregroundStyle(.white.opacity(0.7))
     }
 
     private var cueAlignment: HorizontalAlignment {
@@ -431,9 +537,4 @@ private struct TeleprompterShortcutMonitor: NSViewRepresentable {
             return responder is NSTextView || responder is NSTextField
         }
     }
-}
-
-private struct OperatorControlsHeightKey: PreferenceKey {
-    static let defaultValue: CGFloat = 150
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
 }

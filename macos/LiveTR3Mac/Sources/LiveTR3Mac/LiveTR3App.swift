@@ -21,6 +21,7 @@ struct LiveTR3App: App {
             rootContent
         }
         .windowStyle(.titleBar)
+        .windowToolbarStyle(.unified(showsTitle: false))
         .commands {
             CommandGroup(after: .appInfo) {
                 Button("Restart Local Runtime") {
@@ -54,7 +55,7 @@ struct LiveTR3App: App {
             .environmentObject(runtime)
             .environmentObject(sessionManager)
             .environmentObject(sessionController)
-            .frame(minWidth: 1120, minHeight: 760)
+            .frame(minWidth: 760, minHeight: 560)
             .task {
                 guard startsRuntimeAutomatically else { return }
                 await runtime.start()

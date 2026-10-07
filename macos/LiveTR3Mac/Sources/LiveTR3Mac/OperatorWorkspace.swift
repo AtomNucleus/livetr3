@@ -17,10 +17,12 @@ struct OperatorWorkspace: View {
             } else {
                 RuntimeOverlay(state: runtime.state, message: runtime.statusMessage)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color.black.ignoresSafeArea())
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(.background)
+        // The teleprompter is a dark stage; matching the chrome keeps the glass legible over it.
+        .preferredColorScheme(.dark)
     }
 
     private func openProjector() {
