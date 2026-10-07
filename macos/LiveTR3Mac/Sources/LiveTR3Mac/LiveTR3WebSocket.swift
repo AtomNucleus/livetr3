@@ -1,11 +1,5 @@
 import Foundation
 
-enum WebSocketConnectionMode {
-    case start
-    case resume
-    case viewer
-}
-
 @MainActor
 final class LiveTR3WebSocket: NSObject, CaptionEngine {
     var onMessage: ((LiveTR3ServerMessage) -> Void)?
