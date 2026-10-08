@@ -206,7 +206,7 @@ struct OperatorSettingsPanel: View {
     }
 
     private var minSilenceBinding: Binding<Double> {
-        configDoubleBinding(keyPath: \.min_silence_ms, defaultValue: 150)
+        configDoubleBinding(keyPath: \.min_silence_ms, defaultValue: 600)
     }
 
     private func configDoubleBinding(

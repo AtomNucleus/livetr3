@@ -226,6 +226,24 @@ def _trim_to_transcribable_audio(audio: np.ndarray) -> np.ndarray:
     )
 
 
+def _drop_repeated_lead(previous: str, text: str, max_words: int = 3) -> str:
+    """Remove words a cap-cut caption repeats from the end of the previous one.
+
+    The six-second cap repeats up to 300 ms of audio when it finds no quiet
+    cut, so the next caption can start with the word that ended the last one
+    ("banned from | from the games"). Only an exact match of up to three
+    words is removed, and never the whole caption.
+    """
+    word = lambda token: re.sub(r"[^\w']", "", token.casefold())
+    tail = [word(token) for token in previous.split()]
+    tokens = text.split()
+    for count in range(min(max_words, len(tail), len(tokens) - 1), 0, -1):
+        lead = [word(token) for token in tokens[:count]]
+        if all(lead) and lead == tail[-count:]:
+            return " ".join(tokens[count:])
+    return text
+
+
 def _ends_with_decoded_prefix_pause(audio: np.ndarray) -> bool:
     samples = DECODED_PREFIX_PAUSE_FRAMES * FRAME_SAMPLES
     if audio.size < samples:
@@ -361,6 +379,7 @@ class TranscriptionSession:
         self._utterance_runtime: dict[int, UtteranceRuntime] = {}
         self._pending_config: ConfigMessage | None = None
         self._skip_next_polish = False
+        self._last_final: tuple[int, str, str, str] | None = None
         self.session_id = websocket.query_params.get("session") or str(uuid4())
         self.role: Literal["unknown", "producer", "viewer"] = "unknown"
         self._archive_dir: Path | None = None
@@ -856,6 +875,11 @@ class TranscriptionSession:
         original, translation = result.original, result.translation
         self._finalized.add(utterance_id)
         commit_reason = self._finalizing.pop(utterance_id, "silero_end")
+        last = self._last_final
+        if last is not None and last[0] == utterance_id - 1 and last[3] == "max_utterance_cap":
+            original = _drop_repeated_lead(last[1], original)
+            translation = _drop_repeated_lead(last[2], translation)
+        self._last_final = (utterance_id, original, translation, commit_reason)
         runtime = self._utterance_runtime.pop(utterance_id, None)
         self.state.prior_context.append((original, translation))
         self.state.prior_context = self.state.prior_context[-2:]
