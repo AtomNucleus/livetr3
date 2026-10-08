@@ -132,7 +132,7 @@ struct ProjectorCaptionPresentation {
     private mutating func takeNextPage(layout: ProjectorCaptionLayout) {
         var next = queue.removeFirst()
         // Short utterances that arrive in a burst share the next page, instead of each
-        // accumulating another four seconds of lag. Never change a page being read.
+        // accumulating another full page hold of lag. Never change a page being read.
         while let candidate = queue.first {
             let combined = Pending(captions: next.captions + candidate.captions)
             let caption = combined.caption
@@ -176,8 +176,14 @@ struct ProjectorCaptionPresentation {
             // Character pacing also covers scripts that do not separate words with spaces.
             return max(Double(words) / 3, Double(text.count) / 15)
         }
-        return max(4, max(duration(original), duration(translation)))
+        return max(minimumPageSeconds, max(duration(original), duration(translation)))
     }
+
+    /// Short pages still get word-paced time; a longer floor queued finals behind
+    /// one-word pages and let the projector drift seconds behind the speaker.
+    static let minimumPageSeconds: TimeInterval = 2.5
+    /// How long a draft character must stay unchanged before the audience sees it.
+    static let draftSettleSeconds: TimeInterval = 0.3
 }
 
 private struct SettlingCaptionText {
@@ -192,7 +198,7 @@ private struct SettlingCaptionText {
     }
 
     func settled(at now: TimeInterval) -> String {
-        let count = firstSeen.prefix(while: { now - $0 >= 0.7 }).count
+        let count = firstSeen.prefix(while: { now - $0 >= ProjectorCaptionPresentation.draftSettleSeconds }).count
         guard count > 0 else { return "" }
         // Withhold the changing word, even when only its first few letters have settled.
         var end = count

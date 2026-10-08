@@ -5,6 +5,8 @@ import XCTest
 
 final class ProjectorCaptionPresentationTests: XCTestCase {
     private let layout = ProjectorCaptionLayout(size: CGSize(width: 1280, height: 720), requestedFontSize: 72, style: .split)
+    private let page = ProjectorCaptionPresentation.minimumPageSeconds
+    private let settle = ProjectorCaptionPresentation.draftSettleSeconds
 
     private func entry(_ id: Int, _ original: String, _ translation: String, state: UtteranceState = .final) -> TranscriptUtterance {
         TranscriptUtterance(id: id, original: original, translation: translation, state: state,
@@ -19,9 +21,9 @@ final class ProjectorCaptionPresentationTests: XCTestCase {
         model.receive([first], at: 0)
         model.tick(at: 0, layout: layout)
         model.receive([first, second], at: 1)
-        model.tick(at: 3.9, layout: layout)
+        model.tick(at: page - 0.1, layout: layout)
         XCTAssertEqual(model.current?.utteranceID, 1)
-        model.tick(at: 4, layout: layout)
+        model.tick(at: page, layout: layout)
         XCTAssertEqual(model.current?.utteranceID, 2)
         model.tick(at: 400, layout: layout)
         XCTAssertEqual(model.current?.translation, second.translation)
@@ -31,13 +33,13 @@ final class ProjectorCaptionPresentationTests: XCTestCase {
         var model = ProjectorCaptionPresentation()
         let first = entry(1, "There are nin", "Hay nove", state: .partial)
         model.receive([first], at: 0)
-        model.tick(at: 0.5, layout: layout)
+        model.tick(at: settle / 2, layout: layout)
         XCTAssertNil(model.draft)
-        model.receive([entry(1, "There are ninety liters ", "Hay noventa litros ", state: .partial)], at: 0.5)
-        model.tick(at: 0.8, layout: layout)
+        model.receive([entry(1, "There are ninety liters ", "Hay noventa litros ", state: .partial)], at: settle / 2)
+        model.tick(at: settle + 0.05, layout: layout)
         XCTAssertEqual(model.draft?.original, "There are")
         XCTAssertEqual(model.draft?.translation, "Hay")
-        model.tick(at: 1.3, layout: layout)
+        model.tick(at: settle / 2 + settle + 0.05, layout: layout)
         XCTAssertEqual(model.draft?.original, "There are ninety liters")
         XCTAssertNil(model.current, "A settled draft must never be promoted to a final")
     }
@@ -54,7 +56,7 @@ final class ProjectorCaptionPresentationTests: XCTestCase {
         model.tick(at: 1.2, layout: layout)
         XCTAssertEqual(model.current?.original, "There are ninety liters.")
         XCTAssertNil(model.draft)
-        XCTAssertEqual(model.holdUntil, 5.2, accuracy: 0.001)
+        XCTAssertEqual(model.holdUntil, 1.2 + page, accuracy: 0.001)
     }
 
     func testNewSpeechNeverEvictsFinishedCaption() {
@@ -112,7 +114,7 @@ final class ProjectorCaptionPresentationTests: XCTestCase {
         model.tick(at: 1, layout: smaller)
         XCTAssertTrue(text.hasPrefix(model.current!.original))
         XCTAssertTrue(text.hasPrefix(model.current!.translation))
-        XCTAssertGreaterThanOrEqual(model.holdUntil, 5)
+        XCTAssertGreaterThanOrEqual(model.holdUntil, 1 + page)
     }
 
     func testPolishedCorrectionUpdatesCurrentButDoesNotReplayAnOldUtterance() {
@@ -124,7 +126,7 @@ final class ProjectorCaptionPresentationTests: XCTestCase {
         model.receive([corrected], at: 3)
         model.tick(at: 3, layout: layout)
         XCTAssertEqual(model.current?.translation, "Noventa.")
-        XCTAssertEqual(model.holdUntil, 7)
+        XCTAssertEqual(model.holdUntil, 3 + page)
         let second = entry(2, "Thanks.", "Gracias.")
         model.receive([corrected, second], at: 4)
         model.tick(at: 7, layout: layout)
@@ -147,7 +149,7 @@ final class ProjectorCaptionPresentationTests: XCTestCase {
     }
 
     func testReadingTimeGrowsWithTextAndHandlesUnspacedScripts() {
-        XCTAssertEqual(ProjectorCaptionPresentation.readingDuration(original: "", translation: "Hello."), 4)
+        XCTAssertEqual(ProjectorCaptionPresentation.readingDuration(original: "", translation: "Hello."), page)
         XCTAssertGreaterThan(ProjectorCaptionPresentation.readingDuration(original: "", translation: String(repeating: "word ", count: 30)), 9)
         XCTAssertGreaterThan(ProjectorCaptionPresentation.readingDuration(original: "", translation: String(repeating: "文", count: 90)), 5)
     }
@@ -166,7 +168,7 @@ final class ProjectorCaptionPresentationTests: XCTestCase {
         model.receive([first, entry(2, "Ninety.", "Noventa.", state: .polished)] + Array(burst.suffix(2)), at: 5)
         model.tick(at: 5, layout: layout)
         XCTAssertEqual(model.current?.translation, "Noventa. Dos. Tres.", "Corrections retain their identity within a combined page")
-        XCTAssertEqual(model.holdUntil, 9)
+        XCTAssertEqual(model.holdUntil, 5 + page)
     }
 
     func testRepeatedPartialSnapshotsDoNotPretendToBeNewEvidence() {
@@ -174,11 +176,11 @@ final class ProjectorCaptionPresentationTests: XCTestCase {
         let partial = entry(1, "Welcome everyone ", "Bienvenidos todos ", state: .partial)
         model.receive([partial], at: 0)
         for step in 1...6 {
-            model.receive([partial], at: Double(step) / 10)
-            model.tick(at: Double(step) / 10, layout: layout)
+            model.receive([partial], at: Double(step) * settle / 7)
+            model.tick(at: Double(step) * settle / 7, layout: layout)
             XCTAssertNil(model.draft)
         }
-        model.tick(at: 0.8, layout: layout)
+        model.tick(at: settle, layout: layout)
         XCTAssertEqual(model.draft?.translation, "Bienvenidos todos")
     }
 
@@ -221,9 +223,9 @@ final class ProjectorCaptionPresentationTests: XCTestCase {
         XCTAssertEqual(model.previous?.translation, first.translation)
         XCTAssertEqual(model.current?.translation, second.translation)
         model.receive([first, second, third], at: 5)
-        model.tick(at: 7.99, layout: layout)
+        model.tick(at: 4 + page - 0.01, layout: layout)
         XCTAssertEqual(model.previous?.translation, first.translation)
-        model.tick(at: 8, layout: layout)
+        model.tick(at: 4 + page, layout: layout)
         XCTAssertEqual(model.previous?.translation, second.translation)
         XCTAssertEqual(model.current?.translation, third.translation)
         model.tick(at: 800, layout: layout)
@@ -293,7 +295,7 @@ final class ProjectorCaptionPresentationTests: XCTestCase {
                 XCTAssertNil(model.draft)
                 XCTAssertEqual(model.current?.translation, translated.translation)
                 XCTAssertEqual(model.previous?.translation, "Gracias.")
-                XCTAssertGreaterThanOrEqual(model.holdUntil, 105)
+                XCTAssertGreaterThanOrEqual(model.holdUntil, 101 + page)
             }
         }
     }
