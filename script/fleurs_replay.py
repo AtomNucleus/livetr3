@@ -33,7 +33,7 @@ class WallCapture(Capture):
             self.file.flush()
 
 
-async def replay(name, worker, audio, output, reference, id_base, cap, silence_ms, extend=0, pause_ms=0):
+async def replay(name, worker, audio, output, reference, id_base, cap, silence_ms, extend=2, pause_ms=200):
     from protocol import ConfigMessage
     from session import SessionHub, TranscriptionSession
     if competing_workers():
@@ -151,6 +151,6 @@ if __name__ == '__main__':
     parser.add_argument('--mode', choices=('baseline', 'mtp'), required=True)
     parser.add_argument('--conditions', default=[(6, 400)],
                         type=lambda s: [tuple(int(v) for v in item.split(':')) for item in s.split(',')],
-                        help='Ordered cap-seconds:silence-ms[:extend-seconds[:pause-ms]] conditions, e.g. 6:600,6:600:2:200')
+                        help='Ordered cap-seconds:silence-ms[:extend-seconds[:pause-ms]] conditions, e.g. 6:600:0:0,6:600:2:200; omitted fields use the session defaults')
     parser.add_argument('--clips', help='Comma-separated clip names; default all')
     asyncio.run(main(parser.parse_args()))

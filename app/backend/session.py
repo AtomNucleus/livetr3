@@ -1120,8 +1120,10 @@ class TranscriptionSession:
             speech_pad_ms=speech_pad_ms,
             min_silence_ms=min_silence_ms,
             max_utterance_s=max_utterance_seconds,
-            cap_extend_s=float(os.getenv("LIVETR3_CAP_EXTEND_SECONDS", "0")),
-            cap_pause_ms=int(os.getenv("LIVETR3_CAP_PAUSE_MS", "0")),
+            # Wait up to 2 s past the cap for a 200 ms phrase pause (FLEURS
+            # replay, 2026-10-08); set either to 0 for the plain cap.
+            cap_extend_s=float(os.getenv("LIVETR3_CAP_EXTEND_SECONDS", "2")),
+            cap_pause_ms=int(os.getenv("LIVETR3_CAP_PAUSE_MS", "200")),
         )
 
     def _max_tokens_for_ast(self, priority: str, audio: np.ndarray) -> int:
