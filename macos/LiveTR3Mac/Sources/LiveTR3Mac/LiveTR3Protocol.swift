@@ -47,7 +47,7 @@ struct ClientConfig: Codable, Equatable {
         max_utterance_seconds: 6,
         silero_threshold: 0.5,
         speech_pad_ms: 300,
-        min_silence_ms: 400,
+        min_silence_ms: 600,
         early_commit_enabled: false,
         early_commit_min_seconds: 1.0,
         early_commit_punctuation: true,
