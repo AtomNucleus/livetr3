@@ -94,11 +94,11 @@ final class ProjectorCaptionPresentationTests: XCTestCase {
                                 fontSize: source ? layout.sourceFontSize : layout.fontSize, lineSpacing: layout.lineSpacing),
                             layout.textHeight(source: source), "Page must fit without shrinking or clipping")
                     }
-                    if seenTranslation.count == translation.count && (style == .focus || seenOriginal.count == original.count) { break }
+                    if seenTranslation.count == translation.count && (style == .rollUp || seenOriginal.count == original.count) { break }
                     now = model.holdUntil
                 }
                 XCTAssertEqual(seenTranslation, translation)
-                XCTAssertEqual(seenOriginal, style == .focus ? "" : original)
+                XCTAssertEqual(seenOriginal, style == .rollUp ? "" : original)
             }
         }
     }

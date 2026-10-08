@@ -1,16 +1,15 @@
 import SwiftUI
 
 enum ProjectorPresentationStyle: String, CaseIterable, Identifiable {
-    case focus
+    // A saved "focus" (the earlier translation-only look) falls back to the default, rollUp.
+    case rollUp
     case split
     case stack
-    case rollUp
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
-        case .focus: "Focus"
         case .split: "Split"
         case .stack: "Stack"
         case .rollUp: "Roll-up"
@@ -19,7 +18,6 @@ enum ProjectorPresentationStyle: String, CaseIterable, Identifiable {
 
     var detail: String {
         switch self {
-        case .focus: "Large translation only"
         case .split: "Source and translation side by side"
         case .stack: "Source and translation stacked together"
         case .rollUp: "Continuous translation that scrolls up line by line"
@@ -28,7 +26,6 @@ enum ProjectorPresentationStyle: String, CaseIterable, Identifiable {
 
     var symbolName: String {
         switch self {
-        case .focus: "rectangle.center.inset.filled"
         case .split: "rectangle.split.2x1"
         case .stack: "rectangle.split.1x2"
         case .rollUp: "text.append"

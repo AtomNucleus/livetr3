@@ -111,6 +111,21 @@ final class ProjectorRollUpTests: XCTestCase {
     }
 
     @MainActor
+    func testSavedFocusLookAndFreshInstallsUseRollUp() {
+        let defaults = UserDefaults.standard
+        let key = SessionManager.styleStorageKey
+        let old = defaults.object(forKey: key)
+        defer { if let old { defaults.set(old, forKey: key) } else { defaults.removeObject(forKey: key) } }
+        let id = UUID().uuidString
+        defaults.set("focus", forKey: key)
+        XCTAssertEqual(SessionManager(sessionID: id).projectorStyle, .rollUp)
+        defaults.removeObject(forKey: key)
+        XCTAssertEqual(SessionManager(sessionID: id).projectorStyle, .rollUp)
+        defaults.set("split", forKey: key)
+        XCTAssertEqual(SessionManager(sessionID: id).projectorStyle, .split)
+    }
+
+    @MainActor
     func testRenderRollUpAt720pAnd1080p() async throws {
         var repo = URL(fileURLWithPath: #filePath)
         for _ in 0..<5 { repo.deleteLastPathComponent() }

@@ -125,7 +125,7 @@ struct ProjectorCaptionPresentation {
 
     private var hasRemainder: Bool {
         guard let active, let layout else { return false }
-        return (layout.style != .focus && active.originalOffset < active.caption.original.count)
+        return (layout.style != .rollUp && active.originalOffset < active.caption.original.count)
             || active.translationOffset < active.caption.translation.count
     }
 
@@ -137,7 +137,7 @@ struct ProjectorCaptionPresentation {
             let combined = Pending(captions: next.captions + candidate.captions)
             let caption = combined.caption
             guard layout.prefix(caption.translation, source: false) == caption.translation,
-                  layout.style == .focus || layout.prefix(caption.original, source: true) == caption.original else { break }
+                  layout.style == .rollUp || layout.prefix(caption.original, source: true) == caption.original else { break }
             next = combined
             queue.removeFirst()
         }
@@ -151,7 +151,7 @@ struct ProjectorCaptionPresentation {
             previousStart = pageStart
         }
         pageStart = active
-        let original = layout.style == .focus ? "" : layout.prefix(
+        let original = layout.style == .rollUp ? "" : layout.prefix(
             String(active.caption.original.dropFirst(active.originalOffset)), source: true
         )
         let translation = layout.prefix(

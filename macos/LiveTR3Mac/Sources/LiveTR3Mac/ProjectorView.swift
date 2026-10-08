@@ -68,7 +68,7 @@ struct ProjectorLiveCaptionStage: View {
     var body: some View {
         VStack(spacing: 16) {
             switch layout.style {
-            case .focus, .rollUp:
+            case .rollUp:
                 lane(source: false)
             case .split:
                 HStack(spacing: 24) {
@@ -184,7 +184,7 @@ struct ProjectorCaptionStage: View {
             let target = isDraft && isTranslationPending ? "Translating…"
                 : isDraft ? layout.prefix(caption.translation, source: false, balancePages: false) : caption.translation
             switch layout.style {
-            case .focus, .rollUp:
+            case .rollUp:
                 lane(target, previous: previous?.translation, source: false,
                      title: title(targetLanguage, draft: isDraft, continuation: caption.isContinuation),
                      fontSize: layout.fontSize, language: targetLanguage)
