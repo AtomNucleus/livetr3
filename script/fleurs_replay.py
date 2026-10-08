@@ -33,7 +33,7 @@ class WallCapture(Capture):
             self.file.flush()
 
 
-async def replay(name, worker, audio, output, reference, id_base, cap, silence_ms):
+async def replay(name, worker, audio, output, reference, id_base, cap, silence_ms, extend=2, pause_ms=200):
     from protocol import ConfigMessage
     from session import SessionHub, TranscriptionSession
     if competing_workers():
@@ -48,6 +48,8 @@ async def replay(name, worker, audio, output, reference, id_base, cap, silence_m
         speech_pad_ms=300, silero_threshold=.5, early_commit_enabled=False,
         early_commit_min_seconds=1, early_commit_punctuation=True,
         early_commit_stability=True, stability_window=2)
+    os.environ['LIVETR3_CAP_EXTEND_SECONDS'] = str(extend)
+    os.environ['LIVETR3_CAP_PAUSE_MS'] = str(pause_ms)
     value.segmenter = value._build_segmenter(value.state.config)
     value.state.running = True
     value.state.utterance_id = id_base
@@ -74,6 +76,8 @@ async def replay(name, worker, audio, output, reference, id_base, cap, silence_m
             if row['type'] == 'final' and row.get('last_audio_frame_unix_seconds')]
         result['cap_seconds'] = cap
         result['silence_ms'] = silence_ms
+        result['cap_extend_seconds'] = extend
+        result['cap_pause_ms'] = pause_ms
         (output / f'{name}-summary.json').write_text(json.dumps(result, indent=2, ensure_ascii=False))
         latency = result['final_latency_seconds']
         print(json.dumps(dict(run=name, finals=result['final_count'],
@@ -126,11 +130,12 @@ async def main(args):
         warm = sorted(args.eval_dir.glob('clip-*.wav'))[-1]
         await replay('warmup', worker, load(warm), output,
                      warm.with_suffix('.en.txt').read_text(), id_base, *args.conditions[0])
-        for index, (cap, silence_ms) in enumerate(args.conditions, 1):
+        for index, condition in enumerate(args.conditions, 1):
+            label = '{}s-{}ms'.format(*condition) + (f'-x{condition[2]}' if len(condition) > 2 else '') + (f'-p{condition[3]}' if len(condition) > 3 else '')
             for path in clips:
                 id_base += 1000
-                await replay(f'{index:02d}-{cap}s-{silence_ms}ms-{path.stem}', worker, load(path),
-                             output, path.with_suffix('.en.txt').read_text(), id_base, cap, silence_ms)
+                await replay(f'{index:02d}-{label}-{path.stem}', worker, load(path),
+                             output, path.with_suffix('.en.txt').read_text(), id_base, *condition)
     finally:
         await worker.stop()
     if args.mode == 'mtp':
@@ -146,6 +151,6 @@ if __name__ == '__main__':
     parser.add_argument('--mode', choices=('baseline', 'mtp'), required=True)
     parser.add_argument('--conditions', default=[(6, 400)],
                         type=lambda s: [tuple(int(v) for v in item.split(':')) for item in s.split(',')],
-                        help='Ordered cap-seconds:silence-ms pairs, e.g. 6:400,8:400')
+                        help='Ordered cap-seconds:silence-ms[:extend-seconds[:pause-ms]] conditions, e.g. 6:600:0:0,6:600:2:200; omitted fields use the session defaults')
     parser.add_argument('--clips', help='Comma-separated clip names; default all')
     asyncio.run(main(parser.parse_args()))

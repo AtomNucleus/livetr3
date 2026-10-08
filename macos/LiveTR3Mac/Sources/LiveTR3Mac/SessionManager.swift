@@ -30,7 +30,7 @@ final class SessionManager: ObservableObject {
         self.projectorFontSize = stored > 0 ? Self.clampFontSize(stored) : 72
 
         let storedStyle = UserDefaults.standard.string(forKey: Self.styleStorageKey) ?? ""
-        self.projectorStyle = ProjectorPresentationStyle(rawValue: storedStyle) ?? .focus
+        self.projectorStyle = ProjectorPresentationStyle(rawValue: storedStyle) ?? .rollUp
     }
 
     static let styleStorageKey = "LiveTR3.projector.presentationStyle"

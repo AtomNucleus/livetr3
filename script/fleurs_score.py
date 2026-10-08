@@ -21,7 +21,7 @@ from whisper_normalizer.english import EnglishTextNormalizer
 
 normalize = EnglishTextNormalizer()
 NEGATION = {"not", "no", "never", "nor", "none", "nothing", "without", "cannot"}
-RUN = re.compile(r"^(\d+)-(?:(\d+)s-)?(\d+)ms-(clip-\d+)-summary\.json$")
+RUN = re.compile(r"^(\d+)-(?:(\d+)s-)?(\d+)ms-(?:x([\d.]+)-)?(?:p(\d+)-)?(clip-\d+)-summary\.json$")
 
 
 def tokens(text):
@@ -130,9 +130,9 @@ def main(args):
             match = RUN.match(path.name)
             if not match:
                 continue
-            clip = match.group(4)
+            clip = match.group(6)
             summary = json.loads(path.read_text())
-            by_condition.setdefault(f"{match.group(2) or 6}s {match.group(3)}ms", []).append(score_clip(
+            by_condition.setdefault(f"{match.group(2) or 6}s {match.group(3)}ms" + (f" +{match.group(4)}s" if match.group(4) else "") + (f" pause {match.group(5)}ms" if match.group(5) else ""), []).append(score_clip(
                 summary, (args.eval_dir / f"{clip}.en.txt").read_text(),
                 (args.eval_dir / f"{clip}.es.txt").read_text()))
         inference = final_inference_seconds(run_dir)
@@ -142,7 +142,7 @@ def main(args):
     columns = [("WER", "wer", "{:.2%}"), ("del", "deletions", "{}"), ("ins", "insertions", "{}"),
                ("near cut", "near_boundary_errors", "{}"), ("numbers", "numeric", "{}"),
                ("negation", "negation", "{}"), ("chrF++", "chrf_pp", "{:.1f}"), ("BLEU", "bleu", "{:.1f}"),
-               ("dropped", "dropped_finals", "{}"), ("final lat med", "final_latency_median", "{:.2f}"),
+               ("forced", "forced", "{}"), ("dropped", "dropped_finals", "{}"), ("final lat med", "final_latency_median", "{:.2f}"),
                ("p95", "final_latency_p95", "{:.2f}"), ("last after clip", "last_final_after_clip_mean", "{:.2f}"),
                ("first target", "first_target_mean", "{:.2f}"), ("gap p95", "gap_p95_mean", "{:.2f}"),
                (">2 s", "gaps_over_two", "{}"), ("infer med", "final_inference_median", "{:.2f}")]
