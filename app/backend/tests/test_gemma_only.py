@@ -29,7 +29,7 @@ def test_every_session_routes_audio_through_combined_gemma(monkeypatch, source, 
         value._run_mlx_ast = AsyncMock()
         audio = np.ones(320, dtype=np.float32)
         await value._run_ast("partial", 1, audio)
-        value._run_mlx_ast.assert_awaited_once_with("partial", 1, audio)
+        value._run_mlx_ast.assert_awaited_once_with("partial", 1, audio, None)
 
     asyncio.run(run())
 

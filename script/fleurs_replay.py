@@ -116,6 +116,7 @@ async def main(args):
     git = lambda *cmd: subprocess.check_output(['git', *cmd], cwd=root, text=True)
     metadata = dict(mode=args.mode, model=MODEL_PATH, prompt=AST_PROMPT,
                     conditions=args.conditions, clips=[path.stem for path in clips],
+                    early_final_ms=os.getenv('LIVETR3_EARLY_FINAL_MS', 'default'),
                     commit=git('rev-parse', 'HEAD').strip(),
                     worktree_diff_sha256=hashlib.sha256(git('diff', 'HEAD').encode()).hexdigest(),
                     manifest_sha256=hashlib.sha256((args.eval_dir / 'manifest.json').read_bytes()).hexdigest(),

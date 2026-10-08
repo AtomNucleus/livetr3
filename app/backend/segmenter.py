@@ -65,6 +65,11 @@ class RMSGate:
     def speech_active(self) -> bool:
         return self._speech_active
 
+    @property
+    def trailing_quiet_ms(self) -> int:
+        """How long the detector has heard no speech in an utterance that has not ended yet."""
+        return self._below_threshold_frames * 20 if self._speech_active else 0
+
     def current_audio(self) -> np.ndarray:
         if not self._current:
             return np.zeros(0, dtype=np.float32)
@@ -242,6 +247,18 @@ class SileroVAD(RMSGate):
             self._vad_iterator.reset_states()
         except AttributeError:
             pass
+
+    @property
+    def trailing_quiet_ms(self) -> int:
+        # Silero marks where a possible end began and resets it only when speech
+        # returns, so this is the same quiet that becomes end-of-speech later.
+        if not self._speech_active:
+            return 0
+        iterator = self._vad_iterator
+        silero_ms = 0
+        if getattr(iterator, "triggered", False) and getattr(iterator, "temp_end", 0):
+            silero_ms = int((iterator.current_sample - iterator.temp_end) * 1000 / SAMPLE_RATE)
+        return max(silero_ms, self._silent_frames * 20)
 
     def _cap_is_end_of_speech(self) -> bool:
         # Nothing follows a real end of speech, so carry nothing past it.

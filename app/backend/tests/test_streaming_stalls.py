@@ -55,7 +55,7 @@ def test_trailing_silence_does_not_start_preview_before_imminent_final(monkeypat
             await value._receive_frame(silence)
 
         value._schedule_ast.assert_called_once()
-        priority, utterance_id, audio = value._schedule_ast.call_args.args
+        priority, utterance_id, audio = value._schedule_ast.call_args.args[:3]
         assert (priority, utterance_id) == ("final", 1)
         np.testing.assert_array_equal(
             audio, np.concatenate([speech] * 20 + [silence] * 20)

@@ -30,7 +30,7 @@ from protocol import (
     TranscriptMessage,
     parse_control_message,
 )
-from segmenter import FRAME_SAMPLES, RMSGate, make_segmenter
+from segmenter import FRAME_SAMPLES, RMSGate, SegmentResult, make_segmenter
 from transport import SessionTransport
 from latency_trace import trace
 
@@ -112,6 +112,9 @@ TRANSCRIBABLE_TRIM_PAD_SECONDS = min(
     1.0, max(0.0, float(os.getenv("TRANSCRIBABLE_TRIM_PAD_SECONDS", "0.30")))
 )
 DECODED_PREFIX_PAUSE_FRAMES = 8  # 160 ms of quiet audio at a word/phrase boundary.
+# Start the final decode this far into a pause, before end-of-speech is
+# certain, and drop it if speech resumes. 0 waits for end-of-speech instead.
+DEFAULT_EARLY_FINAL_QUIET_MS = 200
 
 
 CommitReason = Literal["punctuation", "stability", "silero_end", "max_utterance_cap", "decoded_prefix"]
@@ -128,6 +131,16 @@ class UtteranceRuntime:
     latest_partial_translation: str = ""
     partial_audio_snapshot: np.ndarray | None = None
     partial_last_audio_unix_seconds: float | None = None
+
+
+@dataclass(slots=True)
+class EarlyFinal:
+    utterance_id: int
+    audio: np.ndarray
+    config: ConfigMessage
+    prior_context: list[tuple[str, str]]
+    task: asyncio.Task | None = None
+    adopted: bool = False
 
 
 def _source_text_ends_sentence(text: str) -> bool:
@@ -356,6 +369,9 @@ class SessionHub:
 
 
 class TranscriptionSession:
+    _early_final: EarlyFinal | None = None
+    _early_final_armed = True
+
     def __init__(
         self,
         websocket: SessionTransport,
@@ -405,6 +421,7 @@ class TranscriptionSession:
             self.worker.remove_status_listener(self._handle_worker_status)
             await self.hub.detach(self.session_id, self)
             await self._finalize_archive()
+            self._cancel_early_final()
             for task in self._jobs:
                 task.cancel()
             await asyncio.gather(*self._jobs, return_exceptions=True)
@@ -449,6 +466,7 @@ class TranscriptionSession:
             else:
                 await self._resume_archive_from_disk()
                 self.state.running = True
+                self._cancel_early_final()
                 self.segmenter.reset()
                 self._finalizing.clear()
                 self._utterance_runtime.clear()
@@ -460,6 +478,7 @@ class TranscriptionSession:
             self._begin_archive()
             self.state.running = True
             self.state.utterance_id = max(self.state.utterance_id, highest_utterance_id)
+            self._cancel_early_final()
             self.segmenter.reset()
             self._finalized.clear()
             self._finalizing.clear()
@@ -539,6 +558,8 @@ class TranscriptionSession:
             runtime.last_audio_frame_unix_seconds = time.time()
             runtime.voiced_audio_samples += FRAME_SAMPLES
 
+        self._track_early_final(result)
+
         if (
             result.speech_active
             # During trailing silence a final is imminent. Starting another
@@ -547,6 +568,7 @@ class TranscriptionSession:
             and result.rms >= MIN_TRANSCRIBABLE_FRAME_RMS
             and DEFAULT_PARTIAL_AST_ENABLED
             and self.state.active_utterance_id not in self._finalizing
+            and self._early_final is None
             and self._active_utterance_has_new_speech_for_partial()
         ):
             audio = self._partial_audio_snapshot(self.segmenter.current_audio())
@@ -581,6 +603,95 @@ class TranscriptionSession:
             reason: CommitReason = "max_utterance_cap" if result.force_flushed else "silero_end"
             await self._commit_utterance(utterance_id, result.audio, reason=reason, reset_segmenter=False)
 
+    def _early_final_quiet_ms(self) -> int:
+        return max(0, int(os.getenv("LIVETR3_EARLY_FINAL_MS", DEFAULT_EARLY_FINAL_QUIET_MS)))
+
+    def _track_early_final(self, result: SegmentResult) -> None:
+        """Start the final decode early in a pause; drop it when speech resumes."""
+        quiet_ms = self.segmenter.trailing_quiet_ms if result.speech_active else 0
+        if quiet_ms == 0:
+            self._early_final_armed = True
+        if self._early_final is not None and (
+            result.speech_started
+            or (result.speech_active and quiet_ms == 0)
+            or (not result.speech_active and not result.speech_ended)
+        ):
+            self._cancel_early_final()
+        threshold_ms = self._early_final_quiet_ms()
+        utterance_id = self.state.active_utterance_id
+        if (
+            not threshold_ms or quiet_ms < threshold_ms or not self._early_final_armed
+            or self._early_final is not None or not self.state.running
+            or utterance_id is None or utterance_id in self._finalizing
+            or utterance_id in self._finalized
+        ):
+            return
+        # One attempt per pause, so a too-quiet chunk isn't re-checked every frame.
+        self._early_final_armed = False
+        audio = self.segmenter.current_audio()
+        # Past the size cap, the segmenter cuts at the next phrase pause, which
+        # is this one, so that cut's own final would wait behind this decode.
+        if audio.size >= self.segmenter.max_utterance_frames * FRAME_SAMPLES:
+            return
+        if not _audio_has_transcribable_energy(_trim_to_transcribable_audio(audio)):
+            return
+        early = EarlyFinal(
+            utterance_id=utterance_id,
+            audio=audio.copy(),
+            config=self.state.config.model_copy(deep=True),
+            prior_context=self._ast_prior_context(),
+        )
+        self._early_final = early
+        # A final decode supersedes this utterance's running preview, as it
+        # would at end-of-speech.
+        self.worker.cancel_active_partial(utterance_id)
+        early.task = asyncio.create_task(
+            self._run_early_final(early), name=f"early-final-ast-{utterance_id}"
+        )
+        trace("early_final_start", session=self.session_id, utterance=utterance_id,
+              samples=audio.size, quiet_ms=quiet_ms)
+
+    async def _run_early_final(self, early: EarlyFinal) -> ASTResult | None:
+        # Cancellation is the normal outcome when speech resumes, and any failure
+        # falls back to an ordinary final decode, so neither escapes this task.
+        try:
+            return await self._submit_ast("final", early.utterance_id, early.audio, early=early)
+        except asyncio.CancelledError:
+            return None
+        except Exception as exc:
+            logger.info("early_final failed utterance_id=%s: %s", early.utterance_id, exc)
+            return None
+
+    def _cancel_early_final(self) -> None:
+        early, self._early_final = self._early_final, None
+        if early is not None and early.task is not None and not early.adopted:
+            early.task.cancel()
+            trace("early_final_cancel", session=self.session_id, utterance=early.utterance_id)
+
+    def _take_early_final(self, utterance_id: int, audio: np.ndarray) -> asyncio.Task | None:
+        """The early decode's task, when the committed chunk only adds pause after it."""
+        early = self._early_final
+        if early is None or early.utterance_id != utterance_id:
+            return None
+        if (
+            early.audio.size > audio.size
+            or not np.array_equal(audio[:early.audio.size], early.audio)
+            or early.config != self.state.config
+            or early.prior_context != self._ast_prior_context()
+        ):
+            self._cancel_early_final()
+            return None
+        self._early_final = None
+        early.adopted = True
+        return early.task
+
+    def _ast_prior_context(self) -> list[tuple[str, str]]:
+        # Model-generated prior captions can repeat an earlier recognition error,
+        # so earlier source text is a default-off replay experiment.
+        if os.getenv("LIVETR3_AST_SOURCE_CONTEXT", "0") != "1":
+            return []
+        return list(self.state.prior_context)
+
     async def _flush_active_final(self) -> None:
         if not self.segmenter.speech_active or self.state.active_utterance_id is None:
             return
@@ -605,6 +716,8 @@ class TranscriptionSession:
             rms, peak, voiced_frames, required_frames = _audio_energy_stats(transcribable_audio)
             if reset_segmenter:
                 self.segmenter.reset()
+            if self._early_final is not None and self._early_final.utterance_id == utterance_id:
+                self._cancel_early_final()
             if self.state.active_utterance_id == utterance_id:
                 self.state.active_utterance_id = None
             self._finalized.add(utterance_id)
@@ -638,7 +751,9 @@ class TranscriptionSession:
                 utterance_id,
                 audio.shape[0] / 16_000,
             )
-            self._schedule_ast("final", utterance_id, audio)
+            # Adopt now: frames processed before the final task first runs may
+            # otherwise drop the early decode.
+            self._schedule_ast("final", utterance_id, audio, self._take_early_final(utterance_id, audio))
             return True
 
     def _schedule_ast(
@@ -646,6 +761,7 @@ class TranscriptionSession:
         priority: str,
         utterance_id: int | None,
         audio: np.ndarray,
+        early_task: asyncio.Task | None = None,
     ) -> None:
         if utterance_id is None:
             return
@@ -655,7 +771,7 @@ class TranscriptionSession:
         ):
             return
         task = asyncio.create_task(
-            self._run_ast(priority, utterance_id, audio.copy()),
+            self._run_ast(priority, utterance_id, audio.copy(), early_task),
             name=f"{priority}-ast-{utterance_id}",
         )
         self._jobs.add(task)
@@ -663,10 +779,16 @@ class TranscriptionSession:
             self._partial_ast_task = task
         task.add_done_callback(self._jobs.discard)
 
-    async def _run_ast(self, priority: str, utterance_id: int, audio: np.ndarray) -> None:
+    async def _run_ast(
+        self,
+        priority: str,
+        utterance_id: int,
+        audio: np.ndarray,
+        early_task: asyncio.Task | None = None,
+    ) -> None:
         started_at = time.monotonic()
         try:
-            await self._run_mlx_ast(priority, utterance_id, audio)
+            await self._run_mlx_ast(priority, utterance_id, audio, early_task)
         finally:
             # Errors, empty decodes, and cancellation must not leave a commit pending.
             if priority == "final":
@@ -679,64 +801,27 @@ class TranscriptionSession:
                     priority, utterance_id, elapsed, audio.size / 16_000,
                 )
 
-    async def _run_mlx_ast(self, priority: str, utterance_id: int, audio: np.ndarray) -> None:
+    async def _run_mlx_ast(
+        self,
+        priority: str,
+        utterance_id: int,
+        audio: np.ndarray,
+        early_task: asyncio.Task | None = None,
+    ) -> None:
         config = self.state.config.model_copy(deep=True)
         runtime = self._utterance_runtime.get(utterance_id)
         snapshot = runtime.partial_audio_snapshot if priority == "partial" and runtime else None
         snapshot_last_audio = runtime.partial_last_audio_unix_seconds if runtime else None
-        async def publish_progress(text: str) -> None:
-            if utterance_id in self._finalized:
-                return
-            if priority == "partial" and utterance_id in self._finalizing:
-                return
-            original, translation = _parse_ast_response(
-                text,
-                self.state.config.target_lang,
-                self.state.config.source_lang,
-            )
-            original = original.strip()
-            translation = translation.strip()
-            if not original:
-                return
-            if not self._should_translate_final(original):
-                translation = original
-            runtime = self._utterance_runtime.setdefault(
-                utterance_id,
-                UtteranceRuntime(partials=deque(maxlen=self._stability_window())),
-            )
-            if (
-                original == runtime.latest_partial_original
-                and translation == runtime.latest_partial_translation
-            ):
-                return
-            runtime.latest_partial_original = original
-            runtime.latest_partial_translation = translation
-            await self._send_and_broadcast(
-                TranscriptMessage(
-                    type="partial",
-                    utterance_id=utterance_id,
-                    original=original,
-                    translation=translation,
-                ).model_dump(exclude_none=True)
-            )
 
         try:
             trace("inference_submit", session=getattr(self, "session_id", ""), utterance=utterance_id, priority=priority, samples=audio.size)
-            result = await self.worker.submit_ast(
-                priority="final" if priority == "final" else "partial",
-                utterance_id=utterance_id,
-                audio_f32_16k=audio,
-                src=self.state.config.source_lang,
-                tgt=self.state.config.target_lang,
-                # Model-generated prior captions can repeat an earlier recognition error,
-                # so earlier source text is a default-off replay experiment.
-                prior_context=(list(self.state.prior_context)
-                               if os.getenv("LIVETR3_AST_SOURCE_CONTEXT", "0") == "1" else []),
-                custom_vocab=self.state.config.custom_vocab,
-                code_switching_enabled=self.state.config.code_switching_enabled,
-                max_tokens=self._max_tokens_for_ast(priority, audio),
-                on_progress=publish_progress,
-            )
+            result = None
+            if early_task is not None:
+                result = await early_task
+                trace("early_final_adopt", session=getattr(self, "session_id", ""),
+                      utterance=utterance_id, decoded=result is not None)
+            if result is None:
+                result = await self._submit_ast(priority, utterance_id, audio)
         except asyncio.CancelledError:
             raise
         except InferenceTimeoutError as exc:
@@ -797,6 +882,66 @@ class TranscriptionSession:
 
         await self._publish_final_result(utterance_id, result)
 
+    async def _submit_ast(
+        self,
+        priority: str,
+        utterance_id: int,
+        audio: np.ndarray,
+        *,
+        early: EarlyFinal | None = None,
+    ) -> ASTResult | None:
+        async def publish_progress(text: str) -> None:
+            if utterance_id in self._finalized:
+                return
+            if priority == "partial" and utterance_id in self._finalizing:
+                return
+            if early is not None and not early.adopted and self._early_final is not early:
+                return
+            original, translation = _parse_ast_response(
+                text,
+                self.state.config.target_lang,
+                self.state.config.source_lang,
+            )
+            original = original.strip()
+            translation = translation.strip()
+            if not original:
+                return
+            if not self._should_translate_final(original):
+                translation = original
+            runtime = self._utterance_runtime.setdefault(
+                utterance_id,
+                UtteranceRuntime(partials=deque(maxlen=self._stability_window())),
+            )
+            if (
+                original == runtime.latest_partial_original
+                and translation == runtime.latest_partial_translation
+            ):
+                return
+            runtime.latest_partial_original = original
+            runtime.latest_partial_translation = translation
+            await self._send_and_broadcast(
+                TranscriptMessage(
+                    type="partial",
+                    utterance_id=utterance_id,
+                    original=original,
+                    translation=translation,
+                ).model_dump(exclude_none=True)
+            )
+
+        return await self.worker.submit_ast(
+            priority="final" if priority == "final" else "partial",
+            utterance_id=utterance_id,
+            audio_f32_16k=audio,
+            src=self.state.config.source_lang,
+            tgt=self.state.config.target_lang,
+            prior_context=self._ast_prior_context(),
+            custom_vocab=self.state.config.custom_vocab,
+            code_switching_enabled=self.state.config.code_switching_enabled,
+            max_tokens=self._max_tokens_for_ast(priority, audio),
+            on_progress=publish_progress,
+            **({"early": True} if early is not None else {}),
+        )
+
     async def _commit_decoded_prefix(
         self,
         utterance_id: int,
@@ -829,6 +974,7 @@ class TranscriptionSession:
                 return False
             if not self.segmenter.split_decoded_prefix(snapshot):
                 return False
+            self._cancel_early_final()
             self._finalizing[utterance_id] = "decoded_prefix"
             self.worker.finish_partials(utterance_id)
             runtime = self._utterance_runtime[utterance_id]
@@ -1072,6 +1218,7 @@ class TranscriptionSession:
                 "partial_interval_seconds": partial_interval_seconds,
             }
         )
+        self._cancel_early_final()
         try:
             self.segmenter = self._build_segmenter(self.state.config)
         except Exception as exc:

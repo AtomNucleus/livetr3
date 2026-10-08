@@ -476,6 +476,7 @@ class _QueuedJob:
     payload: dict = field(compare=False)
     enqueued_at: float = field(default_factory=time.monotonic, compare=False)
     on_progress: Callable[[str], Awaitable[None]] | None = field(default=None, compare=False)
+    cancellable: bool = field(default=False, compare=False)
 
 
 class MLXWorkerService:
@@ -560,7 +561,11 @@ class MLXWorkerService:
         code_switching_enabled: bool,
         max_tokens: int,
         on_progress: Callable[[str], Awaitable[None]] | None = None,
+        early: bool = False,
     ) -> ASTResult | None:
+        """Decode one chunk. An early final is a final-quality decode started
+        before end-of-speech: it does not retire the utterance's previews, and
+        cancelling the awaiting task also stops it on the model worker."""
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
         job = _QueuedJob(
@@ -569,6 +574,7 @@ class MLXWorkerService:
             kind="ast",
             future=future,
             on_progress=on_progress,
+            cancellable=priority == "partial" or early,
             payload={
                 "priority": priority,
                 "utterance_id": utterance_id,
@@ -581,7 +587,7 @@ class MLXWorkerService:
                 "max_tokens": max_tokens,
             },
         )
-        if utterance_id is not None:
+        if utterance_id is not None and not early:
             previous = self._queued_partial_jobs.get(utterance_id)
             if priority == "partial":
                 if utterance_id in self._final_utterance_ids:
@@ -597,7 +603,12 @@ class MLXWorkerService:
                     if not previous.future.done():
                         previous.future.set_result(None)
         await self._queue.put(job)
-        return await future
+        try:
+            return await future
+        except asyncio.CancelledError:
+            if job.cancellable and self._active_job is job:
+                self._cancelled_job_id.value = job.sequence
+            raise
 
     async def submit_polish(self, text: str) -> str:
         loop = asyncio.get_running_loop()
@@ -624,6 +635,14 @@ class MLXWorkerService:
         job = self._queued_partial_jobs.pop(utterance_id, None)
         if job is not None and not job.future.done():
             job.future.set_result(None)
+
+    def cancel_active_partial(self, utterance_id: int) -> None:
+        """Stop the running preview of an utterance that may still continue."""
+        active = self._active_job
+        if (active is not None and active.kind == "ast"
+                and active.payload.get("priority") == "partial"
+                and active.payload.get("utterance_id") == utterance_id):
+            self._cancelled_job_id.value = active.sequence
 
 
     async def submit_maintenance(self) -> None:
@@ -760,10 +779,7 @@ class MLXWorkerService:
         request = {
             "job_id": job.sequence,
             "kind": job.kind,
-            "cancellable": (
-                job.kind == "ast"
-                and job.payload.get("priority") == "partial"
-            ),
+            "cancellable": job.kind == "ast" and job.cancellable,
             "payload": payload,
         }
         await asyncio.to_thread(self._request_queue.put, request)
