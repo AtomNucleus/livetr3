@@ -40,6 +40,8 @@ class RMSGate:
         min_utterance_ms: int = 800,
         max_utterance_s: float = 25.0,
         overlap_s: float = 0.5,
+        cap_extend_s: float = 0.0,
+        cap_pause_ms: int = 0,
     ) -> None:
         self.threshold = threshold
         self.trailing_silence_frames = max(1, trailing_silence_ms // 20)
@@ -48,7 +50,12 @@ class RMSGate:
         # no caller can hand the worker a chunk that needs to be silently trimmed.
         safe_max_utterance_s = min(float(max_utterance_s), MAX_UTTERANCE_SECONDS)
         self.max_utterance_frames = max(1, int(safe_max_utterance_s / FRAME_SECONDS))
+        # Past the cap, wait up to cap_extend_s for a brief dip before forcing a
+        # cut through continuous speech, which splits or repeats a word.
+        safe_hard_cap_s = min(safe_max_utterance_s + max(0.0, float(cap_extend_s)), MAX_UTTERANCE_SECONDS)
+        self.hard_max_utterance_frames = max(self.max_utterance_frames, int(safe_hard_cap_s / FRAME_SECONDS))
         self.overlap_frames = max(0, int(overlap_s / 0.02))
+        self.cap_pause_frames = max(0, int(cap_pause_ms) // 20) if cap_extend_s > 0 else 0
         self._pre_roll: deque[np.ndarray] = deque(maxlen=self.overlap_frames)
         self._current: list[np.ndarray] = []
         self._speech_active = False
@@ -78,17 +85,38 @@ class RMSGate:
         self._current = self._current[max(0, boundary - self.overlap_frames):]
         return True
 
-    def _cap_cut(self) -> tuple[int, int]:
-        """Frames to flush at the size cap, and frames of overlap to repeat."""
+    def _cap_cut(self) -> tuple[int, int] | None:
+        """Frames to flush at the size cap and frames of overlap to repeat, or
+        None to keep listening for a pause until the hard cap."""
         frames = len(self._current)
         if self._cap_is_end_of_speech():
             return frames, 0
         rms = np.sqrt(np.mean(np.square(np.stack(self._current)), axis=1))
+        quiet = CAP_CUT_QUIET_RATIO * float(np.median(rms))
+        start = max(frames // 2, frames - CAP_CUT_SEARCH_FRAMES)
+        if self.cap_pause_frames and frames < self.hard_max_utterance_frames:
+            # Before the hard cap, only a phrase pause will do: a gap between
+            # words still splits the sentence the model needs to translate.
+            run = 0
+            for index in range(frames - 1, start - 1, -1):
+                run = run + 1 if rms[index] <= quiet else 0
+                if run >= self.cap_pause_frames:
+                    end = index + run
+                    while end < frames and rms[end] <= quiet:
+                        end += 1
+                    return (index + end) // 2, 0
+            return None
         local = lambda cut: float(np.mean(rms[max(0, cut - 2):cut + 2]))
-        # Ties keep the latest cut, i.e. the longest chunk.
-        cut = min(range(frames, max(frames // 2, frames - CAP_CUT_SEARCH_FRAMES) - 1, -1), key=local)
-        if local(cut) <= CAP_CUT_QUIET_RATIO * float(np.median(rms)):
+        if frames > self.max_utterance_frames and not self.cap_pause_frames:
+            # Already searched up to the soft cap; only the newest cut point is new.
+            cut = frames - 2
+        else:
+            # Ties keep the latest cut, i.e. the longest chunk.
+            cut = min(range(frames, start - 1, -1), key=local)
+        if local(cut) <= quiet:
             return cut, 0
+        if frames < self.hard_max_utterance_frames:
+            return None
         return frames, self.overlap_frames
 
     def _cap_is_end_of_speech(self) -> bool:
@@ -134,8 +162,9 @@ class RMSGate:
         else:
             self._below_threshold_frames += 1
 
-        if len(self._current) >= self.max_utterance_frames:
-            cut, overlap = self._cap_cut()
+        cap_cut = self._cap_cut() if len(self._current) >= self.max_utterance_frames else None
+        if cap_cut is not None:
+            cut, overlap = cap_cut
             audio = np.concatenate(self._current[:cut]).astype(np.float32, copy=False)
             carry = self._current[max(0, cut - overlap):]
             force_flushed = True
@@ -168,6 +197,8 @@ class SileroVAD(RMSGate):
         min_silence_ms: int = 400,
         min_utterance_ms: int = 800,
         max_utterance_s: float = 25.0,
+        cap_extend_s: float = 0.0,
+        cap_pause_ms: int = 0,
     ) -> None:
         super().__init__(
             threshold=0.01,
@@ -175,6 +206,8 @@ class SileroVAD(RMSGate):
             min_utterance_ms=min_utterance_ms,
             max_utterance_s=max_utterance_s,
             overlap_s=speech_pad_ms / 1000,
+            cap_extend_s=cap_extend_s,
+            cap_pause_ms=cap_pause_ms,
         )
         try:
             import torch
@@ -279,6 +312,8 @@ def make_segmenter(
     speech_pad_ms: int = 300,
     min_silence_ms: int = 400,
     max_utterance_s: float = 25.0,
+    cap_extend_s: float = 0.0,
+    cap_pause_ms: int = 0,
 ) -> RMSGate:
     if name == "silero":
         return SileroVAD(
@@ -286,6 +321,8 @@ def make_segmenter(
             speech_pad_ms=speech_pad_ms,
             min_silence_ms=min_silence_ms,
             max_utterance_s=max_utterance_s,
+            cap_extend_s=cap_extend_s,
+            cap_pause_ms=cap_pause_ms,
         )
     raise ValueError("Only the Silero VAD segmenter is enabled for this build.")
 
