@@ -32,15 +32,25 @@ private struct ProjectorTranscriptView: View {
                 sourceLanguage: sourceLanguage, targetLanguage: targetLanguage, connectionError: connectionError)
         } else {
         GeometryReader { geometry in
-            ProjectorLiveCaptionStage(
-                entries: transcript.displayEntries,
-                layout: ProjectorCaptionLayout(size: geometry.size,
-                    requestedFontSize: sessionManager.projectorFontSize,
-                    style: sessionManager.projectorStyle),
-                sourceLanguage: sourceLanguage,
-                targetLanguage: targetLanguage,
-                status: connectionError ?? transcript.lastError
-            )
+            let layout = ProjectorCaptionLayout(size: geometry.size,
+                requestedFontSize: sessionManager.projectorFontSize,
+                style: sessionManager.projectorStyle)
+            if layout.style == .rollUp {
+                ProjectorRollUpStage(
+                    entries: transcript.displayEntries,
+                    layout: layout,
+                    targetLanguage: targetLanguage,
+                    status: connectionError ?? transcript.lastError
+                )
+            } else {
+                ProjectorLiveCaptionStage(
+                    entries: transcript.displayEntries,
+                    layout: layout,
+                    sourceLanguage: sourceLanguage,
+                    targetLanguage: targetLanguage,
+                    status: connectionError ?? transcript.lastError
+                )
+            }
         }
         }
     }
@@ -58,7 +68,7 @@ struct ProjectorLiveCaptionStage: View {
     var body: some View {
         VStack(spacing: 16) {
             switch layout.style {
-            case .focus:
+            case .focus, .rollUp:
                 lane(source: false)
             case .split:
                 HStack(spacing: 24) {
@@ -174,7 +184,7 @@ struct ProjectorCaptionStage: View {
             let target = isDraft && isTranslationPending ? "Translating…"
                 : isDraft ? layout.prefix(caption.translation, source: false, balancePages: false) : caption.translation
             switch layout.style {
-            case .focus:
+            case .focus, .rollUp:
                 lane(target, previous: previous?.translation, source: false,
                      title: title(targetLanguage, draft: isDraft, continuation: caption.isContinuation),
                      fontSize: layout.fontSize, language: targetLanguage)
