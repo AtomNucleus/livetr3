@@ -1,0 +1,3 @@
+Generated with the built-in image_gen tool.
+
+Use case: logo-brand. Create a finished macOS app icon for Cadenza, a local bilingual speech caption app. A single sculptural ribbon forms two interlocking flowing speech waves, one warm ivory and one soft turquoise, on a deep midnight teal rounded-square tile. Restrained luminous depth, beautifully clean silhouette, centered generous margins, readable at 32 pixels, elegant Apple desktop icon quality. Square image, tile fills the canvas. No text, no letters, no microphone pictogram, no watermark. Save the generated icon image.
