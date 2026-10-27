@@ -37,7 +37,7 @@ async def replay(name, worker, audio, output, reference, id_base, cap, silence_m
     from protocol import ConfigMessage
     from session import SessionHub, TranscriptionSession
     if competing_workers():
-        raise RuntimeError('Live engine worker exists; stop capture before replay')
+        raise RuntimeError('A LiveTR3 engine worker is loaded; quit LiveTR3 before replaying')
     clip_seconds = audio.size / 16000
     audio = np.concatenate([audio, np.zeros(32000, dtype='float32')])
     capture = WallCapture(output / f'{name}.jsonl')
@@ -59,7 +59,7 @@ async def replay(name, worker, audio, output, reference, id_base, cap, silence_m
         for offset in range(0, audio.size, 320):
             await asyncio.sleep(max(0, start + offset / 16000 - time.monotonic()))
             if offset % 16000 == 0 and competing_workers():
-                raise RuntimeError('Live capture worker resumed; comparison aborted')
+                raise RuntimeError('A LiveTR3 engine worker started; comparison aborted')
             frame = audio[offset:offset + 320]
             if frame.size < 320:
                 frame = np.pad(frame, (0, 320 - frame.size))
