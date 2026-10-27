@@ -495,6 +495,7 @@ class MLXWorkerService:
         self._response_queue: mp.Queue | None = None
         self._active_job_kind: Literal["ast", "polish", "maintenance"] | None = None
         self._queued_partial_jobs: dict[int, _QueuedJob] = {}
+        self._pause_jobs: dict[int, _QueuedJob] = {}
         self._final_utterance_ids: set[int] = set()
         self._mp_context = mp.get_context("spawn")
         self._cancelled_job_id = self._mp_context.Value("q", -1)
@@ -550,7 +551,10 @@ class MLXWorkerService:
     async def submit_ast(
         self,
         *,
-        priority: Literal["partial", "final"],
+        # "pause" is a final decode started at a pause, before its commit: the
+        # same request as the final, queued like one, but cancellable and not
+        # retired by finish_partials.
+        priority: Literal["partial", "final", "pause"],
         utterance_id: int | None,
         audio_f32_16k: np.ndarray,
         src: str,
@@ -581,6 +585,16 @@ class MLXWorkerService:
                 "max_tokens": max_tokens,
             },
         )
+        if priority == "pause":
+            if utterance_id is not None:
+                self.cancel_pause_decode(utterance_id)
+                self._pause_jobs[utterance_id] = job
+            await self._queue.put(job)
+            try:
+                return await future
+            finally:
+                if utterance_id is not None and self._pause_jobs.get(utterance_id) is job:
+                    self._pause_jobs.pop(utterance_id)
         if utterance_id is not None:
             previous = self._queued_partial_jobs.get(utterance_id)
             if priority == "partial":
@@ -616,6 +630,10 @@ class MLXWorkerService:
     def finish_partials(self, utterance_id: int) -> None:
         """Retire queued previews immediately when audio commits, before final ASR finishes."""
         self._final_utterance_ids.add(utterance_id)
+        self.cancel_partials(utterance_id)
+
+    def cancel_partials(self, utterance_id: int) -> None:
+        """Drop this utterance's queued and running previews; later ones still run."""
         active = self._active_job
         if (active is not None and active.kind == "ast"
                 and active.payload.get("priority") == "partial"
@@ -625,6 +643,14 @@ class MLXWorkerService:
         if job is not None and not job.future.done():
             job.future.set_result(None)
 
+    def cancel_pause_decode(self, utterance_id: int) -> None:
+        job = self._pause_jobs.pop(utterance_id, None)
+        if job is None:
+            return
+        if self._active_job is job:
+            self._cancelled_job_id.value = job.sequence
+        elif not job.future.done():
+            job.future.set_result(None)
 
     async def submit_maintenance(self) -> None:
         loop = asyncio.get_running_loop()
@@ -757,12 +783,15 @@ class MLXWorkerService:
                 for key, value in job.payload.items()
                 if key != "utterance_id"
             }
+            if payload.get("priority") == "pause":
+                # Decode exactly as the final would, retry budget included.
+                payload["priority"] = "final"
         request = {
             "job_id": job.sequence,
             "kind": job.kind,
             "cancellable": (
                 job.kind == "ast"
-                and job.payload.get("priority") == "partial"
+                and job.payload.get("priority") in {"partial", "pause"}
             ),
             "payload": payload,
         }
