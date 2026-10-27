@@ -128,6 +128,7 @@ class UtteranceRuntime:
     latest_partial_translation: str = ""
     partial_audio_snapshot: np.ndarray | None = None
     partial_last_audio_unix_seconds: float | None = None
+    preview_sources: list[str] = field(default_factory=list)
 
 
 def _source_text_ends_sentence(text: str) -> bool:
@@ -242,6 +243,27 @@ def _drop_repeated_lead(previous: str, text: str, max_words: int = 3) -> str:
         if all(lead) and lead == tail[-count:]:
             return " ".join(tokens[count:])
     return text
+
+
+def _agreed_source_prefix(previous: str, latest: str) -> str:
+    """LocalAgreement-2: the words two consecutive previews agree on, in the
+    latest preview's spelling. A shared last word may be cut off by the audio
+    end, so agreement must stop short of one hypothesis's end. Under two words
+    is not worth forcing."""
+    key = lambda word: re.sub(r"[^\w']", "", word.casefold())
+    first, second = previous.split(), latest.split()
+    count = 0
+    while count < min(len(first), len(second)) and key(first[count]) == key(second[count]):
+        count += 1
+    if count == min(len(first), len(second)):
+        count -= 1
+    return " ".join(second[:count]) if count >= 2 else ""
+
+
+def _la2_prefix_mode() -> str:
+    """LIVETR3_LA2_PREFIX: off (default), previews, or all (previews and finals)."""
+    mode = os.getenv("LIVETR3_LA2_PREFIX", "off")
+    return mode if mode in {"previews", "all"} else "off"
 
 
 def _ends_with_decoded_prefix_pause(audio: np.ndarray) -> bool:
@@ -720,6 +742,15 @@ class TranscriptionSession:
                 ).model_dump(exclude_none=True)
             )
 
+        prefix_kwargs = {}
+        mode = _la2_prefix_mode()
+        if runtime is not None and len(runtime.preview_sources) >= 2 and (
+                mode == "all" or (mode == "previews" and priority == "partial")):
+            source_prefix = _agreed_source_prefix(*runtime.preview_sources[-2:])
+            if source_prefix:
+                prefix_kwargs["source_prefix"] = source_prefix
+                trace("la2_prefix", utterance=utterance_id, priority=priority,
+                      words=len(source_prefix.split()))
         try:
             trace("inference_submit", session=getattr(self, "session_id", ""), utterance=utterance_id, priority=priority, samples=audio.size)
             result = await self.worker.submit_ast(
@@ -736,6 +767,7 @@ class TranscriptionSession:
                 code_switching_enabled=self.state.config.code_switching_enabled,
                 max_tokens=self._max_tokens_for_ast(priority, audio),
                 on_progress=publish_progress,
+                **prefix_kwargs,
             )
         except asyncio.CancelledError:
             raise
@@ -773,6 +805,7 @@ class TranscriptionSession:
                 utterance_id,
                 UtteranceRuntime(partials=deque(maxlen=self._stability_window())),
             )
+            runtime.preview_sources = [*runtime.preview_sources[-1:], original.strip()]
             merged_original = original.strip()
             merged_translation = (
                 translation.strip() if self._should_translate_final(merged_original) else merged_original
