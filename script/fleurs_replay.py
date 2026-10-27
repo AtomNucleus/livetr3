@@ -114,7 +114,11 @@ async def main(args):
     if args.clips:
         clips = [path for path in clips if path.stem in args.clips.split(',')]
     git = lambda *cmd: subprocess.check_output(['git', *cmd], cwd=root, text=True)
+    paths = {'LIVETR3_TEMP_WAV_ROOT', 'LIVETR3_ARCHIVE_ROOT', 'LIVETR3_BACKEND_TRACE'}
     metadata = dict(mode=args.mode, model=MODEL_PATH, prompt=AST_PROMPT,
+                    eval_dir=str(args.eval_dir.resolve()),
+                    flags={k: v for k, v in sorted(os.environ.items())
+                           if k.startswith(('LIVETR3_', 'MLX_')) and k not in paths},
                     conditions=args.conditions, clips=[path.stem for path in clips],
                     commit=git('rev-parse', 'HEAD').strip(),
                     worktree_diff_sha256=hashlib.sha256(git('diff', 'HEAD').encode()).hexdigest(),
