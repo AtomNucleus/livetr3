@@ -19,7 +19,6 @@ import re
 from pathlib import Path
 
 import numpy as np
-import pyarrow.parquet as pq
 import soundfile as sf
 
 RATE = 16_000
@@ -40,12 +39,19 @@ def frame_rms(audio):
     return np.sqrt(np.mean(np.square(frames), axis=1))
 
 
-def prepare(audio):
-    # Level first, so quiet recordings trim against the same speech level.
+def level(audio):
+    """Scale speech to the live p95 frame RMS; None for a silent recording."""
     p95 = float(np.percentile(frame_rms(audio), 95))
     if p95 < 1e-5:
         return None
-    audio = np.clip(audio * (SPEECH_P95_RMS / p95), -1, 1).astype(np.float32)
+    return np.clip(audio * (SPEECH_P95_RMS / p95), -1, 1).astype(np.float32)
+
+
+def prepare(audio):
+    # Level first, so quiet recordings trim against the same speech level.
+    audio = level(audio)
+    if audio is None:
+        return None
     levels = frame_rms(audio)
     voiced = np.flatnonzero(levels >= TRIM_RMS)
     pad = int(TRIM_PAD_SECONDS * RATE / FRAME)
@@ -54,6 +60,8 @@ def prepare(audio):
 
 
 def main(args):
+    import pyarrow.parquet as pq
+
     rows = pq.read_table(args.fleurs / "parquet-data/en_us/test-00000-of-00001.parquet",
                          columns=["id", "audio", "raw_transcription", "gender"]).to_pylist()
     spanish = {}
