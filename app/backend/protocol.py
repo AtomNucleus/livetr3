@@ -91,6 +91,8 @@ class TranscriptMessage(BaseModel):
     translation: str
     commit_reason: Literal["punctuation", "stability", "silero_end", "max_utterance_cap", "decoded_prefix"] | None = None
     last_audio_frame_unix_seconds: float | None = None
+    # Set on finals while LIVETR3_PAUSE_DECODE is on: published from the pause decode.
+    pause_decode_reused: bool | None = None
 
 
 class LevelMessage(BaseModel):
