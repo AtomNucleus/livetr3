@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from math import sqrt
+import os
 
 import numpy as np
 
@@ -28,6 +29,9 @@ class SegmentResult:
     speech_ended: bool = False
     force_flushed: bool = False
     audio: np.ndarray | None = None
+    # Samples of audio up to Silero's speech end (the silence start plus the
+    # speech pad), when the utterance ended in a Silero-detected pause.
+    pause_samples: int | None = None
 
 
 class RMSGate:
@@ -132,6 +136,10 @@ class RMSGate:
     def _rollover(self) -> None:
         self.reset()
 
+    def pause_audio(self) -> np.ndarray | None:
+        """The utterance up to its speech end, once a pause has run past the speech pad."""
+        return None
+
     def ingest(self, frame: np.ndarray) -> SegmentResult:
         frame = _coerce_frame(frame)
         rms = float(sqrt(float(np.mean(np.square(frame)))))
@@ -190,6 +198,17 @@ class RMSGate:
 class SileroVAD(RMSGate):
     """Silero-backed VAD with the same streaming output contract as RMSGate."""
 
+    # Absolute sample positions: samples ingested, samples Silero has consumed,
+    # where its sample counter restarted, and the current pause's speech end
+    # (silence start plus pad) with whether the pad has elapsed.
+    _ingested = 0
+    _consumed = 0
+    _iterator_origin = 0
+    _speech_end: int | None = None
+    _pause_ready = False
+    _speech_pad_samples = 4800
+    _pause_delay_samples = 0
+
     def __init__(
         self,
         threshold: float = 0.5,
@@ -232,16 +251,37 @@ class SileroVAD(RMSGate):
         self._silent_frames = 0
         self._speech_rms: deque[float] = deque(maxlen=int(MAX_UTTERANCE_SECONDS / FRAME_SECONDS))
         self._end_event_pending = False
+        self._speech_pad_samples = int(SAMPLE_RATE * speech_pad_ms / 1000)
+        # Extra silence before a pause decode starts; the window still ends at the pad.
+        self._pause_delay_samples = int(SAMPLE_RATE * int(os.getenv("LIVETR3_PAUSE_DECODE_DELAY_MS", "0")) / 1000)
 
     def reset(self) -> None:
         super().reset()
         self._silero_active = False
         self._silent_frames = 0
         self._speech_rms.clear()
+        self._speech_end = None
+        self._pause_ready = False
         try:
             self._vad_iterator.reset_states()
         except AttributeError:
             pass
+        # Pending samples survive the reset and are the iterator's next input.
+        self._iterator_origin = self._consumed
+
+    def _samples_before(self, end: int | None) -> int | None:
+        """Samples of the current utterance before absolute position end."""
+        if end is None or not self._current:
+            return None
+        start = self._ingested - len(self._current) * FRAME_SAMPLES
+        count = end - start
+        return count if 0 < count < len(self._current) * FRAME_SAMPLES else None
+
+    def pause_audio(self) -> np.ndarray | None:
+        if not self._speech_active or not self._pause_ready:
+            return None
+        count = self._samples_before(self._speech_end)
+        return None if count is None else self.current_audio()[:count]
 
     def _cap_is_end_of_speech(self) -> bool:
         # Nothing follows a real end of speech, so carry nothing past it.
@@ -256,14 +296,17 @@ class SileroVAD(RMSGate):
         frame = _coerce_frame(frame)
         rms = float(sqrt(float(np.mean(np.square(frame)))))
         self._pending = np.concatenate([self._pending, frame])
+        self._ingested += FRAME_SAMPLES
         event: dict | None = None
         while self._pending.shape[0] >= 512:
             chunk = self._pending[:512]
             self._pending = self._pending[512:]
             tensor = self._torch.from_numpy(chunk)
             maybe_event = self._vad_iterator(tensor, return_seconds=False)
+            self._consumed += 512
             if maybe_event:
                 event = maybe_event
+            self._track_pause(maybe_event)
 
         parent_threshold = self.threshold
         if event and "start" in event:
@@ -292,6 +335,7 @@ class SileroVAD(RMSGate):
             self.reset()
         if end_event and not result.speech_ended:
             audio = self.current_audio()
+            pause_samples = self._samples_before(self._speech_end)
             speech_ended = len(self._current) >= self.min_utterance_frames
             self.reset()
             return SegmentResult(
@@ -300,8 +344,26 @@ class SileroVAD(RMSGate):
                 speech_started=result.speech_started,
                 speech_ended=speech_ended,
                 audio=audio if speech_ended else None,
+                pause_samples=pause_samples if speech_ended else None,
             )
         return result
+
+    def _track_pause(self, event: dict | None) -> None:
+        iterator = self._vad_iterator
+        temp_end = getattr(iterator, "temp_end", 0)
+        current_sample = getattr(iterator, "current_sample", 0)
+        if event and "end" in event:
+            self._speech_end = self._iterator_origin + int(event["end"])
+            self._pause_ready = True
+        elif (getattr(iterator, "triggered", False) is True and isinstance(temp_end, int) and temp_end
+              and isinstance(current_sample, int)):
+            # Silero's end point for this pause: silence start plus the pad.
+            self._speech_end = self._iterator_origin + temp_end - 512 + self._speech_pad_samples
+            self._pause_ready = current_sample - temp_end >= self._speech_pad_samples + self._pause_delay_samples
+        else:
+            # Speech (or no pause yet): any earlier pause no longer ends it.
+            self._speech_end = None
+            self._pause_ready = False
 
 
 def make_segmenter(

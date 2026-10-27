@@ -18,4 +18,5 @@ if platform.system() != "Darwin" or platform.machine() != "arm64":
         "test_cap_repeat.py",
         "test_cancellable_prefill.py",
         "test_la2_prefix.py",
+        "test_pause_decode.py",
     ]
