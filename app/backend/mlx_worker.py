@@ -162,6 +162,7 @@ class MLXWorker:
         priority: Literal["partial", "final"] = "final",
         cancelled: Callable[[], bool] | None = None,
         on_progress: Callable[[str], None] | None = None,
+        source_prefix: str = "",
     ) -> ASTResult | None:
         audio_f32_16k = np.asarray(audio_f32_16k, dtype=np.float32).reshape(-1)
         if audio_f32_16k.shape[0] > AST_MAX_AUDIO_SECONDS * 16_000:
@@ -213,6 +214,8 @@ class MLXWorker:
                 prompt_text,
                 num_audios=1,
             )
+            # The model continues an agreed source prefix as if it had written it.
+            formatted += source_prefix
             def generate_once(token_budget: int) -> ASTResult | None:
                 if cancelled is not None and cancelled():
                     return None
@@ -266,7 +269,7 @@ class MLXWorker:
                         piece = getattr(response, "text", None)
                         if isinstance(piece, str):
                             pieces.append(piece)
-                        output = "".join(pieces)
+                        output = source_prefix + "".join(pieces)
                         if output and on_progress is not None:
                             progress_text = _streaming_ast_progress_text(output, tgt, src)
                             if progress_text and progress_text != last_progress_text:
@@ -293,7 +296,7 @@ class MLXWorker:
                     if callable(close):
                         close()
 
-                output = "".join(pieces)
+                output = source_prefix + "".join(pieces)
                 original, translation = _parse_ast_response(output, tgt, src)
                 truncated = _generation_was_truncated(latest_response, token_budget)
                 complete = bool(original and translation and not truncated)
@@ -604,6 +607,7 @@ class MLXWorkerService:
         code_switching_enabled: bool,
         max_tokens: int,
         on_progress: Callable[[str], Awaitable[None]] | None = None,
+        source_prefix: str = "",
     ) -> ASTResult | None:
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
@@ -623,6 +627,7 @@ class MLXWorkerService:
                 "custom_vocab": custom_vocab,
                 "code_switching_enabled": code_switching_enabled,
                 "max_tokens": max_tokens,
+                **({"source_prefix": source_prefix} if source_prefix else {}),
             },
         )
         if utterance_id is not None:

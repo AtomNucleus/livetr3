@@ -53,16 +53,17 @@ def test_only_cancellable_jobs_get_the_small_prefill_chunk(monkeypatch, tmp_path
 def test_cancel_during_prefill_returns_no_result_and_keeps_mtp(monkeypatch, tmp_path):
     monkeypatch.setattr(mlx_worker, "CANCELLABLE_PREFILL_CHUNK", 32)
     _patch_mlx(monkeypatch, [])
-    calls, armed = [], []
+    calls, armed, flag = [], [], [False]
     def generate(*args, **kwargs):
         calls.append(kwargs)
         armed.append(worker._generation_cancelled)
-        raise GenerationCancelled  # what the hook raises mid-prefill
+        flag[0] = True  # the cancel arrives mid-prefill and the hook raises
+        raise GenerationCancelled
         yield
     sys.modules["mlx_vlm"].stream_generate = generate
     worker = _worker(tmp_path)
     draft = worker._draft_model = object()
-    cancelled = lambda: True
+    cancelled = lambda: flag[0]
     assert worker.ast(np.ones(16000), "English", "Spanish", [], priority="partial",
                       cancelled=cancelled) is None
     assert armed == [cancelled] and worker._generation_cancelled is None
