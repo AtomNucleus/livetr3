@@ -891,7 +891,10 @@ class TranscriptionSession:
         if window is None or not _audio_has_transcribable_energy(_trim_to_transcribable_audio(window)):
             return
         # A preview of this utterance is now stale; the pause decode replaces it.
-        self.worker.cancel_partials(utterance_id)
+        # Experiment: keeping it lets a decoded-prefix handoff still use it if
+        # speech resumes, at the cost of the pause decode queueing behind it.
+        if os.getenv("LIVETR3_PAUSE_DECODE_CANCEL_PREVIEW", "1") == "1":
+            self.worker.cancel_partials(utterance_id)
         runtime.pause_audio = window.copy()
         runtime.pause_request = self._ast_request()
         trace("pause_decode_start", session=self.session_id, utterance=utterance_id, samples=window.size)
