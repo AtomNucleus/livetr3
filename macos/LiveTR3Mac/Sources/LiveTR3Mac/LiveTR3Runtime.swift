@@ -148,6 +148,9 @@ final class LiveTR3Runtime: ObservableObject {
         process.environment = Self.engineEnvironment(backend: workingDirectory)
         process.standardOutput = logHandle
         process.standardError = logHandle
+        // Captions are user-facing work; the engine and the model worker it
+        // spawns inherit this QoS.
+        process.qualityOfService = .userInitiated
         try process.run()
         return process
     }

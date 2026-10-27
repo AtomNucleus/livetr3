@@ -13,9 +13,12 @@ from session import SessionHub, TranscriptionSession
 from transport import FRAME_TEXT, HEADER, UnixSocketTransport
 
 
+# Long enough to keep Gemma loaded across a service's pauses and breaks, so a
+# restart does not wait for a model load; an unused worker is still released.
 IDLE_UNLOAD_SECONDS = max(
-    5.0, float(os.getenv("MLX_WORKER_IDLE_UNLOAD_SECONDS", "45"))
+    5.0, float(os.getenv("MLX_WORKER_IDLE_UNLOAD_SECONDS", "1800"))
 )
+IDLE_POLL_SECONDS = 2.0
 
 
 class EngineHost:
@@ -23,6 +26,7 @@ class EngineHost:
         self.worker = MLXWorkerService()
         self.hub = SessionHub()
         self._idle_task: asyncio.Task[None] | None = None
+        self._preload_task: asyncio.Task[None] | None = None
         self._stopped = asyncio.Event()
 
     async def start(self, socket_path: Path) -> None:
@@ -33,15 +37,19 @@ class EngineHost:
         server = await asyncio.start_unix_server(self._handle_client, path=str(socket_path))
         self._idle_task = asyncio.create_task(self._idle_unloader())
         print(json.dumps({"type": "engine_ready", "socket": str(socket_path)}), flush=True)
+        # Load the model behind the ready socket; Start joins this load through
+        # the worker's start lock instead of beginning its own.
+        self._preload_task = asyncio.create_task(self._preload_worker(), name="mlx-worker-preload")
 
         async with server:
             await self._stopped.wait()
             server.close()
             await server.wait_closed()
 
-        if self._idle_task is not None:
-            self._idle_task.cancel()
-            await asyncio.gather(self._idle_task, return_exceptions=True)
+        tasks = [task for task in (self._preload_task, self._idle_task) if task is not None]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         await self.worker.stop()
         if socket_path.exists():
             socket_path.unlink()
@@ -81,10 +89,19 @@ class EngineHost:
         except Exception:
             return {}
 
+    async def _preload_worker(self) -> None:
+        try:
+            await self.worker.start()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # The worker reports "failed" to clients; the next Start retries.
+            print(json.dumps({"type": "worker_preload_failed", "error": str(exc)}), flush=True)
+
     async def _idle_unloader(self) -> None:
         idle_since: float | None = None
         while True:
-            await asyncio.sleep(2)
+            await asyncio.sleep(IDLE_POLL_SECONDS)
             if await self.hub.active_producer_count() > 0:
                 idle_since = None
                 continue

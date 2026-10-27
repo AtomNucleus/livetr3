@@ -23,6 +23,7 @@ final class SessionController: ObservableObject {
     private let runtime: LiveTR3Runtime
     private let engine: CaptionEngine
     private let audio = AudioCaptureEngine()
+    private let captureActivity = CaptureActivity()
 
     private var manualStop = false
     private var reconnectAttempt = 0
@@ -171,6 +172,7 @@ final class SessionController: ObservableObject {
             let onLevel: (Float) -> Void = { [weak self] rms in
                 Task { @MainActor in self?.appendLevel(rms) }
             }
+            captureActivity.begin()
             if let replayPath {
                 // Start only after the actual model worker reports readiness.
                 for _ in 0..<1200 {
@@ -204,6 +206,7 @@ final class SessionController: ObservableObject {
         engine.sendJSON(["type": "stop"])
         engine.disconnect()
         audio.stop()
+        captureActivity.end()
         paused = false
         status = .idle
     }
