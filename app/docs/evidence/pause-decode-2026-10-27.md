@@ -162,7 +162,39 @@ discarded on sermon-v2), and WER rises to 5.22%. Pooled, the median goes to
 1.88 s and p95 to 2.81 s, which is worse than A1 and C1. 600 ms stays.
 Neither silence setting was a candidate for adoption, so no ABBA was run.
 
-## Gate verdict
+## Live-weighted rescore
+
+The replays don't end utterances the way live services do:
+
+| Commit reason | Live share | Replay share |
+| --- | ---: | ---: |
+| `silero_end` | 89.2% | 40–75% |
+| `max_utterance_cap` | 10.7% | 16–47% |
+| `decoded_prefix` | 0.1% | 8–19% |
+
+The live shares come from the user's last 51 live sessions, 1,901 finals
+through 2026-10-08. So the pooled median overweights exactly the paths the
+pause decode slowed down.
+
+`fleurs_score.py` now also reports a live-weighted median and p95: each final
+is weighted by its reason's live share over its share in the pass. These are
+the same passes, rescored without new replays.
+
+| Pass | Live-weighted median | Live-weighted p95 | Pooled median | Pooled p95 | Gap p95 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| A1, flag off | 1.57 | 2.50 | 1.70 | 2.58 | 1.86 |
+| B1, flag on | **1.42** | **2.35** | 1.72 | 2.57 | 2.04 |
+| C1, on, keep preview | 1.47 | 2.44 | 1.71 | 2.58 | 1.96 |
+| D1, on, 800 ms | 1.46 | 2.69 | 1.88 | 2.81 | 1.97 |
+
+Live-weighted, B1 improves the median by 0.15 s and the p95 by 0.15 s, so it
+passes the final-latency gate. It still fails the gap-p95 gate: 2.04 vs 1.86,
+caused by the worker time that discarded pause decodes take. The flag stays
+off and #25 stays parked as a draft. The pause decode will be retested after
+Phase 3, with an interruptible prefill if that works and a later trigger, and
+judged on the live-weighted numbers.
+
+## Gate verdict (pooled, as first screened)
 
 | Gate | B1 | C1 | D1 |
 | --- | --- | --- | --- |
