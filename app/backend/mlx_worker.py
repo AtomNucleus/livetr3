@@ -39,6 +39,9 @@ MAINTENANCE_TIMEOUT_SECONDS = max(1.0, float(os.getenv("MAINTENANCE_TIMEOUT_SECO
 AST_MAX_AUDIO_SECONDS = 30
 # Tokens per MTP verify step: block - 1 drafted proposals plus the target bonus.
 MTP_BLOCK_SIZE = max(2, int(os.getenv("LIVETR3_MTP_BLOCK", "3")))
+# Prefill chunk for cancellable jobs, so a cancel lands between chunks instead
+# of after the whole prompt. 0 keeps one full-speed prefill for every job.
+CANCELLABLE_PREFILL_CHUNK = max(0, int(os.getenv("LIVETR3_CANCELLABLE_PREFILL_CHUNK", "0")))
 MLX_WORKER_START_TIMEOUT_SECONDS = max(
     10.0, float(os.getenv("MLX_WORKER_START_TIMEOUT_SECONDS", "180"))
 )
@@ -76,6 +79,30 @@ class MTPGenerationError(RuntimeError):
     """One candidate attempt failed; the next attempt uses ordinary decoding."""
 
 
+class GenerationCancelled(Exception):
+    """Raised from the language model's forward call once its job is cancelled."""
+
+
+def _install_cancel_hook(model: object, check: Callable[[], Callable[[], bool] | None]) -> None:
+    """Make every language-model forward call (one per prefill chunk, one per
+    decode or MTP verify step) raise GenerationCancelled while check() returns
+    a cancel test that is true."""
+    language_model = getattr(model, "language_model", None)
+    if language_model is None:
+        return
+    base = type(language_model)
+
+    class CancellableLanguageModel(base):
+        def __call__(self, *args, **kwargs):
+            cancelled = check()
+            if cancelled is not None and cancelled():
+                raise GenerationCancelled
+            return base.__call__(self, *args, **kwargs)
+
+    CancellableLanguageModel.__name__ = base.__name__
+    language_model.__class__ = CancellableLanguageModel
+
+
 def _mtp_counters(draft: object) -> tuple[int, float, int]:
     return (getattr(draft, "speculative_total_rounds", 0),
             getattr(draft, "speculative_total_accepted", 0.0),
@@ -92,6 +119,9 @@ class MLXWorker:
         self.model, self.processor = load(MODEL_PATH)
         self.config = self.model.config
         self._draft_model = None
+        self._generation_cancelled: Callable[[], bool] | None = None
+        if CANCELLABLE_PREFILL_CHUNK:
+            _install_cancel_hook(self.model, lambda: self._generation_cancelled)
         if os.getenv("LIVETR3_GEMMA_MTP", "1") == "1":
             try:
                 from mlx_vlm.speculative.drafters import load_drafter, validate_drafter_compatibility
@@ -194,6 +224,9 @@ class MLXWorker:
                     counters_before = _mtp_counters(draft)
                 started = time.monotonic()
                 first_response_seconds = None
+                prefill_kwargs = {}
+                if CANCELLABLE_PREFILL_CHUNK and cancelled is not None:
+                    prefill_kwargs = dict(prefill_step_size=CANCELLABLE_PREFILL_CHUNK)
                 def guarded_responses():
                     try:
                         yield from stream_generate(
@@ -206,7 +239,10 @@ class MLXWorker:
                             top_p=0.95,
                             top_k=64,
                             **draft_kwargs,
+                            **prefill_kwargs,
                         )
+                    except GenerationCancelled:
+                        raise
                     except Exception as error:
                         if draft is None:
                             raise
@@ -219,6 +255,7 @@ class MLXWorker:
                 pieces: list[str] = []
                 latest_response: object | None = None
                 last_progress_text = ""
+                self._generation_cancelled = cancelled
                 try:
                     for response in stream:
                         if cancelled is not None and cancelled():
@@ -235,10 +272,14 @@ class MLXWorker:
                             if progress_text and progress_text != last_progress_text:
                                 on_progress(progress_text)
                                 last_progress_text = progress_text
+                except GenerationCancelled:
+                    return None
                 finally:
+                    self._generation_cancelled = None
                     elapsed = time.monotonic() - started
                     after = _mtp_counters(draft) if draft is not None else counters_before
                     trace("ast_decode", mtp=draft is not None, priority=priority,
+                          prefill_chunk=prefill_kwargs.get("prefill_step_size"),
                           token_budget=token_budget, elapsed_seconds=elapsed,
                           first_response_seconds=first_response_seconds,
                           prompt_tokens=getattr(latest_response, "prompt_tokens", None),
@@ -500,6 +541,7 @@ class MLXWorkerService:
         self._final_utterance_ids: set[int] = set()
         self._mp_context = mp.get_context("spawn")
         self._cancelled_job_id = self._mp_context.Value("q", -1)
+        self._cancel_requested_at: dict[int, float] = {}
         self._active_job: _QueuedJob | None = None
         self._status = WorkerStatusEvent(state="starting", message="Loading Gemma model worker")
         self._status_listeners: set[Callable[[WorkerStatusEvent], Awaitable[None]]] = set()
@@ -623,6 +665,7 @@ class MLXWorkerService:
                 and active.payload.get("priority") == "partial"
                 and active.payload.get("utterance_id") == utterance_id):
             self._cancelled_job_id.value = active.sequence
+            self._cancel_requested_at.setdefault(active.sequence, time.monotonic())
         job = self._queued_partial_jobs.pop(utterance_id, None)
         if job is not None and not job.future.done():
             job.future.set_result(None)
@@ -678,6 +721,12 @@ class MLXWorkerService:
                 result = await self._execute_job(job)
                 finished_at = time.monotonic()
                 trace("worker_complete", utterance=job.payload.get("utterance_id"), priority=job.payload.get("priority"), inference_seconds=finished_at-dispatched_at, kind=job.kind)
+                requested_at = self._cancel_requested_at.pop(job.sequence, None)
+                if requested_at is not None:
+                    # How long a cancelled job kept the worker after the cancel.
+                    trace("worker_cancel_free", utterance=job.payload.get("utterance_id"),
+                          priority=job.payload.get("priority"), seconds=finished_at - requested_at,
+                          cancelled_result=result is None)
                 if finished_at - job.enqueued_at >= 1.0:
                     logger.warning(
                         "slow_inference engine=gemma priority=%s utterance_id=%s queue_seconds=%.3f inference_seconds=%.3f",

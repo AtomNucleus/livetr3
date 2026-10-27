@@ -17,4 +17,5 @@ if platform.system() != "Darwin" or platform.machine() != "arm64":
         "test_worker_lifecycle.py",
         "test_cap_repeat.py",
         "test_engine_host.py",
+        "test_cancellable_prefill.py",
     ]
