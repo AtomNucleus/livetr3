@@ -37,6 +37,8 @@ FINAL_TIMEOUT_SECONDS = max(1.0, float(os.getenv("FINAL_TIMEOUT_SECONDS", "45"))
 POLISH_TIMEOUT_SECONDS = max(1.0, float(os.getenv("POLISH_TIMEOUT_SECONDS", "10")))
 MAINTENANCE_TIMEOUT_SECONDS = max(1.0, float(os.getenv("MAINTENANCE_TIMEOUT_SECONDS", "5")))
 AST_MAX_AUDIO_SECONDS = 30
+# Tokens per MTP verify step: block - 1 drafted proposals plus the target bonus.
+MTP_BLOCK_SIZE = max(2, int(os.getenv("LIVETR3_MTP_BLOCK", "3")))
 MLX_WORKER_START_TIMEOUT_SECONDS = max(
     10.0, float(os.getenv("MLX_WORKER_START_TIMEOUT_SECONDS", "180"))
 )
@@ -188,7 +190,7 @@ class MLXWorker:
                 draft_kwargs = {}
                 counters_before = (0, 0, 0)
                 if draft is not None:
-                    draft_kwargs = dict(draft_model=draft, draft_kind="mtp", draft_block_size=3)
+                    draft_kwargs = dict(draft_model=draft, draft_kind="mtp", draft_block_size=MTP_BLOCK_SIZE)
                     counters_before = _mtp_counters(draft)
                 started = time.monotonic()
                 first_response_seconds = None
