@@ -1,5 +1,6 @@
 """Instruction-prefix KV cache: keying, private copies and the embedding hand-off."""
 import importlib
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -108,7 +109,86 @@ def test_embedding_override_removed_when_never_called(model):
     assert "get_input_embeddings" not in vars(model)
 
 
-def test_worker_flag_defaults_off():
+def test_worker_flag_defaults_on():
     import mlx_worker
 
-    assert mlx_worker.PREFIX_CACHE is False
+    assert mlx_worker.PREFIX_CACHE is True
+
+
+class BrokenCache:
+    """Fails in prepare() or, once its inputs are used, inside generation."""
+
+    def __init__(self, where):
+        self.where = where
+
+    def prepare(self, processor, prompt, audio_path):
+        if self.where == "prepare":
+            raise ValueError("prepare broke")
+        return {"input_ids": "suffix", "_prefix_embedding": None}, 77
+
+    @contextmanager
+    def embeddings(self, kwargs):
+        kwargs.pop("_prefix_embedding")
+        yield kwargs
+
+
+RESPONSE = [SimpleNamespace(text="We cannot go\nSpanish: No podemos ir",
+                            generation_tokens=8, finish_reason="stop")]
+
+
+@pytest.mark.parametrize("where", ["prepare", "generate"])
+def test_cache_failure_reruns_uncached_and_keeps_mtp(monkeypatch, tmp_path, where):
+    import numpy as np
+
+    import mlx_worker
+    from test_ast_streaming import _patch_mlx, _worker
+
+    traced = []
+    monkeypatch.setattr(mlx_worker, "trace", lambda stage, **fields: traced.append(stage))
+    _patch_mlx(monkeypatch, [])
+    calls = []
+
+    def generate(*args, **kwargs):
+        calls.append(kwargs)
+        if kwargs.get("input_ids") == "suffix":
+            yield SimpleNamespace(text="We", generation_tokens=1, finish_reason=None)
+            raise RuntimeError("cached generation broke")
+        yield from RESPONSE
+
+    import sys
+    sys.modules["mlx_vlm"].stream_generate = generate
+    worker = _worker(tmp_path)
+    draft = worker._draft_model = object()
+    worker._prefix_cache = BrokenCache(where)
+
+    result = worker.ast(np.ones(16000), "English", "Spanish", [], priority="final")
+    assert (result.original, result.translation) == ("We cannot go", "No podemos ir")
+    assert worker._draft_model is draft and worker._prefix_cache is None
+    assert "prefix_cache_failed" in traced and "mtp_fallback" not in traced
+    assert "audio" in calls[-1] and calls[-1]["draft_model"] is draft
+
+    worker.ast(np.ones(16000), "English", "Spanish", [], priority="final")
+    assert "audio" in calls[-1] and "input_ids" not in calls[-1]
+
+
+def test_cancel_in_the_cached_path_still_propagates(monkeypatch, tmp_path):
+    import sys
+
+    import numpy as np
+
+    import mlx_worker
+    from test_ast_streaming import _patch_mlx, _worker
+
+    _patch_mlx(monkeypatch, [])
+
+    def generate(*args, **kwargs):
+        raise mlx_worker.GenerationCancelled
+        yield
+
+    sys.modules["mlx_vlm"].stream_generate = generate
+    worker = _worker(tmp_path)
+    worker._draft_model = object()
+    cache = worker._prefix_cache = BrokenCache("generate")
+    assert worker.ast(np.ones(16000), "English", "Spanish", [], priority="partial",
+                      cancelled=lambda: False) is None
+    assert worker._prefix_cache is cache

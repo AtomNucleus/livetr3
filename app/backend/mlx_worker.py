@@ -43,8 +43,9 @@ MTP_BLOCK_SIZE = max(2, int(os.getenv("LIVETR3_MTP_BLOCK", "3")))
 # of after the whole prompt (cancel-to-free p95 0.39 -> 0.07 s, ABBA
 # 2026-10-27). 0 keeps one full-speed prefill for every job.
 CANCELLABLE_PREFILL_CHUNK = max(0, int(os.getenv("LIVETR3_CANCELLABLE_PREFILL_CHUNK", "32")))
-# Reuse the KV of the instruction tokens before the audio across decodes.
-PREFIX_CACHE = os.getenv("LIVETR3_PREFIX_CACHE", "0") == "1"
+# Reuse the KV of the instruction tokens before the audio across decodes
+# (prefill -0.17 s per preview, -0.12 s per final, ABBA 2026-10-28). 0 turns it off.
+PREFIX_CACHE = os.getenv("LIVETR3_PREFIX_CACHE", "1") == "1"
 MLX_WORKER_START_TIMEOUT_SECONDS = max(
     10.0, float(os.getenv("MLX_WORKER_START_TIMEOUT_SECONDS", "180"))
 )
@@ -80,6 +81,10 @@ class ASTResult:
 
 class MTPGenerationError(RuntimeError):
     """One candidate attempt failed; the next attempt uses ordinary decoding."""
+
+
+class PrefixCacheError(RuntimeError):
+    """The cached-prefix attempt failed; the cache is off and the decode reruns uncached."""
 
 
 class GenerationCancelled(Exception):
@@ -239,9 +244,9 @@ class MLXWorker:
                     nonlocal prefix_tokens
                     cached = None
                     prefix_cache = getattr(self, "_prefix_cache", None)
-                    if prefix_cache is not None:
-                        cached = prefix_cache.prepare(self.processor, formatted, str(wav_path))
                     try:
+                        if prefix_cache is not None:
+                            cached = prefix_cache.prepare(self.processor, formatted, str(wav_path))
                         if cached is None:
                             yield from stream_generate(
                                 self.model,
@@ -273,6 +278,12 @@ class MLXWorker:
                     except GenerationCancelled:
                         raise
                     except Exception as error:
+                        if prefix_cache is not None:
+                            # A cache fault must not cost the caption or MTP.
+                            self._prefix_cache = None
+                            logger.exception("Prefix cache decode failed; disabling the cache")
+                            trace("prefix_cache_failed", error=type(error).__name__)
+                            raise PrefixCacheError from error
                         if draft is None:
                             raise
                         # Restart with fresh target caches, never combine hypotheses.
@@ -329,19 +340,22 @@ class MLXWorker:
                 complete = bool(original and translation and not truncated)
                 return ASTResult(original, translation, complete, truncated)
 
-            try:
-                result = generate_once(max_tokens)
-            except MTPGenerationError:
-                result = generate_once(max_tokens)
+            def attempt(token_budget: int) -> ASTResult | None:
+                # Each failure kind switches itself off, so this ends uncached and without MTP.
+                for _ in range(2):
+                    try:
+                        return generate_once(token_budget)
+                    except (MTPGenerationError, PrefixCacheError):
+                        pass
+                return generate_once(token_budget)
+
+            result = attempt(max_tokens)
             if result is None:
                 return None
             if priority == "final" and not result.complete:
                 retry_budget = min(768, max_tokens * 2)
                 if retry_budget > max_tokens:
-                    try:
-                        result = generate_once(retry_budget)
-                    except MTPGenerationError:
-                        result = generate_once(retry_budget)
+                    result = attempt(retry_budget)
             return result
         finally:
             _safe_unlink(wav_path)
