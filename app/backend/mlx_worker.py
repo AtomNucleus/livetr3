@@ -40,8 +40,9 @@ AST_MAX_AUDIO_SECONDS = 30
 # Tokens per MTP verify step: block - 1 drafted proposals plus the target bonus.
 MTP_BLOCK_SIZE = max(2, int(os.getenv("LIVETR3_MTP_BLOCK", "3")))
 # Prefill chunk for cancellable jobs, so a cancel lands between chunks instead
-# of after the whole prompt. 0 keeps one full-speed prefill for every job.
-CANCELLABLE_PREFILL_CHUNK = max(0, int(os.getenv("LIVETR3_CANCELLABLE_PREFILL_CHUNK", "0")))
+# of after the whole prompt (cancel-to-free p95 0.39 -> 0.07 s, ABBA
+# 2026-10-27). 0 keeps one full-speed prefill for every job.
+CANCELLABLE_PREFILL_CHUNK = max(0, int(os.getenv("LIVETR3_CANCELLABLE_PREFILL_CHUNK", "32")))
 MLX_WORKER_START_TIMEOUT_SECONDS = max(
     10.0, float(os.getenv("MLX_WORKER_START_TIMEOUT_SECONDS", "180"))
 )
