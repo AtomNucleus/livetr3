@@ -114,6 +114,12 @@ TRANSCRIBABLE_TRIM_PAD_SECONDS = min(
 DECODED_PREFIX_PAUSE_FRAMES = 8  # 160 ms of quiet audio at a word/phrase boundary.
 
 
+def _pause_decode_enabled() -> bool:
+    # Start the final decode once Silero's pause passes the speech pad, and
+    # publish it at the commit if the committed window is the same audio.
+    return os.getenv("LIVETR3_PAUSE_DECODE", "0") == "1"
+
+
 CommitReason = Literal["punctuation", "stability", "silero_end", "max_utterance_cap", "decoded_prefix"]
 
 
@@ -128,6 +134,9 @@ class UtteranceRuntime:
     latest_partial_translation: str = ""
     partial_audio_snapshot: np.ndarray | None = None
     partial_last_audio_unix_seconds: float | None = None
+    pause_task: asyncio.Task | None = None
+    pause_audio: np.ndarray | None = None
+    pause_request: dict | None = None
 
 
 def _source_text_ends_sentence(text: str) -> bool:
@@ -451,7 +460,7 @@ class TranscriptionSession:
                 self.state.running = True
                 self.segmenter.reset()
                 self._finalizing.clear()
-                self._utterance_runtime.clear()
+                self._clear_utterance_runtime()
             self._schedule_worker_warmup()
             return
 
@@ -463,7 +472,7 @@ class TranscriptionSession:
             self.segmenter.reset()
             self._finalized.clear()
             self._finalizing.clear()
-            self._utterance_runtime.clear()
+            self._clear_utterance_runtime()
             self.state.last_maintenance_at = time.monotonic()
             self.state.utterances_since_maintenance = 0
             self._schedule_worker_warmup()
@@ -539,6 +548,9 @@ class TranscriptionSession:
             runtime.last_audio_frame_unix_seconds = time.time()
             runtime.voiced_audio_samples += FRAME_SAMPLES
 
+        if _pause_decode_enabled() and result.speech_active:
+            self._update_pause_decode()
+
         if (
             result.speech_active
             # During trailing silence a final is imminent. Starting another
@@ -547,6 +559,8 @@ class TranscriptionSession:
             and result.rms >= MIN_TRANSCRIBABLE_FRAME_RMS
             and DEFAULT_PARTIAL_AST_ENABLED
             and self.state.active_utterance_id not in self._finalizing
+            # A pause decode already covers this audio; another preview would delay it.
+            and not self._active_pause_decode_held()
             and self._active_utterance_has_new_speech_for_partial()
         ):
             audio = self._partial_audio_snapshot(self.segmenter.current_audio())
@@ -579,12 +593,19 @@ class TranscriptionSession:
         if result.speech_ended and result.audio is not None:
             utterance_id = self.state.active_utterance_id
             reason: CommitReason = "max_utterance_cap" if result.force_flushed else "silero_end"
-            await self._commit_utterance(utterance_id, result.audio, reason=reason, reset_segmenter=False)
+            audio = result.audio
+            if _pause_decode_enabled() and reason == "silero_end" and result.pause_samples:
+                # Decode up to Silero's speech end, the window a pause decode used.
+                audio = audio[:result.pause_samples]
+            await self._commit_utterance(utterance_id, audio, reason=reason, reset_segmenter=False)
 
     async def _flush_active_final(self) -> None:
         if not self.segmenter.speech_active or self.state.active_utterance_id is None:
             return
         audio = self.segmenter.current_audio()
+        pause_audio = self.segmenter.pause_audio() if _pause_decode_enabled() else None
+        if pause_audio is not None:
+            audio = pause_audio
         utterance_id = self.state.active_utterance_id
         if audio.size:
             await self._commit_utterance(utterance_id, audio, reason="silero_end", reset_segmenter=True)
@@ -609,6 +630,7 @@ class TranscriptionSession:
                 self.state.active_utterance_id = None
             self._finalized.add(utterance_id)
             self._finalizing.pop(utterance_id, None)
+            self._discard_pause_decode(utterance_id, "low_energy")
             self._utterance_runtime.pop(utterance_id, None)
             logger.info(
                 (
@@ -638,7 +660,17 @@ class TranscriptionSession:
                 utterance_id,
                 audio.shape[0] / 16_000,
             )
-            self._schedule_ast("final", utterance_id, audio)
+            runtime = self._utterance_runtime.get(utterance_id)
+            reuse = None
+            if runtime is not None and runtime.pause_audio is not None:
+                if (reason == "silero_end" and runtime.pause_request == self._ast_request()
+                        and np.array_equal(runtime.pause_audio, audio)):
+                    reuse = runtime.pause_task
+                else:
+                    self._discard_pause_decode(
+                        utterance_id, "window_changed" if reason == "silero_end" else reason
+                    )
+            self._schedule_ast("final", utterance_id, audio, reuse=reuse)
             return True
 
     def _schedule_ast(
@@ -646,6 +678,7 @@ class TranscriptionSession:
         priority: str,
         utterance_id: int | None,
         audio: np.ndarray,
+        reuse: asyncio.Task | None = None,
     ) -> None:
         if utterance_id is None:
             return
@@ -655,7 +688,7 @@ class TranscriptionSession:
         ):
             return
         task = asyncio.create_task(
-            self._run_ast(priority, utterance_id, audio.copy()),
+            self._run_ast(priority, utterance_id, audio.copy(), reuse),
             name=f"{priority}-ast-{utterance_id}",
         )
         self._jobs.add(task)
@@ -663,10 +696,15 @@ class TranscriptionSession:
             self._partial_ast_task = task
         task.add_done_callback(self._jobs.discard)
 
-    async def _run_ast(self, priority: str, utterance_id: int, audio: np.ndarray) -> None:
+    async def _run_ast(
+        self, priority: str, utterance_id: int, audio: np.ndarray, reuse: asyncio.Task | None = None
+    ) -> None:
         started_at = time.monotonic()
         try:
-            await self._run_mlx_ast(priority, utterance_id, audio)
+            if reuse is None:
+                await self._run_mlx_ast(priority, utterance_id, audio)
+            else:
+                await self._run_mlx_ast(priority, utterance_id, audio, reuse)
         finally:
             # Errors, empty decodes, and cancellation must not leave a commit pending.
             if priority == "final":
@@ -679,76 +717,55 @@ class TranscriptionSession:
                     priority, utterance_id, elapsed, audio.size / 16_000,
                 )
 
-    async def _run_mlx_ast(self, priority: str, utterance_id: int, audio: np.ndarray) -> None:
+    async def _run_mlx_ast(
+        self, priority: str, utterance_id: int, audio: np.ndarray, reuse: asyncio.Task | None = None
+    ) -> None:
         config = self.state.config.model_copy(deep=True)
         runtime = self._utterance_runtime.get(utterance_id)
         snapshot = runtime.partial_audio_snapshot if priority == "partial" and runtime else None
         snapshot_last_audio = runtime.partial_last_audio_unix_seconds if runtime else None
         async def publish_progress(text: str) -> None:
-            if utterance_id in self._finalized:
-                return
-            if priority == "partial" and utterance_id in self._finalizing:
-                return
-            original, translation = _parse_ast_response(
-                text,
-                self.state.config.target_lang,
-                self.state.config.source_lang,
-            )
-            original = original.strip()
-            translation = translation.strip()
-            if not original:
-                return
-            if not self._should_translate_final(original):
-                translation = original
-            runtime = self._utterance_runtime.setdefault(
-                utterance_id,
-                UtteranceRuntime(partials=deque(maxlen=self._stability_window())),
-            )
-            if (
-                original == runtime.latest_partial_original
-                and translation == runtime.latest_partial_translation
-            ):
-                return
-            runtime.latest_partial_original = original
-            runtime.latest_partial_translation = translation
-            await self._send_and_broadcast(
-                TranscriptMessage(
-                    type="partial",
+            await self._publish_progress(priority, utterance_id, text)
+
+        result = await self._reused_pause_result(utterance_id, reuse) if reuse is not None else None
+        pause_decode_reused = result is not None if priority == "final" and _pause_decode_enabled() else None
+        if result is None:
+            try:
+                trace("inference_submit", session=getattr(self, "session_id", ""), utterance=utterance_id, priority=priority, samples=audio.size)
+                result = await self.worker.submit_ast(
+                    priority="final" if priority == "final" else "partial",
                     utterance_id=utterance_id,
-                    original=original,
-                    translation=translation,
-                ).model_dump(exclude_none=True)
-            )
-
-        try:
-            trace("inference_submit", session=getattr(self, "session_id", ""), utterance=utterance_id, priority=priority, samples=audio.size)
-            result = await self.worker.submit_ast(
-                priority="final" if priority == "final" else "partial",
-                utterance_id=utterance_id,
-                audio_f32_16k=audio,
-                src=self.state.config.source_lang,
-                tgt=self.state.config.target_lang,
-                # Model-generated prior captions can repeat an earlier recognition error,
-                # so earlier source text is a default-off replay experiment.
-                prior_context=(list(self.state.prior_context)
-                               if os.getenv("LIVETR3_AST_SOURCE_CONTEXT", "0") == "1" else []),
-                custom_vocab=self.state.config.custom_vocab,
-                code_switching_enabled=self.state.config.code_switching_enabled,
-                max_tokens=self._max_tokens_for_ast(priority, audio),
-                on_progress=publish_progress,
-            )
-        except asyncio.CancelledError:
-            raise
-        except InferenceTimeoutError as exc:
-            if priority == "partial":
-                logger.info("partial_inference dropped after timeout: %s", exc)
+                    audio_f32_16k=audio,
+                    max_tokens=self._max_tokens_for_ast(priority, audio),
+                    on_progress=publish_progress,
+                    **self._ast_request(),
+                )
+            except asyncio.CancelledError:
+                raise
+            except InferenceTimeoutError as exc:
+                if priority == "partial":
+                    logger.info("partial_inference dropped after timeout: %s", exc)
+                    return
+                await self._send_error(f"Inference failed: {exc}")
                 return
-            await self._send_error(f"Inference failed: {exc}")
-            return
-        except Exception as exc:
-            await self._send_error(f"Inference failed: {exc}")
-            return
+            except Exception as exc:
+                await self._send_error(f"Inference failed: {exc}")
+                return
+        await self._handle_ast_result(
+            priority, utterance_id, audio, config, result, snapshot, snapshot_last_audio, pause_decode_reused
+        )
 
+    async def _handle_ast_result(
+        self,
+        priority: str,
+        utterance_id: int,
+        audio: np.ndarray,
+        config: ConfigMessage,
+        result: object,
+        snapshot: np.ndarray | None,
+        snapshot_last_audio: float | None,
+        pause_decode_reused: bool | None,
+    ) -> None:
         if result is None:
             return
         if not isinstance(result, ASTResult):
@@ -795,7 +812,137 @@ class TranscriptionSession:
             await self._maybe_commit_early(utterance_id, merged_original)
             return
 
-        await self._publish_final_result(utterance_id, result)
+        await self._publish_final_result(utterance_id, result, pause_decode_reused=pause_decode_reused)
+
+    def _ast_request(self) -> dict:
+        """Everything besides audio and budget that decides a decode's output."""
+        return dict(
+            src=self.state.config.source_lang,
+            tgt=self.state.config.target_lang,
+            # Model-generated prior captions can repeat an earlier recognition error,
+            # so earlier source text is a default-off replay experiment.
+            prior_context=(list(self.state.prior_context)
+                           if os.getenv("LIVETR3_AST_SOURCE_CONTEXT", "0") == "1" else []),
+            custom_vocab=list(self.state.config.custom_vocab),
+            code_switching_enabled=self.state.config.code_switching_enabled,
+        )
+
+    async def _publish_progress(self, priority: str, utterance_id: int, text: str) -> None:
+        if utterance_id in self._finalized:
+            return
+        if priority == "partial" and utterance_id in self._finalizing:
+            return
+        original, translation = _parse_ast_response(
+            text,
+            self.state.config.target_lang,
+            self.state.config.source_lang,
+        )
+        original = original.strip()
+        translation = translation.strip()
+        if not original:
+            return
+        if not self._should_translate_final(original):
+            translation = original
+        runtime = self._utterance_runtime.setdefault(
+            utterance_id,
+            UtteranceRuntime(partials=deque(maxlen=self._stability_window())),
+        )
+        if (
+            original == runtime.latest_partial_original
+            and translation == runtime.latest_partial_translation
+        ):
+            return
+        runtime.latest_partial_original = original
+        runtime.latest_partial_translation = translation
+        await self._send_and_broadcast(
+            TranscriptMessage(
+                type="partial",
+                utterance_id=utterance_id,
+                original=original,
+                translation=translation,
+            ).model_dump(exclude_none=True)
+        )
+
+    async def _reused_pause_result(self, utterance_id: int, reuse: asyncio.Task) -> ASTResult | None:
+        """The pause decode's result when it can stand as the final, else None."""
+        result = await reuse
+        if isinstance(result, ASTResult) and result.complete and not result.truncated:
+            trace("pause_decode_reuse", session=self.session_id, utterance=utterance_id)
+            return result
+        trace("pause_decode_fallback", session=self.session_id, utterance=utterance_id,
+              reason="incomplete" if isinstance(result, ASTResult) else "no_result")
+        return None
+
+    def _active_pause_decode_held(self) -> bool:
+        runtime = self._active_utterance_runtime()
+        return runtime is not None and runtime.pause_audio is not None
+
+    def _update_pause_decode(self) -> None:
+        utterance_id = self.state.active_utterance_id
+        runtime = self._active_utterance_runtime()
+        if utterance_id is None or runtime is None or utterance_id in self._finalizing:
+            return
+        window = self.segmenter.pause_audio()
+        if runtime.pause_audio is not None:
+            if window is not None and np.array_equal(window, runtime.pause_audio):
+                return
+            # Speech came back: this pause no longer ends the utterance.
+            self._discard_pause_decode(utterance_id, "speech_resumed")
+        if window is None or not _audio_has_transcribable_energy(_trim_to_transcribable_audio(window)):
+            return
+        # A preview of this utterance is now stale; the pause decode replaces it.
+        # Experiment: keeping it lets a decoded-prefix handoff still use it if
+        # speech resumes, at the cost of the pause decode queueing behind it.
+        if os.getenv("LIVETR3_PAUSE_DECODE_CANCEL_PREVIEW", "1") == "1":
+            self.worker.cancel_partials(utterance_id)
+        runtime.pause_audio = window.copy()
+        runtime.pause_request = self._ast_request()
+        trace("pause_decode_start", session=self.session_id, utterance=utterance_id, samples=window.size)
+        task = asyncio.create_task(
+            self._run_pause_decode(utterance_id, runtime.pause_audio, runtime.pause_request),
+            name=f"pause-ast-{utterance_id}",
+        )
+        runtime.pause_task = task
+        self._jobs.add(task)
+        task.add_done_callback(self._jobs.discard)
+
+    async def _run_pause_decode(self, utterance_id: int, audio: np.ndarray, request: dict) -> ASTResult | None:
+        async def publish_progress(text: str) -> None:
+            runtime = self._utterance_runtime.get(utterance_id)
+            # A discarded pause decode must not show text for audio that grew.
+            if runtime is not None and runtime.pause_audio is audio:
+                await self._publish_progress("pause", utterance_id, text)
+
+        try:
+            return await self.worker.submit_ast(
+                priority="pause",
+                utterance_id=utterance_id,
+                audio_f32_16k=audio,
+                max_tokens=self._max_tokens_for_ast("final", audio),
+                on_progress=publish_progress,
+                **request,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # The commit falls back to an ordinary final decode.
+            logger.info("pause_decode failed utterance_id=%s: %s", utterance_id, exc)
+            return None
+
+    def _discard_pause_decode(self, utterance_id: int, reason: str) -> None:
+        runtime = self._utterance_runtime.get(utterance_id)
+        if runtime is None or runtime.pause_audio is None:
+            return
+        self.worker.cancel_pause_decode(utterance_id)
+        if runtime.pause_task is not None:
+            runtime.pause_task.cancel()
+        runtime.pause_task = runtime.pause_audio = runtime.pause_request = None
+        trace("pause_decode_discard", session=self.session_id, utterance=utterance_id, reason=reason)
+
+    def _clear_utterance_runtime(self) -> None:
+        for utterance_id in list(self._utterance_runtime):
+            self._discard_pause_decode(utterance_id, "reset")
+        self._utterance_runtime.clear()
 
     async def _commit_decoded_prefix(
         self,
@@ -830,6 +977,7 @@ class TranscriptionSession:
             if not self.segmenter.split_decoded_prefix(snapshot):
                 return False
             self._finalizing[utterance_id] = "decoded_prefix"
+            self._discard_pause_decode(utterance_id, "decoded_prefix")
             self.worker.finish_partials(utterance_id)
             runtime = self._utterance_runtime[utterance_id]
             tail_last_audio = runtime.last_audio_frame_unix_seconds
@@ -871,7 +1019,11 @@ class TranscriptionSession:
                 return prefix
         return audio
 
-    async def _publish_final_result(self, utterance_id: int, result: ASTResult) -> None:
+    async def _publish_final_result(
+        self, utterance_id: int, result: ASTResult, *, pause_decode_reused: bool | None = None
+    ) -> None:
+        if pause_decode_reused is None and _pause_decode_enabled():
+            pause_decode_reused = False
         original, translation = result.original, result.translation
         self._finalized.add(utterance_id)
         commit_reason = self._finalizing.pop(utterance_id, "silero_end")
@@ -894,6 +1046,7 @@ class TranscriptionSession:
                 last_audio_frame_unix_seconds=(
                     runtime.last_audio_frame_unix_seconds if runtime is not None else None
                 ),
+                pause_decode_reused=pause_decode_reused,
             ).model_dump(exclude_none=True)
         )
 
@@ -1093,7 +1246,7 @@ class TranscriptionSession:
         ]
         self._finalized = set(snapshot.get("finalized_ids", []))
         self._finalizing.clear()
-        self._utterance_runtime.clear()
+        self._clear_utterance_runtime()
         self.segmenter.reset()
 
     def export_session_snapshot(self) -> dict:
@@ -1269,6 +1422,8 @@ class TranscriptionSession:
         utterance["state"] = payload_type
         if payload.get("commit_reason") is not None:
             utterance["commit_reason"] = payload["commit_reason"]
+        if payload.get("pause_decode_reused") is not None:
+            utterance["pause_decode_reused"] = payload["pause_decode_reused"]
         if payload_type != "partial":
             utterance["ended_at"] = elapsed_seconds
 

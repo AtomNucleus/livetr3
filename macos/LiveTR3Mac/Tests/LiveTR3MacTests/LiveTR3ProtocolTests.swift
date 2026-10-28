@@ -34,6 +34,19 @@ final class LiveTR3ProtocolTests: XCTestCase {
         XCTAssertEqual(ClientConfig.diagnosticConfig(environment: [:]), ClientConfig.default)
     }
 
+    func testFinalWithBackendDiagnosticsParses() throws {
+        let data = try XCTUnwrap(
+            #"{"type":"final","utterance_id":8,"original":"Hello","translation":"Hola","commit_reason":"silero_end","last_audio_frame_unix_seconds":1.5,"pause_decode_reused":true}"#
+                .data(using: .utf8)
+        )
+        guard case let .caption(type, utteranceID, original, _) = try XCTUnwrap(LiveTR3ServerMessage.parse(data)) else {
+            return XCTFail("Expected a caption message")
+        }
+        XCTAssertEqual(type, .final)
+        XCTAssertEqual(utteranceID, 8)
+        XCTAssertEqual(original, "Hello")
+    }
+
     func testCaptionMessageParses() throws {
         let data = try XCTUnwrap(
             #"{"type":"final","utterance_id":7,"original":"Hello","translation":"Hola"}"#
