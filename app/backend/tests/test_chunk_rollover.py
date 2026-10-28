@@ -96,3 +96,71 @@ def test_loud_speech_keeps_the_absolute_silence_flush_level():
     for _ in range(20):
         result = vad.ingest(np.full(320, 0.0009, dtype=np.float32))
     assert result.speech_ended
+
+
+def short_join_silero(events, join_frames=30, hold_frames=10):
+    """events maps a frame index to the Silero event seen while ingesting it."""
+    vad = fake_silero()
+    vad.max_utterance_frames = vad.hard_max_utterance_frames = 1000
+    vad.trailing_silence_frames = 5
+    vad._base_trailing_silence_frames = 5
+    vad.min_utterance_frames = 1
+    vad._short_join_frames, vad._short_join_hold_frames, vad._holding = join_frames, hold_frames, False
+    vad.frame, seen = 0, set()
+
+    def iterator(*args, **kwargs):
+        if vad.frame in seen:
+            return None
+        seen.add(vad.frame)
+        return events.get(vad.frame)
+
+    vad._vad_iterator.side_effect = iterator
+    return vad
+
+
+def run(vad, frames):
+    results = []
+    for index, frame in enumerate(frames):
+        vad.frame = index
+        vad._pending = np.zeros(512, dtype=np.float32)  # one detector step per frame
+        results.append(vad.ingest(frame))
+    return results
+
+
+SPEECH = np.full(320, 0.1, dtype=np.float32)
+QUIET = np.zeros(320, dtype=np.float32)
+
+
+def test_short_utterance_waits_for_the_hold_then_commits_alone():
+    vad = short_join_silero({0: {"start": 0}, 4: {"end": 0}})
+    results = run(vad, [SPEECH] * 4 + [QUIET] * 14)
+    ended = [i for i, r in enumerate(results) if r.speech_ended]
+    assert ended == [4 + 9]  # the hold is 10 silent frames, counting the end-event frame
+    assert results[ended[0]].audio.size == 14 * 320
+    assert not vad._holding and vad.trailing_silence_frames == 5
+    vad._vad_iterator.reset_states.assert_called()
+
+
+def test_speech_resuming_in_the_hold_joins_the_same_utterance():
+    vad = short_join_silero({0: {"start": 0}, 4: {"end": 0}, 8: {"start": 0}, 15: {"end": 0}},
+                            join_frames=12)
+    results = run(vad, [SPEECH] * 4 + [QUIET] * 4 + [SPEECH] * 7 + [QUIET] * 8)
+    assert sum(r.speech_started for r in results) == 1
+    ended = [i for i, r in enumerate(results) if r.speech_ended]
+    # The joined utterance is past join_frames, so its end commits at once.
+    assert ended == [15] and results[15].audio.size == 16 * 320
+    assert not vad._holding and vad.trailing_silence_frames == 5
+
+
+def test_long_utterance_ends_without_a_hold():
+    vad = short_join_silero({0: {"start": 0}, 8: {"end": 0}}, join_frames=5)
+    results = run(vad, [SPEECH] * 8 + [QUIET] * 3)
+    assert [i for i, r in enumerate(results) if r.speech_ended] == [8]
+
+
+def test_a_fragment_below_the_minimum_is_still_dropped_without_a_hold():
+    vad = short_join_silero({0: {"start": 0}, 4: {"end": 0}})
+    vad.min_utterance_frames = 10
+    results = run(vad, [SPEECH] * 4 + [QUIET] * 14)
+    assert not any(r.speech_ended for r in results)
+    assert not vad._holding and not vad.speech_active

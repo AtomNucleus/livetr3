@@ -199,6 +199,8 @@ class SileroVAD(RMSGate):
         max_utterance_s: float = 25.0,
         cap_extend_s: float = 0.0,
         cap_pause_ms: int = 0,
+        short_join_ms: int = 0,
+        short_join_hold_ms: int = 800,
     ) -> None:
         super().__init__(
             threshold=0.01,
@@ -232,9 +234,22 @@ class SileroVAD(RMSGate):
         self._silent_frames = 0
         self._speech_rms: deque[float] = deque(maxlen=int(MAX_UTTERANCE_SECONDS / FRAME_SECONDS))
         self._end_event_pending = False
+        # An utterance that ends shorter than short_join_ms waits up to
+        # short_join_hold_ms more for speech to resume, so a lone word ("Grace.")
+        # is decoded with the words that follow instead of without context.
+        self._short_join_frames = max(0, int(short_join_ms) // 20)
+        self._short_join_hold_frames = max(1, int(short_join_hold_ms) // 20)
+        self._base_trailing_silence_frames = self.trailing_silence_frames
+        self._holding = False
+
+    def _end_hold(self) -> None:
+        if getattr(self, "_holding", False):
+            self._holding = False
+            self.trailing_silence_frames = self._base_trailing_silence_frames
 
     def reset(self) -> None:
         super().reset()
+        self._end_hold()
         self._silero_active = False
         self._silent_frames = 0
         self._speech_rms.clear()
@@ -269,6 +284,7 @@ class SileroVAD(RMSGate):
         if event and "start" in event:
             self._silero_active = True
             self._silent_frames = 0
+            self._end_hold()
         if self._silero_active:
             self._speech_rms.append(rms)
             level = float(np.percentile(self._speech_rms, 90))
@@ -279,6 +295,21 @@ class SileroVAD(RMSGate):
         end_event = bool(event and "end" in event) or (
             self._silero_active and self._silent_frames >= self._silence_flush_frames
         )
+        if (
+            end_event
+            and getattr(self, "_short_join_frames", 0)
+            and self._speech_active
+            # Too-short fragments still drop: holding would pad them past the minimum.
+            and self.min_utterance_frames <= len(self._current) < self._short_join_frames
+        ):
+            # Hold instead of ending: the parent flushes after the hold's
+            # silence unless a new Silero start resumes the same utterance.
+            end_event = False
+            self._holding = True
+            self._silero_active = False
+            self._silent_frames = 0
+            self.trailing_silence_frames = self._short_join_hold_frames
+            self._vad_iterator.reset_states()
         active_for_parent = self._silero_active
         self.threshold = -1.0 if active_for_parent else 2.0
         self._end_event_pending = end_event
@@ -314,6 +345,8 @@ def make_segmenter(
     max_utterance_s: float = 25.0,
     cap_extend_s: float = 0.0,
     cap_pause_ms: int = 0,
+    short_join_ms: int = 0,
+    short_join_hold_ms: int = 800,
 ) -> RMSGate:
     if name == "silero":
         return SileroVAD(
@@ -323,6 +356,8 @@ def make_segmenter(
             max_utterance_s=max_utterance_s,
             cap_extend_s=cap_extend_s,
             cap_pause_ms=cap_pause_ms,
+            short_join_ms=short_join_ms,
+            short_join_hold_ms=short_join_hold_ms,
         )
     raise ValueError("Only the Silero VAD segmenter is enabled for this build.")
 

@@ -1124,6 +1124,9 @@ class TranscriptionSession:
             # replay, 2026-10-08); set either to 0 for the plain cap.
             cap_extend_s=float(os.getenv("LIVETR3_CAP_EXTEND_SECONDS", "2")),
             cap_pause_ms=int(os.getenv("LIVETR3_CAP_PAUSE_MS", "200")),
+            # Utterances ending shorter than this wait for more speech; 0 is off.
+            short_join_ms=int(os.getenv("LIVETR3_SHORT_JOIN_MS", "0")),
+            short_join_hold_ms=int(os.getenv("LIVETR3_SHORT_JOIN_HOLD_MS", "800")),
         )
 
     def _max_tokens_for_ast(self, priority: str, audio: np.ndarray) -> int:
