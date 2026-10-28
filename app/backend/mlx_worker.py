@@ -43,6 +43,8 @@ MTP_BLOCK_SIZE = max(2, int(os.getenv("LIVETR3_MTP_BLOCK", "3")))
 # of after the whole prompt (cancel-to-free p95 0.39 -> 0.07 s, ABBA
 # 2026-10-27). 0 keeps one full-speed prefill for every job.
 CANCELLABLE_PREFILL_CHUNK = max(0, int(os.getenv("LIVETR3_CANCELLABLE_PREFILL_CHUNK", "32")))
+# Reuse the KV of the instruction tokens before the audio across decodes.
+PREFIX_CACHE = os.getenv("LIVETR3_PREFIX_CACHE", "0") == "1"
 MLX_WORKER_START_TIMEOUT_SECONDS = max(
     10.0, float(os.getenv("MLX_WORKER_START_TIMEOUT_SECONDS", "180"))
 )
@@ -123,6 +125,10 @@ class MLXWorker:
         self._generation_cancelled: Callable[[], bool] | None = None
         if CANCELLABLE_PREFILL_CHUNK:
             _install_cancel_hook(self.model, lambda: self._generation_cancelled)
+        self._prefix_cache = None
+        if PREFIX_CACHE:
+            from prefix_cache import PrefixKVCache
+            self._prefix_cache = PrefixKVCache(self.model)
         if os.getenv("LIVETR3_GEMMA_MTP", "1") == "1":
             try:
                 from mlx_vlm.speculative.drafters import load_drafter, validate_drafter_compatibility
@@ -228,20 +234,42 @@ class MLXWorker:
                 prefill_kwargs = {}
                 if CANCELLABLE_PREFILL_CHUNK and cancelled is not None:
                     prefill_kwargs = dict(prefill_step_size=CANCELLABLE_PREFILL_CHUNK)
+                prefix_tokens = None
                 def guarded_responses():
+                    nonlocal prefix_tokens
+                    cached = None
+                    prefix_cache = getattr(self, "_prefix_cache", None)
+                    if prefix_cache is not None:
+                        cached = prefix_cache.prepare(self.processor, formatted, str(wav_path))
                     try:
-                        yield from stream_generate(
-                            self.model,
-                            self.processor,
-                            formatted,
-                            audio=[str(wav_path)],
-                            max_tokens=token_budget,
-                            temperature=0.0,
-                            top_p=0.95,
-                            top_k=64,
-                            **draft_kwargs,
-                            **prefill_kwargs,
-                        )
+                        if cached is None:
+                            yield from stream_generate(
+                                self.model,
+                                self.processor,
+                                formatted,
+                                audio=[str(wav_path)],
+                                max_tokens=token_budget,
+                                temperature=0.0,
+                                top_p=0.95,
+                                top_k=64,
+                                **draft_kwargs,
+                                **prefill_kwargs,
+                            )
+                            return
+                        inputs, prefix_tokens = cached
+                        with prefix_cache.embeddings(inputs) as inputs:
+                            yield from stream_generate(
+                                self.model,
+                                self.processor,
+                                formatted,
+                                max_tokens=token_budget,
+                                temperature=0.0,
+                                top_p=0.95,
+                                top_k=64,
+                                **inputs,
+                                **draft_kwargs,
+                                **prefill_kwargs,
+                            )
                     except GenerationCancelled:
                         raise
                     except Exception as error:
@@ -281,6 +309,7 @@ class MLXWorker:
                     after = _mtp_counters(draft) if draft is not None else counters_before
                     trace("ast_decode", mtp=draft is not None, priority=priority,
                           prefill_chunk=prefill_kwargs.get("prefill_step_size"),
+                          prefix_tokens=prefix_tokens,
                           token_budget=token_budget, elapsed_seconds=elapsed,
                           first_response_seconds=first_response_seconds,
                           prompt_tokens=getattr(latest_response, "prompt_tokens", None),
