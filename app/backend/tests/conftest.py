@@ -21,4 +21,5 @@ if platform.system() != "Darwin" or platform.machine() != "arm64":
         "test_decode_timing.py",
         "test_noisy_room.py",
         "test_cancellable_prefill.py",
+        "test_prefix_cache.py",
     ]
