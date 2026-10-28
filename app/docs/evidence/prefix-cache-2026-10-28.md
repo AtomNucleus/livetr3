@@ -3,8 +3,9 @@
 Every AST prompt starts with the same instruction tokens before the audio
 (boa) token. With `LIVETR3_PREFIX_CACHE=1` the worker prefills those once and
 gives each decode a private copy of their KV cache. Prefill then runs only on
-the audio and the answer header. **The flag stays off by default**: the ABBA
-is positive on the median but mixed on the live-weighted p95 (below).
+the audio and the answer header. **It is on by default**; set
+`LIVETR3_PREFIX_CACHE=0` to turn it off. The ABBA improves the median in both
+pairs and the live-weighted p95 on the mean (below).
 
 Outputs are in `dist/logs/prefix-cache-2026-10-28/`. Only one model worker ran
 at a time, and no other LiveTR3 worker was loaded.
@@ -33,6 +34,11 @@ on):
   prefill's last step, which attends over the whole cache.
 - `ast_decode` traces gain `prefix_tokens`. `prompt_tokens` there now counts
   the suffix only.
+- A fault in the cache path must not cost a caption or MTP. Any exception
+  other than a cancel, in `prepare()` or in the cached generation, does three
+  things: it traces `prefix_cache_failed`, turns the cache off for that worker,
+  and reruns the decode uncached with MTP kept. A cancel still propagates as
+  before.
 
 mlx-vlm 0.7.10 doesn't help: like 0.7.4, both of its reuse paths
 (`PromptCacheState` and APC) still require a text-only suffix
@@ -147,18 +153,13 @@ schedules about 17% more of them. Finals then queue behind those a little
 more often. Final queue p95 was 0.121 and 0.097 s on vs 0.094 and 0.124 s off.
 That trims part of the tail gain.
 
-## Recommendation
+## Decision
 
-Adopt it, but the flag stays off until the coordinator decides on the
-p95 result. The case for adopting:
-- every latency metric improves on the ABBA means
-- median, first target and gap p95 improve in both pairs
-- quality holds
-- MTP is untouched
-
-The one pair-1 regression is within noise. A third pair would settle p95 if
-a strict per-pair pass is required. Turning it on is a one-line default change
-in `mlx_worker.py`.
+**Adopted, on by default.** The coordinator reviewed the passes and confirmed
+the numbers. Silence-ended finals, 89% of live, improved at the median by
+0.09 s and 0.13 s in the two pairs, which matches the 0.12 s drop in final
+prefill. The pair-1 p95 regression is inside the A1-to-A2 spread of 0.16 s,
+so no third pair was run.
 
 ## Tests
 
@@ -168,6 +169,9 @@ checks:
 - private per-decode copies
 - no prefix without the audio token
 - the embedding override is served once and always removed
-- the flag defaults off
+- the flag defaults on
+- a failure in `prepare()` or in cached generation still returns the caption,
+  keeps MTP, and leaves later decodes uncached
+- a cancel in the cached path still propagates
 
-Results: 179 backend tests pass with the shared env.
+Results: 182 backend tests pass with the shared env.
