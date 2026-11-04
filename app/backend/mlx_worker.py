@@ -476,6 +476,7 @@ class _QueuedJob:
     payload: dict = field(compare=False)
     enqueued_at: float = field(default_factory=time.monotonic, compare=False)
     on_progress: Callable[[str], Awaitable[None]] | None = field(default=None, compare=False)
+    early: bool = field(default=False, compare=False)
 
 
 class MLXWorkerService:
@@ -496,6 +497,7 @@ class MLXWorkerService:
         self._active_job_kind: Literal["ast", "polish", "maintenance"] | None = None
         self._queued_partial_jobs: dict[int, _QueuedJob] = {}
         self._final_utterance_ids: set[int] = set()
+        self._early_jobs: dict[int, _QueuedJob] = {}
         self._mp_context = mp.get_context("spawn")
         self._cancelled_job_id = self._mp_context.Value("q", -1)
         self._active_job: _QueuedJob | None = None
@@ -560,7 +562,10 @@ class MLXWorkerService:
         code_switching_enabled: bool,
         max_tokens: int,
         on_progress: Callable[[str], Awaitable[None]] | None = None,
+        early: bool = False,
     ) -> ASTResult | None:
+        """Queue one decode. An early final is a final decode started in a pause
+        before the commit; it stays cancellable until the session claims it."""
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
         job = _QueuedJob(
@@ -569,6 +574,7 @@ class MLXWorkerService:
             kind="ast",
             future=future,
             on_progress=on_progress,
+            early=early,
             payload={
                 "priority": priority,
                 "utterance_id": utterance_id,
@@ -590,6 +596,14 @@ class MLXWorkerService:
                 if previous is not None and not previous.future.done():
                     previous.future.set_result(None)
                 self._queued_partial_jobs[utterance_id] = job
+            elif early:
+                # Its audio contains any queued preview's audio. A running preview
+                # finishes: if speech resumes, its text is all the screen gets.
+                if previous is not None:
+                    self._queued_partial_jobs.pop(utterance_id, None)
+                    if not previous.future.done():
+                        previous.future.set_result(None)
+                self._early_jobs[utterance_id] = job
             else:
                 self._final_utterance_ids.add(utterance_id)
                 if previous is not None:
@@ -597,7 +611,11 @@ class MLXWorkerService:
                     if not previous.future.done():
                         previous.future.set_result(None)
         await self._queue.put(job)
-        return await future
+        try:
+            return await future
+        finally:
+            if utterance_id is not None and self._early_jobs.get(utterance_id) is job:
+                del self._early_jobs[utterance_id]
 
     async def submit_polish(self, text: str) -> str:
         loop = asyncio.get_running_loop()
@@ -625,6 +643,15 @@ class MLXWorkerService:
         if job is not None and not job.future.done():
             job.future.set_result(None)
 
+    def cancel_early_final(self, utterance_id: int) -> None:
+        """Drop an early final when speech resumes or the commit has other audio."""
+        job = self._early_jobs.pop(utterance_id, None)
+        if job is None:
+            return
+        if self._active_job is job:
+            self._cancelled_job_id.value = job.sequence
+        elif not job.future.done():
+            job.future.set_result(None)
 
     async def submit_maintenance(self) -> None:
         loop = asyncio.get_running_loop()
@@ -762,7 +789,7 @@ class MLXWorkerService:
             "kind": job.kind,
             "cancellable": (
                 job.kind == "ast"
-                and job.payload.get("priority") == "partial"
+                and (job.payload.get("priority") == "partial" or job.early)
             ),
             "payload": payload,
         }

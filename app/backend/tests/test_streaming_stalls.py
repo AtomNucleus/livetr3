@@ -42,6 +42,7 @@ def test_trailing_silence_does_not_start_preview_before_imminent_final(monkeypat
     async def run():
         value = make_session(monkeypatch)
         value.worker.is_busy_or_backlogged = True
+        value.worker.submit_ast = AsyncMock(return_value=None)
         value._schedule_ast = Mock()
         speech = np.full(320, 0.1, dtype=np.float32)
         silence = np.zeros(320, dtype=np.float32)
@@ -57,8 +58,9 @@ def test_trailing_silence_does_not_start_preview_before_imminent_final(monkeypat
         value._schedule_ast.assert_called_once()
         priority, utterance_id, audio = value._schedule_ast.call_args.args
         assert (priority, utterance_id) == ("final", 1)
+        # The final decodes the speech plus the 300 ms trim pad.
         np.testing.assert_array_equal(
-            audio, np.concatenate([speech] * 20 + [silence] * 20)
+            audio, np.concatenate([speech] * 20 + [silence] * 15)
         )
     asyncio.run(run())
 
