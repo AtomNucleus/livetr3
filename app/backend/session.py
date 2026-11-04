@@ -111,6 +111,15 @@ MIN_TRANSCRIBABLE_VOICED_MS = max(
 TRANSCRIBABLE_TRIM_PAD_SECONDS = min(
     1.0, max(0.0, float(os.getenv("TRANSCRIBABLE_TRIM_PAD_SECONDS", "0.30")))
 )
+TRANSCRIBABLE_TRIM_PAD_FRAMES = max(1, int(np.ceil(TRANSCRIBABLE_TRIM_PAD_SECONDS / 0.02)))
+# Once a pause is as long as the trim pad, the trimmed audio is what the final
+# would decode. Start that decode then, and keep it if Silero ends the speech.
+EARLY_FINAL_ENABLED = os.getenv("LIVETR3_EARLY_FINAL", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 DECODED_PREFIX_PAUSE_FRAMES = 8  # 160 ms of quiet audio at a word/phrase boundary.
 
 
@@ -128,6 +137,9 @@ class UtteranceRuntime:
     latest_partial_translation: str = ""
     partial_audio_snapshot: np.ndarray | None = None
     partial_last_audio_unix_seconds: float | None = None
+    quiet_frames: int = 0
+    early_final_audio: np.ndarray | None = None
+    early_final_task: asyncio.Task | None = None
 
 
 def _source_text_ends_sentence(text: str) -> bool:
@@ -217,7 +229,7 @@ def _trim_to_transcribable_audio(audio: np.ndarray) -> np.ndarray:
     if voiced_indices.size == 0:
         return audio
 
-    pad_frames = max(1, int(np.ceil(TRANSCRIBABLE_TRIM_PAD_SECONDS / 0.02)))
+    pad_frames = TRANSCRIBABLE_TRIM_PAD_FRAMES
     start_frame = max(0, int(voiced_indices[0]) - pad_frames)
     end_frame = min(frame_count, int(voiced_indices[-1]) + pad_frames + 1)
     return audio[start_frame * FRAME_SAMPLES : end_frame * FRAME_SAMPLES].astype(
@@ -539,6 +551,9 @@ class TranscriptionSession:
             runtime.last_audio_frame_unix_seconds = time.time()
             runtime.voiced_audio_samples += FRAME_SAMPLES
 
+        if result.speech_active and self.state.active_utterance_id is not None:
+            self._track_early_final(self.state.active_utterance_id, result.rms)
+
         if (
             result.speech_active
             # During trailing silence a final is imminent. Starting another
@@ -607,6 +622,7 @@ class TranscriptionSession:
                 self.segmenter.reset()
             if self.state.active_utterance_id == utterance_id:
                 self.state.active_utterance_id = None
+            self.worker.cancel_early_final(utterance_id)
             self._finalized.add(utterance_id)
             self._finalizing.pop(utterance_id, None)
             self._utterance_runtime.pop(utterance_id, None)
@@ -638,7 +654,12 @@ class TranscriptionSession:
                 utterance_id,
                 audio.shape[0] / 16_000,
             )
-            self._schedule_ast("final", utterance_id, audio)
+            # A pause final decodes the same trimmed audio as its early decode.
+            final_audio = (
+                transcribable_audio
+                if EARLY_FINAL_ENABLED and reason == "silero_end" else audio
+            )
+            self._schedule_ast("final", utterance_id, final_audio)
             return True
 
     def _schedule_ast(
@@ -679,64 +700,132 @@ class TranscriptionSession:
                     priority, utterance_id, elapsed, audio.size / 16_000,
                 )
 
+    def _track_early_final(self, utterance_id: int, rms: float) -> None:
+        runtime = self._utterance_runtime.get(utterance_id)
+        if runtime is None:
+            return
+        if rms >= MIN_TRANSCRIBABLE_FRAME_RMS:
+            runtime.quiet_frames = 0
+            if runtime.early_final_task is not None:
+                # Speech resumed, so the early decode covers only a prefix.
+                trace("early_final", session=self.session_id, utterance=utterance_id, event="resumed")
+                runtime.early_final_task = runtime.early_final_audio = None
+                self.worker.cancel_early_final(utterance_id)
+            return
+        runtime.quiet_frames += 1
+        if (
+            not EARLY_FINAL_ENABLED
+            or runtime.quiet_frames != TRANSCRIBABLE_TRIM_PAD_FRAMES
+            or utterance_id in self._finalizing or utterance_id in self._finalized
+        ):
+            return
+        audio = _trim_to_transcribable_audio(self.segmenter.current_audio())
+        if not _audio_has_transcribable_energy(audio):
+            return
+        runtime.early_final_audio = audio
+        task = asyncio.create_task(
+            self._submit_ast("final", utterance_id, audio, early=True),
+            name=f"early-final-ast-{utterance_id}",
+        )
+        runtime.early_final_task = task
+        self._jobs.add(task)
+        task.add_done_callback(self._jobs.discard)
+        # A dropped early decode's error is never awaited; a claimed one falls back.
+        task.add_done_callback(lambda done: done.cancelled() or done.exception())
+        trace("early_final", session=self.session_id, utterance=utterance_id,
+              event="start", samples=audio.size)
+
+    def _claim_early_final(self, utterance_id: int, audio: np.ndarray) -> asyncio.Task | None:
+        runtime = self._utterance_runtime.get(utterance_id)
+        if runtime is None or runtime.early_final_task is None:
+            return None
+        task, early_audio = runtime.early_final_task, runtime.early_final_audio
+        runtime.early_final_task = runtime.early_final_audio = None
+        if early_audio is not None and np.array_equal(early_audio, audio):
+            return task
+        trace("early_final", session=self.session_id, utterance=utterance_id, event="mismatch")
+        self.worker.cancel_early_final(utterance_id)
+        return None
+
+    async def _publish_progress(self, priority: str, utterance_id: int, text: str) -> None:
+        if utterance_id in self._finalized:
+            return
+        if priority == "partial" and utterance_id in self._finalizing:
+            return
+        original, translation = _parse_ast_response(
+            text,
+            self.state.config.target_lang,
+            self.state.config.source_lang,
+        )
+        original = original.strip()
+        translation = translation.strip()
+        if not original:
+            return
+        if not self._should_translate_final(original):
+            translation = original
+        runtime = self._utterance_runtime.setdefault(
+            utterance_id,
+            UtteranceRuntime(partials=deque(maxlen=self._stability_window())),
+        )
+        if (
+            original == runtime.latest_partial_original
+            and translation == runtime.latest_partial_translation
+        ):
+            return
+        runtime.latest_partial_original = original
+        runtime.latest_partial_translation = translation
+        await self._send_and_broadcast(
+            TranscriptMessage(
+                type="partial",
+                utterance_id=utterance_id,
+                original=original,
+                translation=translation,
+            ).model_dump(exclude_none=True)
+        )
+
+    async def _submit_ast(
+        self, priority: str, utterance_id: int, audio: np.ndarray, *, early: bool = False,
+    ) -> ASTResult | None:
+        trace("inference_submit", session=getattr(self, "session_id", ""), utterance=utterance_id, priority=priority, samples=audio.size)
+        async def publish_progress(text: str) -> None:
+            await self._publish_progress(priority, utterance_id, text)
+        return await self.worker.submit_ast(
+            priority="final" if priority == "final" else "partial",
+            utterance_id=utterance_id,
+            audio_f32_16k=audio,
+            src=self.state.config.source_lang,
+            tgt=self.state.config.target_lang,
+            # Model-generated prior captions can repeat an earlier recognition error,
+            # so earlier source text is a default-off replay experiment.
+            prior_context=(list(self.state.prior_context)
+                           if os.getenv("LIVETR3_AST_SOURCE_CONTEXT", "0") == "1" else []),
+            custom_vocab=self.state.config.custom_vocab,
+            code_switching_enabled=self.state.config.code_switching_enabled,
+            max_tokens=self._max_tokens_for_ast(priority, audio),
+            on_progress=publish_progress,
+            early=early,
+        )
+
     async def _run_mlx_ast(self, priority: str, utterance_id: int, audio: np.ndarray) -> None:
         config = self.state.config.model_copy(deep=True)
         runtime = self._utterance_runtime.get(utterance_id)
         snapshot = runtime.partial_audio_snapshot if priority == "partial" and runtime else None
         snapshot_last_audio = runtime.partial_last_audio_unix_seconds if runtime else None
-        async def publish_progress(text: str) -> None:
-            if utterance_id in self._finalized:
-                return
-            if priority == "partial" and utterance_id in self._finalizing:
-                return
-            original, translation = _parse_ast_response(
-                text,
-                self.state.config.target_lang,
-                self.state.config.source_lang,
-            )
-            original = original.strip()
-            translation = translation.strip()
-            if not original:
-                return
-            if not self._should_translate_final(original):
-                translation = original
-            runtime = self._utterance_runtime.setdefault(
-                utterance_id,
-                UtteranceRuntime(partials=deque(maxlen=self._stability_window())),
-            )
-            if (
-                original == runtime.latest_partial_original
-                and translation == runtime.latest_partial_translation
-            ):
-                return
-            runtime.latest_partial_original = original
-            runtime.latest_partial_translation = translation
-            await self._send_and_broadcast(
-                TranscriptMessage(
-                    type="partial",
-                    utterance_id=utterance_id,
-                    original=original,
-                    translation=translation,
-                ).model_dump(exclude_none=True)
-            )
+        early = self._claim_early_final(utterance_id, audio) if priority == "final" else None
 
         try:
-            trace("inference_submit", session=getattr(self, "session_id", ""), utterance=utterance_id, priority=priority, samples=audio.size)
-            result = await self.worker.submit_ast(
-                priority="final" if priority == "final" else "partial",
-                utterance_id=utterance_id,
-                audio_f32_16k=audio,
-                src=self.state.config.source_lang,
-                tgt=self.state.config.target_lang,
-                # Model-generated prior captions can repeat an earlier recognition error,
-                # so earlier source text is a default-off replay experiment.
-                prior_context=(list(self.state.prior_context)
-                               if os.getenv("LIVETR3_AST_SOURCE_CONTEXT", "0") == "1" else []),
-                custom_vocab=self.state.config.custom_vocab,
-                code_switching_enabled=self.state.config.code_switching_enabled,
-                max_tokens=self._max_tokens_for_ast(priority, audio),
-                on_progress=publish_progress,
-            )
+            result = None
+            if early is not None:
+                try:
+                    result = await early
+                except Exception:
+                    logger.exception("early final failed; decoding the final again")
+                if isinstance(result, ASTResult) and result.complete:
+                    trace("early_final", session=self.session_id, utterance=utterance_id, event="used")
+                else:
+                    result = None
+            if result is None:
+                result = await self._submit_ast(priority, utterance_id, audio)
         except asyncio.CancelledError:
             raise
         except InferenceTimeoutError as exc:
@@ -831,6 +920,7 @@ class TranscriptionSession:
                 return False
             self._finalizing[utterance_id] = "decoded_prefix"
             self.worker.finish_partials(utterance_id)
+            self.worker.cancel_early_final(utterance_id)
             runtime = self._utterance_runtime[utterance_id]
             tail_last_audio = runtime.last_audio_frame_unix_seconds
             runtime.last_audio_frame_unix_seconds = last_audio_unix_seconds
