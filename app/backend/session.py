@@ -789,22 +789,41 @@ class TranscriptionSession:
         trace("inference_submit", session=getattr(self, "session_id", ""), utterance=utterance_id, priority=priority, samples=audio.size)
         async def publish_progress(text: str) -> None:
             await self._publish_progress(priority, utterance_id, text)
-        return await self.worker.submit_ast(
-            priority="final" if priority == "final" else "partial",
-            utterance_id=utterance_id,
-            audio_f32_16k=audio,
-            src=self.state.config.source_lang,
-            tgt=self.state.config.target_lang,
-            # Model-generated prior captions can repeat an earlier recognition error,
-            # so earlier source text is a default-off replay experiment.
-            prior_context=(list(self.state.prior_context)
-                           if os.getenv("LIVETR3_AST_SOURCE_CONTEXT", "0") == "1" else []),
-            custom_vocab=self.state.config.custom_vocab,
-            code_switching_enabled=self.state.config.code_switching_enabled,
-            max_tokens=self._max_tokens_for_ast(priority, audio),
-            on_progress=publish_progress,
-            early=early,
-        )
+        timing: dict = {}
+        submitted_at = time.monotonic()
+        outcome = "error"
+        try:
+            result = await self.worker.submit_ast(
+                priority="final" if priority == "final" else "partial",
+                utterance_id=utterance_id,
+                audio_f32_16k=audio,
+                src=self.state.config.source_lang,
+                tgt=self.state.config.target_lang,
+                # Model-generated prior captions can repeat an earlier recognition error,
+                # so earlier source text is a default-off replay experiment.
+                prior_context=(list(self.state.prior_context)
+                               if os.getenv("LIVETR3_AST_SOURCE_CONTEXT", "0") == "1" else []),
+                custom_vocab=self.state.config.custom_vocab,
+                code_switching_enabled=self.state.config.code_switching_enabled,
+                max_tokens=self._max_tokens_for_ast(priority, audio),
+                on_progress=publish_progress,
+                early=early,
+                timing=timing,
+            )
+            outcome = ("dropped" if result is None
+                       else "complete" if result.complete else "incomplete")
+            return result
+        finally:
+            # Live archives keep no engine log, so each decode's timing goes in
+            # the transcript: a slow decode shows up apart from a long queue.
+            if getattr(self, "_archive_dir", None) is not None:
+                self._record_archive_payload({
+                    "type": "decode", "utterance_id": utterance_id, "priority": priority,
+                    "early": early, "audio_seconds": round(audio.size / 16_000, 3),
+                    "total_seconds": round(time.monotonic() - submitted_at, 3),
+                    **{key: round(value, 3) for key, value in timing.items()},
+                    "outcome": outcome,
+                })
 
     async def _run_mlx_ast(self, priority: str, utterance_id: int, audio: np.ndarray) -> None:
         config = self.state.config.model_copy(deep=True)
