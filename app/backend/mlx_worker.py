@@ -477,6 +477,7 @@ class _QueuedJob:
     enqueued_at: float = field(default_factory=time.monotonic, compare=False)
     on_progress: Callable[[str], Awaitable[None]] | None = field(default=None, compare=False)
     early: bool = field(default=False, compare=False)
+    timing: dict | None = field(default=None, compare=False)
 
 
 class MLXWorkerService:
@@ -563,9 +564,11 @@ class MLXWorkerService:
         max_tokens: int,
         on_progress: Callable[[str], Awaitable[None]] | None = None,
         early: bool = False,
+        timing: dict | None = None,
     ) -> ASTResult | None:
         """Queue one decode. An early final is a final decode started in a pause
-        before the commit; it stays cancellable until the session claims it."""
+        before the commit; it stays cancellable until the session claims it.
+        If the decode runs, `timing` gets its queue and inference seconds."""
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
         job = _QueuedJob(
@@ -575,6 +578,7 @@ class MLXWorkerService:
             future=future,
             on_progress=on_progress,
             early=early,
+            timing=timing,
             payload={
                 "priority": priority,
                 "utterance_id": utterance_id,
@@ -703,6 +707,9 @@ class MLXWorkerService:
                 result = await self._execute_job(job)
                 finished_at = time.monotonic()
                 trace("worker_complete", utterance=job.payload.get("utterance_id"), priority=job.payload.get("priority"), inference_seconds=finished_at-dispatched_at, kind=job.kind)
+                if job.timing is not None:
+                    job.timing.update(queue_seconds=dispatched_at - job.enqueued_at,
+                                      inference_seconds=finished_at - dispatched_at)
                 if finished_at - job.enqueued_at >= 1.0:
                     logger.warning(
                         "slow_inference engine=gemma priority=%s utterance_id=%s queue_seconds=%.3f inference_seconds=%.3f",
