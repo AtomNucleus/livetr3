@@ -384,18 +384,20 @@ def test_long_final_retry_stays_inside_the_768_token_cap(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("text", "reason", "expected"),
+    ("text", "reason", "expected", "expected_budgets"),
     [
         (
             "We cannot go\nSpanish: No podemos",
             "length",
             ASTResult("We cannot go", "No podemos", False, True),
+            [100, 200],
         ),
-        ("We cannot go", "stop", ASTResult("We cannot go", "", False, False)),
+        # Greedy decoding repeats a stopped output, so it isn't retried.
+        ("We cannot go", "stop", ASTResult("We cannot go", "", False, False), [100]),
     ],
 )
 def test_final_stays_incomplete_after_one_failed_retry(
-    monkeypatch, tmp_path, text, reason, expected
+    monkeypatch, tmp_path, text, reason, expected, expected_budgets
 ):
     streams = [
         [SimpleNamespace(text=text, generation_tokens=budget, finish_reason=reason)]
@@ -413,7 +415,7 @@ def test_final_stays_incomplete_after_one_failed_retry(
     )
 
     assert result == expected
-    assert budgets == [100, 200]
+    assert budgets == expected_budgets
 
 
 def test_truncated_partial_does_not_retry(monkeypatch, tmp_path):

@@ -138,6 +138,8 @@ class UtteranceRuntime:
     partial_audio_snapshot: np.ndarray | None = None
     partial_last_audio_unix_seconds: float | None = None
     quiet_frames: int = 0
+    # Samples up to the trim pad into the current pause; a pause final ends here.
+    pause_cut_samples: int | None = None
     early_final_audio: np.ndarray | None = None
     early_final_task: asyncio.Task | None = None
 
@@ -551,15 +553,18 @@ class TranscriptionSession:
             runtime.last_audio_frame_unix_seconds = time.time()
             runtime.voiced_audio_samples += FRAME_SAMPLES
 
+        # Room noise can keep frame RMS above the floor through a pause, so a
+        # frame Silero hears no speech in counts as quiet too.
+        quiet = result.rms < MIN_TRANSCRIBABLE_FRAME_RMS or result.quiet
         if result.speech_active and self.state.active_utterance_id is not None:
-            self._track_early_final(self.state.active_utterance_id, result.rms)
+            self._track_early_final(self.state.active_utterance_id, quiet)
 
         if (
             result.speech_active
             # During trailing silence a final is imminent. Starting another
             # preview here makes that final wait for a redundant prefill before
             # the worker can observe cancellation. Keep recording every frame.
-            and result.rms >= MIN_TRANSCRIBABLE_FRAME_RMS
+            and not quiet
             and DEFAULT_PARTIAL_AST_ENABLED
             and self.state.active_utterance_id not in self._finalizing
             and self._active_utterance_has_new_speech_for_partial()
@@ -654,11 +659,14 @@ class TranscriptionSession:
                 utterance_id,
                 audio.shape[0] / 16_000,
             )
-            # A pause final decodes the same trimmed audio as its early decode.
-            final_audio = (
-                transcribable_audio
-                if EARLY_FINAL_ENABLED and reason == "silero_end" else audio
-            )
+            # A pause final decodes the same trimmed audio as its early decode:
+            # speech up to the trim pad into the pause.
+            runtime = self._utterance_runtime.get(utterance_id)
+            cut = runtime.pause_cut_samples if runtime is not None else None
+            final_audio = audio
+            if EARLY_FINAL_ENABLED and reason == "silero_end":
+                final_audio = (_trim_to_transcribable_audio(audio[:cut])
+                               if cut else transcribable_audio)
             self._schedule_ast("final", utterance_id, final_audio)
             return True
 
@@ -700,12 +708,13 @@ class TranscriptionSession:
                     priority, utterance_id, elapsed, audio.size / 16_000,
                 )
 
-    def _track_early_final(self, utterance_id: int, rms: float) -> None:
+    def _track_early_final(self, utterance_id: int, quiet: bool) -> None:
         runtime = self._utterance_runtime.get(utterance_id)
         if runtime is None:
             return
-        if rms >= MIN_TRANSCRIBABLE_FRAME_RMS:
+        if not quiet:
             runtime.quiet_frames = 0
+            runtime.pause_cut_samples = None
             if runtime.early_final_task is not None:
                 # Speech resumed, so the early decode covers only a prefix.
                 trace("early_final", session=self.session_id, utterance=utterance_id, event="resumed")
@@ -713,13 +722,13 @@ class TranscriptionSession:
                 self.worker.cancel_early_final(utterance_id)
             return
         runtime.quiet_frames += 1
-        if (
-            not EARLY_FINAL_ENABLED
-            or runtime.quiet_frames != TRANSCRIBABLE_TRIM_PAD_FRAMES
-            or utterance_id in self._finalizing or utterance_id in self._finalized
-        ):
+        if not EARLY_FINAL_ENABLED or runtime.quiet_frames != TRANSCRIBABLE_TRIM_PAD_FRAMES:
             return
-        audio = _trim_to_transcribable_audio(self.segmenter.current_audio())
+        current = self.segmenter.current_audio()
+        runtime.pause_cut_samples = current.size
+        if utterance_id in self._finalizing or utterance_id in self._finalized:
+            return
+        audio = _trim_to_transcribable_audio(current)
         if not _audio_has_transcribable_energy(audio):
             return
         runtime.early_final_audio = audio
@@ -863,7 +872,10 @@ class TranscriptionSession:
             await self._send_error("Inference failed: model returned an invalid AST result")
             return
         if not result.complete:
-            if priority == "final":
+            if priority == "final" and not result.truncated and not result.original.strip():
+                # The model heard nothing to caption (e.g. only "Spanish:").
+                logger.info("final_commit empty utterance_id=%s", utterance_id)
+            elif priority == "final":
                 await self._send_error(
                     "Final inference remained incomplete after one retry; no final caption was published"
                 )
@@ -1063,6 +1075,20 @@ class TranscriptionSession:
             raise
         except Exception as exc:
             await self._send_error(f"Model warmup failed: {exc}")
+            return
+        # A preloaded model that sat idle decodes 2-3x slower until one decode
+        # wakes the GPU. Spend that decode now, not on the first caption.
+        try:
+            await self.worker.submit_ast(
+                priority="partial", utterance_id=None,
+                audio_f32_16k=np.zeros(16_000, dtype=np.float32),
+                src=self.state.config.source_lang, tgt=self.state.config.target_lang,
+                prior_context=[], custom_vocab=[], code_switching_enabled=False, max_tokens=8,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.info("session warm decode failed", exc_info=True)
 
     async def _maybe_commit_early(self, utterance_id: int, original: str) -> None:
         if not self._early_commit_enabled():

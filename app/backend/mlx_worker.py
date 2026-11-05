@@ -262,7 +262,8 @@ class MLXWorker:
                 result = generate_once(max_tokens)
             if result is None:
                 return None
-            if priority == "final" and not result.complete:
+            # Decoding is greedy, so only a truncated final can come out different.
+            if priority == "final" and result.truncated:
                 retry_budget = min(768, max_tokens * 2)
                 if retry_budget > max_tokens:
                     try:
