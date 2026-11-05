@@ -1077,13 +1077,15 @@ class TranscriptionSession:
             await self._send_error(f"Model warmup failed: {exc}")
             return
         # A preloaded model that sat idle decodes 2-3x slower until one decode
-        # wakes the GPU. Spend that decode now, not on the first caption.
+        # wakes the GPU. Spend that decode now, not on the first caption. With
+        # the captions' own prompt options it also caches their instruction prefix.
         try:
             await self.worker.submit_ast(
                 priority="partial", utterance_id=None,
                 audio_f32_16k=np.zeros(16_000, dtype=np.float32),
                 src=self.state.config.source_lang, tgt=self.state.config.target_lang,
-                prior_context=[], custom_vocab=[], code_switching_enabled=False, max_tokens=8,
+                prior_context=[], custom_vocab=self.state.config.custom_vocab,
+                code_switching_enabled=self.state.config.code_switching_enabled, max_tokens=8,
             )
         except asyncio.CancelledError:
             raise
