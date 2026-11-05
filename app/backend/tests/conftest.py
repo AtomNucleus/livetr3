@@ -19,4 +19,5 @@ if platform.system() != "Darwin" or platform.machine() != "arm64":
         "test_engine_host.py",
         "test_early_final.py",
         "test_decode_timing.py",
+        "test_noisy_room.py",
     ]

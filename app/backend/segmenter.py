@@ -28,6 +28,8 @@ class SegmentResult:
     speech_ended: bool = False
     force_flushed: bool = False
     audio: np.ndarray | None = None
+    # Silero hears no speech in this frame, however loud the room noise is.
+    quiet: bool = False
 
 
 class RMSGate:
@@ -276,6 +278,11 @@ class SileroVAD(RMSGate):
             self._silent_frames = self._silent_frames + 1 if rms <= silence else 0
         else:
             self._silent_frames = 0
+        # Silero sets temp_end when speech probability drops in a pause, and its
+        # own end of speech is temp_end plus the speech pad.
+        quiet = self._silero_active and (
+            bool(getattr(self._vad_iterator, "temp_end", 0)) or self._silent_frames > 0
+        )
         end_event = bool(event and "end" in event) or (
             self._silero_active and self._silent_frames >= self._silence_flush_frames
         )
@@ -301,6 +308,7 @@ class SileroVAD(RMSGate):
                 speech_ended=speech_ended,
                 audio=audio if speech_ended else None,
             )
+        result.quiet = quiet
         return result
 
 
