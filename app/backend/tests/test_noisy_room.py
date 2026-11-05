@@ -67,6 +67,20 @@ def test_session_start_runs_one_warm_decode(monkeypatch):
     asyncio.run(run())
 
 
+def test_warm_decode_uses_the_captions_prompt_so_it_caches_their_prefix(monkeypatch):
+    async def run():
+        value = make_session(monkeypatch)
+        value.state.config = ConfigMessage(polish_enabled=False, custom_vocab=["Ephesians"],
+                                           code_switching_enabled=True)
+        value.worker.start = AsyncMock()
+        value.worker.submit_ast = AsyncMock(return_value=None)
+        await value._warm_mlx_worker()
+        warm = value.worker.submit_ast.await_args.kwargs
+        # The vocabulary and code-switching lines sit before the audio token.
+        assert warm["custom_vocab"] == ["Ephesians"] and warm["code_switching_enabled"]
+    asyncio.run(run())
+
+
 def test_empty_final_is_dropped_without_an_error(monkeypatch):
     async def run():
         value = make_session(monkeypatch)

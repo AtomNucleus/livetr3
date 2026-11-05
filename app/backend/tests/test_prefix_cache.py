@@ -192,3 +192,50 @@ def test_cancel_in_the_cached_path_still_propagates(monkeypatch, tmp_path):
     assert worker.ast(np.ones(16000), "English", "Spanish", [], priority="partial",
                       cancelled=lambda: False) is None
     assert worker._prefix_cache is cache
+
+
+def test_cancel_during_the_prefix_build_leaves_nothing_cached(model):
+    # The cancel hook raises from the language model, here mid-build.
+    import mlx_worker
+
+    model.prompts.update(a=[1, 2, 3, BOA, 7])
+    cache = PrefixKVCache(model)
+
+    class Cancelling:
+        def __call__(self, inputs, cache, logits_to_keep):
+            raise mlx_worker.GenerationCancelled
+
+    model.language_model = Cancelling()
+    with pytest.raises(mlx_worker.GenerationCancelled):
+        cache.prepare(None, "a", "x.wav")
+    assert cache.builds == 0
+    model.language_model = FakeLanguageModel()
+    cache.prepare(None, "a", "x.wav")
+    assert cache.builds == 1 and model.language_model.prefills == [[1, 2, 3]]
+
+
+def test_cancel_while_the_early_final_prepares_keeps_the_cache(monkeypatch, tmp_path):
+    import sys
+
+    import numpy as np
+
+    import mlx_worker
+    from test_ast_streaming import _patch_mlx, _worker
+
+    traced = []
+    monkeypatch.setattr(mlx_worker, "trace", lambda stage, **fields: traced.append(stage))
+    _patch_mlx(monkeypatch, [])
+    calls = []
+    sys.modules["mlx_vlm"].stream_generate = lambda *args, **kwargs: calls.append(kwargs)
+
+    class CancelledCache(BrokenCache):
+        def prepare(self, processor, prompt, audio_path):
+            raise mlx_worker.GenerationCancelled
+
+    worker = _worker(tmp_path)
+    draft = worker._draft_model = object()
+    cache = worker._prefix_cache = CancelledCache("prepare")
+    assert worker.ast(np.ones(16000), "English", "Spanish", [], priority="final",
+                      cancelled=lambda: False) is None
+    assert worker._prefix_cache is cache and worker._draft_model is draft
+    assert calls == [] and "prefix_cache_failed" not in traced
