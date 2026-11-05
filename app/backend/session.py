@@ -1247,7 +1247,7 @@ class TranscriptionSession:
         silero_threshold = min(max(config.silero_threshold or 0.5, 0.1), 0.95)
         speech_pad_ms = min(max(config.speech_pad_ms or 300, 0), 2000)
         min_silence_ms = min(max(config.min_silence_ms or 300, 100), 5000)
-        max_utterance_seconds = min(max(config.max_utterance_seconds or 6.0, 5.0), 29.0)
+        max_utterance_seconds = min(max(config.max_utterance_seconds or 5.0, 5.0), 29.0)
         return make_segmenter(
             config.segmenter,
             rms_threshold,
