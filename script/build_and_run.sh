@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="LiveTR3"
 PACKAGE_DIR="$ROOT/macos/LiveTR3Mac"
 BUNDLE="$ROOT/dist/$APP_NAME.app"
-APP_ICON="$PACKAGE_DIR/Resources/AppIcon.icns"
+APP_ICON="$PACKAGE_DIR/Resources/AppIcon.icon"
 
 verify=false
 launch=true
@@ -26,7 +26,10 @@ EXECUTABLE="$(swift build -c release --show-bin-path)/$APP_NAME"
 rm -rf "$BUNDLE"
 mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
 cp "$EXECUTABLE" "$BUNDLE/Contents/MacOS/$APP_NAME"
-cp "$APP_ICON" "$BUNDLE/Contents/Resources/AppIcon.icns"
+# Compile the Icon Composer icon: Assets.car (Liquid Glass) plus an AppIcon.icns fallback.
+xcrun actool "$APP_ICON" --compile "$BUNDLE/Contents/Resources" \
+  --platform macosx --minimum-deployment-target 14.0 --app-icon AppIcon \
+  --output-partial-info-plist "$(mktemp -t livetr3-icon).plist" >/dev/null
 cat > "$BUNDLE/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -39,6 +42,8 @@ cat > "$BUNDLE/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key>
   <string>$APP_NAME</string>
   <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
+  <key>CFBundleIconName</key>
   <string>AppIcon</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
