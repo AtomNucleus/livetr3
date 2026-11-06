@@ -64,8 +64,5 @@ struct LiveTR3App: App {
                     openWindow(id: LiveTR3WindowID.projector)
                 }
             }
-            .onDisappear {
-                runtime.stop()
-            }
     }
 }

@@ -13,11 +13,11 @@ final class SessionController: ObservableObject {
     @Published private(set) var status: SessionCaptureStatus = .idle
     @Published private(set) var paused = false
     @Published private(set) var error: String?
-    @Published private(set) var levels: [Float] = Array(repeating: 0, count: 10)
     @Published var config: ClientConfig
     @Published var selectedDeviceID: String = ""
 
     let transcript = TranscriptStore()
+    let levelMeter = AudioLevelMeter()
 
     private let sessionManager: SessionManager
     private let runtime: LiveTR3Runtime
@@ -79,7 +79,16 @@ final class SessionController: ObservableObject {
     func pauseResume() {
         guard status == .running else { return }
         paused.toggle()
-        audio.setPaused(paused)
+        guard paused else {
+            audio.setPaused(false)
+            return
+        }
+        // No audio reaches the engine while paused, so it would never hear the
+        // silence that ends the line in progress. Finish that line once the
+        // last frame before the pause has gone out; the next starts on resume.
+        audio.setPaused(true) {
+            Task { @MainActor [weak self] in self?.commitNow() }
+        }
     }
 
     func commitNow() {
@@ -267,10 +276,7 @@ final class SessionController: ObservableObject {
     }
 
     private func appendLevel(_ rms: Float) {
-        if levels.count >= 10 {
-            levels.removeFirst()
-        }
-        levels.append(rms)
+        levelMeter.record(rms)
     }
 
     private var selectedDeviceLabel: String? {

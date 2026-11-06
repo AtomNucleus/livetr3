@@ -145,7 +145,7 @@ struct TeleprompterSessionSheetOperatorView: View {
 
             liveStatus
 
-            WaveformMeterView(levels: session.levels, rms: session.levels.last ?? 0)
+            LiveWaveformMeter(meter: session.levelMeter)
 
             Circle()
                 .fill(Color.green)

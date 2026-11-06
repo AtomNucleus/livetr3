@@ -67,17 +67,21 @@ final class ProjectorRollUpTests: XCTestCase {
         XCTAssertFalse(feed.words.contains(where: \.isDraft))
     }
 
-    func testRewrittenDraftSwapsWordsInPlaceWithoutMovingLaterCaptions() {
+    func testRestartedShorterDraftKeepsItsWordsUntilItCatchesUp() {
         var feed = ProjectorRollUpFeed()
         feed.receive([entry(1, "uno dos tres"), entry(2, "cuatro cinco seis ", state: .partial)])
         feed.tick(at: 0)
         run(&feed, from: 0, to: 5)
         feed.receive([entry(1, "uno dos tres"), entry(2, "cuatro", state: .partial)])
         feed.tick(at: 5.1)
-        XCTAssertEqual(text(feed), "uno dos tres", "A shrinking draft hides only its own words")
+        XCTAssertEqual(text(feed), "uno dos tres cuatro cinco seis",
+                       "A restarted decode must not hide words and reveal them again")
+        feed.receive([entry(1, "uno dos tres"), entry(2, "cuatro cinco siete ocho ", state: .partial)])
+        feed.tick(at: 5.2)
+        XCTAssertEqual(text(feed), "uno dos tres cuatro cinco siete ocho", "A caught-up draft swaps words in place")
         feed.receive([entry(1, "uno dos tres"), entry(2, "siete ocho")])
-        run(&feed, from: 5.1, to: 6)
-        XCTAssertEqual(text(feed), "uno dos tres siete ocho")
+        run(&feed, from: 5.2, to: 6)
+        XCTAssertEqual(text(feed), "uno dos tres siete ocho", "A final always wins")
     }
 
     func testLongPauseStartsANewParagraph() {
@@ -90,15 +94,65 @@ final class ProjectorRollUpTests: XCTestCase {
         XCTAssertEqual(feed.words.map(\.startsParagraph), [false, false, false, true])
     }
 
-    func testKeepsOnlyTheNewestWords() {
+    func testNonStopSpeechBreaksIntoParagraphsAfterASentence() {
         var feed = ProjectorRollUpFeed()
-        let entries = (1...30).map { entry($0, "a b c d e f") }
-        feed.receive(entries)
+        // Six-word captions; only caption 9 ends a sentence.
+        feed.receive((1...12).map { id in
+            entry(id, id == 9 ? "a b c d e fin." : "a b c d e f", startedAt: Double(id), endedAt: Double(id) + 1)
+        })
         feed.tick(at: 0)
         run(&feed, from: 0, to: 30)
-        XCTAssertEqual(feed.words.count, ProjectorRollUpFeed.maxWords)
-        XCTAssertEqual(feed.words.last?.id, "30-5")
+        let starts = feed.words.indices.filter { feed.words[$0].startsParagraph }
+        XCTAssertEqual(starts, [54], "The caption after the first sentence end past 40 words starts a paragraph")
+        XCTAssertEqual(feed.words[54].id, "10-0")
+    }
+
+    func testNonStopSpeechWithoutSentenceEndsStillBreaksAtTheHardLimit() {
+        var feed = ProjectorRollUpFeed()
+        feed.receive((1...16).map { entry($0, "a b c d e f", startedAt: Double($0), endedAt: Double($0) + 1) })
+        feed.tick(at: 0)
+        run(&feed, from: 0, to: 40)
+        let starts = feed.words.indices.filter { feed.words[$0].startsParagraph }
+        XCTAssertEqual(starts, [84])
+    }
+
+    func testOldTextIsDroppedOnlyAWholeParagraphAtATime() {
+        var feed = ProjectorRollUpFeed()
+        var entries: [TranscriptUtterance] = []
+        var now = 0.0
+        var previous: [String: Bool] = [:]
+        for id in 1...90 {
+            entries.append(entry(id, "a b c d e f", startedAt: Double(id), endedAt: Double(id) + 1))
+            feed.receive(entries)
+            run(&feed, from: now, to: now + 3)
+            now += 3
+            XCTAssertLessThanOrEqual(feed.words.count, ProjectorRollUpFeed.maxWords)
+            XCTAssertTrue(feed.words[0].id.hasSuffix("-0"), "The top line starts a caption")
+            // Every word still on screen keeps the line break it had, so the
+            // greedy wrap below the top paragraph can't change.
+            for word in feed.words.dropFirst() {
+                if let was = previous[word.id] { XCTAssertEqual(word.startsParagraph, was, word.id) }
+            }
+            previous = Dictionary(uniqueKeysWithValues: feed.words.map { ($0.id, $0.startsParagraph) })
+        }
+        XCTAssertEqual(feed.words.last?.id, "90-5")
+        XCTAssertGreaterThan(feed.words.count, ProjectorRollUpFeed.maxWords - 60)
         XCTAssertFalse(feed.words[0].startsParagraph)
+    }
+
+    func testParagraphBreakIsFixedOnceShown() {
+        var feed = ProjectorRollUpFeed()
+        // Caption 2 appears while caption 1 is still a draft with no end time.
+        feed.receive([entry(1, "uno dos ", state: .partial, startedAt: 0),
+                      entry(2, "tres cuatro", startedAt: 5, endedAt: 6)])
+        feed.tick(at: 0)
+        run(&feed, from: 0, to: 3)
+        XCTAssertEqual(feed.words.map(\.startsParagraph), [false, false, false, false])
+        // Its final now reports a long pause; the lines on screen must not move.
+        feed.receive([entry(1, "uno dos", startedAt: 0, endedAt: 1),
+                      entry(2, "tres cuatro", startedAt: 5, endedAt: 6)])
+        run(&feed, from: 3, to: 4)
+        XCTAssertEqual(feed.words.map(\.startsParagraph), [false, false, false, false])
     }
 
     func testClearingTheTranscriptClearsTheProjector() {
