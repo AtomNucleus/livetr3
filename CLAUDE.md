@@ -51,22 +51,33 @@ arrive 20-30 s late. That has happened before (PR #32), so:
 - Don't add work to the audio capture queue (`AudioCaptureEngine`,
   `StreamingAudioConverter`) beyond what audio needs.
 
-### Check before calling a UI change done
+### Checks for UI changes
+
+Two levels. Don't run the slow one on every edit.
+
+**While iterating** (about 10 s warm): `./script/quick_check.sh`. It runs
+`script/ui_guard.sh`, which fails if the branch touches an off-limits file above,
+then `swift test`. Backend tests run only if `app/backend` changed.
+
+**Once before a PR or merge:**
 
 1. `./script/validate.sh` passes.
-2. Run the built app, start a capture and speak (or play audio) for a minute. Check
-   CPU with `ps -o %cpu= -p $(pgrep -x LiveTR3)`. It should stay in the normal range.
-   If it is higher than before the change, `sample LiveTR3 5` and fix it.
-3. Read the new session archive in
-   `~/Library/Application Support/LiveTR3/sessions/`. Final latency is
-   (meta.json `started_at` + event `timestamp_seconds`) minus
-   `last_audio_frame_unix_seconds`. Compare it with the baseline. Look for gaps with
-   no events followed by a burst, and for "reloading model worker" status messages.
-4. If anything under `app/backend` or the tuning settings changed, also run the
+2. `./script/ui_perf_check.py` passes. It builds the branch, replays a recorded
+   sermon clip through the full app path (no mic, no talking) into one shared
+   engine, and runs the installed app (A, main) and the branch (B) back to back.
+   It reports app CPU, final latency (median, p95), the longest gap between finals
+   and model reloads for each, and fails if B is clearly worse than A. It needs
+   LiveTR3 quit first and refuses to run otherwise; ask the user, never quit it.
+   If it fails on CPU, `sample LiveTR3 5` while B runs and fix the hot path. If the
+   result is close, rerun with `--order ABBA`.
+3. If anything under `app/backend` or the tuning settings changed, also run the
    replay scoreboard in ABBA order against main (`python3 -I script/scoreboard.py`)
    and report WER and live-weighted latency next to the baseline.
 
-Report these numbers in the PR or the final message. If a check was skipped, say so.
+Report the A/B numbers in the PR or the final message. If a check was skipped,
+say so. Replay latency runs denser than live, so judge B against A, not against
+the live baseline above. Live archives in
+`~/Library/Application Support/LiveTR3/sessions/` stay the source for live numbers.
 
 ### When latency looks worse
 
