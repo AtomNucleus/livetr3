@@ -17,6 +17,7 @@ struct TeleprompterSessionSheetOperatorView: View {
     @State private var pointerInside = true
     @State private var inspectorPresented = false
     @State private var partialPulseActive = false
+    @State private var clock: SessionClock?
 
     var body: some View {
         TeleprompterCueReader(
@@ -79,6 +80,29 @@ struct TeleprompterSessionSheetOperatorView: View {
         ToolbarItemGroup(placement: .principal) {
             ProjectorLookPicker(selection: $sessionManager.projectorStyle, iconsOnly: true)
 
+            ControlGroup {
+                Button {
+                    adjustCaptionSize(by: -Self.captionSizeStep)
+                } label: {
+                    Label("Smaller Captions", systemImage: "textformat.size.smaller")
+                }
+                .keyboardShortcut("-", modifiers: .command)
+                .disabled(sessionManager.projectorFontSize <= Self.captionSizeRange.lowerBound)
+                .help("Smaller captions (⌘−)")
+
+                Button {
+                    adjustCaptionSize(by: Self.captionSizeStep)
+                } label: {
+                    Label("Bigger Captions", systemImage: "textformat.size.larger")
+                }
+                .keyboardShortcut("+", modifiers: .command)
+                .disabled(sessionManager.projectorFontSize >= Self.captionSizeRange.upperBound)
+                .help("Bigger captions (⌘+)")
+            } label: {
+                Label("Caption Size", systemImage: "textformat.size")
+            }
+            .accessibilityValue("\(Int(sessionManager.projectorFontSize)) points")
+
             Button(action: onOpenProjector) {
                 Label("Open Projector", systemImage: "display")
             }
@@ -135,139 +159,129 @@ struct TeleprompterSessionSheetOperatorView: View {
 
     // MARK: Transport
 
+    /// One pill that reads as a single obvious action when idle and splits into
+    /// labelled Pause, status and End once live; the language pair sits beside it.
     private var transportBar: some View {
-        HStack(spacing: 14) {
-            HStack(spacing: 8) {
-                startStopButton
-                pauseButton
-            }
-            .controlSize(.large)
+        HStack(spacing: 10) {
+            transportPill
+                .padding(5)
+                .liveGlassCapsule()
 
-            liveStatus
-
-            LiveWaveformMeter(meter: session.levelMeter)
-
-            Circle()
-                .fill(Color.green)
-                .frame(width: 7, height: 7)
-                .opacity(partialPulseActive ? 1 : 0.2)
-                .help("Partial captions arriving")
-                .accessibilityLabel("Partial caption activity")
-
-            Divider().frame(height: 22)
-
-            languagePair
-
-            Divider().frame(height: 22)
-
-            captionSizeControl
+            languageChip
         }
-        .padding(.leading, 8)
-        .padding(.trailing, 18)
-        .padding(.vertical, 8)
-        .liveGlassCapsule()
-        .liveGlassGroup()
+        .controlSize(.large)
+        .liveGlassGroup(spacing: 10)
         .fixedSize()
-    }
-
-    private var startStopButton: some View {
-        Button(action: session.startStop) {
-            Group {
-                switch session.status {
-                case .idle:
-                    Image(systemName: "mic.fill")
-                case .connecting:
-                    ProgressView().controlSize(.small)
-                case .running:
-                    Image(systemName: "stop.fill")
-                }
+        .animation(.smooth(duration: 0.3), value: session.status)
+        .animation(.smooth(duration: 0.2), value: session.paused)
+        .onChange(of: session.status) { _, status in
+            clock = status == .running ? SessionClock(startedAt: Date()) : nil
+        }
+        .onChange(of: session.paused) { _, paused in
+            clock?.setPaused(paused, at: Date())
+        }
+        .onAppear {
+            // Reopening the window mid-session restarts the count rather than hiding it.
+            if session.status == .running, clock == nil {
+                clock = SessionClock(startedAt: Date())
+                clock?.setPaused(session.paused, at: Date())
             }
-            .frame(width: 22, height: 22)
         }
-        .buttonBorderShape(.circle)
-        .liveGlassButtonStyle(prominent: true)
-        .tint(session.status == .running ? .red : .accentColor)
-        .disabled(session.status == .connecting)
-        .help(session.status == .running ? "End session (Space)" : "Start session (Space)")
-        .accessibilityLabel(session.status == .running ? "End session" : "Start session")
-    }
-
-    private var pauseButton: some View {
-        Button(action: session.pauseResume) {
-            Image(systemName: session.paused ? "play.fill" : "pause.fill")
-                .frame(width: 22, height: 22)
-        }
-        .buttonBorderShape(.circle)
-        .liveGlassButtonStyle()
-        .disabled(session.status != .running)
-        .help(session.paused ? "Resume capture" : "Pause capture")
-        .accessibilityLabel(session.paused ? "Resume capture" : "Pause capture")
     }
 
     @ViewBuilder
-    private var liveStatus: some View {
+    private var transportPill: some View {
         switch session.status {
-        case .running:
-            Text(session.paused ? "PAUSED" : "LIVE")
-                .font(.caption.weight(.heavy))
-                .tracking(0.8)
-                .foregroundStyle(.white)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 3)
-                .background(session.paused ? Color.orange : Color.red, in: Capsule())
-                .accessibilityLabel(session.paused ? "Paused" : "Live")
-        case .connecting:
-            Image(systemName: "antenna.radiowaves.left.and.right")
-                .symbolEffect(.variableColor.iterative)
-                .foregroundStyle(.yellow)
-                .help("Connecting")
-                .accessibilityLabel("Connecting")
         case .idle:
-            EmptyView()
-        }
-    }
-
-    private var languagePair: some View {
-        HStack(spacing: 6) {
-            Button {
-                inspectorPresented = true
-            } label: {
-                HStack(spacing: 5) {
-                    Text(LiveTR3Language.shortCode(session.config.source_lang))
-                    Image(systemName: "arrow.right")
-                        .font(.caption.weight(.bold))
-                        .foregroundStyle(.secondary)
-                    Text(LiveTR3Language.shortCode(session.config.target_lang))
+            Button(action: session.startStop) {
+                Label("Start Translating", systemImage: "mic.fill")
+                    .padding(.horizontal, 6)
+            }
+            .buttonBorderShape(.capsule)
+            .liveGlassButtonStyle(prominent: true)
+            .help("Start session (Space)")
+        case .connecting:
+            Button(action: {}) {
+                Label {
+                    Text("Connecting…")
+                } icon: {
+                    ProgressView().controlSize(.small)
                 }
-                .font(.callout.weight(.semibold).monospaced())
+                .padding(.horizontal, 6)
             }
-            .buttonStyle(.plain)
-            .help("\(session.config.source_lang) to \(session.config.target_lang)")
-            .accessibilityLabel("\(session.config.source_lang) to \(session.config.target_lang)")
+            .buttonBorderShape(.capsule)
+            .liveGlassButtonStyle(prominent: true)
+            .disabled(true)
+        case .running:
+            HStack(spacing: 4) {
+                Button(action: session.pauseResume) {
+                    Label(session.paused ? "Resume" : "Pause",
+                          systemImage: session.paused ? "play.fill" : "pause.fill")
+                        .frame(minWidth: 78)
+                }
+                .buttonBorderShape(.capsule)
+                .liveGlassButtonStyle()
+                .help(session.paused ? "Resume capture" : "Pause capture")
 
-            Button(action: swapLanguages) {
+                liveStatus
+                    .padding(.horizontal, 10)
+
+                Button(role: .destructive, action: session.startStop) {
+                    Label("End", systemImage: "stop.fill")
+                        .frame(minWidth: 52)
+                }
+                .buttonBorderShape(.capsule)
+                .liveGlassButtonStyle()
+                .tint(.red)
+                .help("End session (Space)")
+            }
+        }
+    }
+
+    /// Waveform and elapsed time; the waveform brightens briefly as partial captions arrive.
+    private var liveStatus: some View {
+        HStack(spacing: 10) {
+            LiveWaveformMeter(meter: session.levelMeter)
+                .opacity(session.paused ? 0.35 : (partialPulseActive ? 1 : 0.7))
+                .accessibilityHint("Brightens as captions arrive")
+
+            if let clock {
+                SessionClockLabel(clock: clock, paused: session.paused)
+            }
+        }
+    }
+
+    private var languageChip: some View {
+        Button(action: swapLanguages) {
+            HStack(spacing: 8) {
+                Text(session.config.source_lang)
+                Image(systemName: "arrow.right")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.secondary)
+                Text(session.config.target_lang)
                 Image(systemName: "arrow.left.arrow.right")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 2)
             }
-            .buttonStyle(.borderless)
-            .help(session.status == .running ? "Swap languages from the next utterance" : "Swap languages")
-            .accessibilityLabel("Swap languages")
+            .font(.callout.weight(.medium))
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            .contentShape(Capsule())
         }
+        .buttonStyle(.plain)
+        .liveGlassCapsule(interactive: true)
+        .help(session.status == .running ? "Swap languages from the next utterance" : "Swap languages")
+        .accessibilityLabel("\(session.config.source_lang) to \(session.config.target_lang)")
+        .accessibilityHint("Swaps the languages")
     }
 
-    private var captionSizeControl: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "textformat.size.smaller")
-                .foregroundStyle(.secondary)
-            Slider(value: $sessionManager.projectorFontSize, in: 36...144, step: 2)
-                .controlSize(.small)
-                .frame(width: 110)
-                .accessibilityLabel("Caption size")
-                .accessibilityValue("\(Int(sessionManager.projectorFontSize)) points")
-            Image(systemName: "textformat.size.larger")
-                .foregroundStyle(.secondary)
-        }
-        .help("Caption size: \(Int(sessionManager.projectorFontSize)) pt")
+    private func adjustCaptionSize(by delta: Double) {
+        sessionManager.projectorFontSize = min(max(sessionManager.projectorFontSize + delta, Self.captionSizeRange.lowerBound), Self.captionSizeRange.upperBound)
     }
+
+    private static let captionSizeRange: ClosedRange<Double> = 36...144
+    private static let captionSizeStep: Double = 4
 
     // MARK: Alerts
 
@@ -536,5 +550,53 @@ private struct TeleprompterShortcutMonitor: NSViewRepresentable {
             guard let responder = event.window?.firstResponder else { return false }
             return responder is NSTextView || responder is NSTextField
         }
+    }
+}
+
+/// Elapsed live time, excluding paused stretches. Kept as view state so the
+/// session controller publishes nothing new.
+struct SessionClock: Equatable {
+    let startedAt: Date
+    private var pausedTotal: TimeInterval = 0
+    private var pausedSince: Date?
+
+    init(startedAt: Date) {
+        self.startedAt = startedAt
+    }
+
+    mutating func setPaused(_ paused: Bool, at now: Date) {
+        if paused, pausedSince == nil {
+            pausedSince = now
+        } else if !paused, let since = pausedSince {
+            pausedTotal += now.timeIntervalSince(since)
+            pausedSince = nil
+        }
+    }
+
+    func elapsed(at now: Date) -> TimeInterval {
+        let end = pausedSince ?? now
+        return max(0, end.timeIntervalSince(startedAt) - pausedTotal)
+    }
+}
+
+/// Redraws only itself, once a second, so the timer never invalidates the caption list.
+private struct SessionClockLabel: View {
+    let clock: SessionClock
+    let paused: Bool
+
+    var body: some View {
+        TimelineView(.periodic(from: clock.startedAt, by: 1)) { context in
+            let seconds = Int(clock.elapsed(at: context.date))
+            Text(Self.format(seconds))
+                .font(.callout.weight(.semibold).monospacedDigit())
+                .foregroundStyle(paused ? Color.orange : Color.primary)
+                .contentTransition(.numericText())
+                .accessibilityLabel(paused ? "Paused at \(Self.format(seconds))" : "Live for \(Self.format(seconds))")
+        }
+    }
+
+    static func format(_ seconds: Int) -> String {
+        let h = seconds / 3600, m = (seconds % 3600) / 60, s = seconds % 60
+        return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%02d:%02d", m, s)
     }
 }
