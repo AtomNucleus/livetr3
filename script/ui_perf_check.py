@@ -160,7 +160,9 @@ def run_once(label, bundle, env, out, index):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--baseline', type=Path, default=Path('/Applications/LiveTR3.app'),
+    installed = next((p for p in (Path('/Applications/Herald.app'), Path('/Applications/LiveTR3.app')) if p.exists()),
+                     Path('/Applications/Herald.app'))
+    parser.add_argument('--baseline', type=Path, default=installed,
                         help='A bundle (default: the installed app, which tracks main)')
     parser.add_argument('--bundle', type=Path, help='B bundle; default builds this checkout')
     parser.add_argument('--order', default='BA', help='Run order of A and B, e.g. BA or ABBA')

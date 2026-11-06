@@ -13,7 +13,7 @@ struct SettingsView: View {
             } header: {
                 Text("Local Engine")
             } footer: {
-                Text("Turn off to open LiveTR3 without starting capture services.")
+                Text("Turn off to open Herald without starting capture services.")
             }
 
             Section {
