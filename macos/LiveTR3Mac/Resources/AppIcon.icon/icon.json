@@ -1,0 +1,110 @@
+{
+  "fill": {
+    "linear-gradient": [
+      "display-p3:0.45000,0.92000,0.60000,1.00000",
+      "display-p3:0.04000,0.46000,0.44000,1.00000"
+    ]
+  },
+  "groups": [
+    {
+      "layers": [
+        {
+          "name": "l4",
+          "image-name": "l4.svg",
+          "glass": true
+        }
+      ],
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.5
+      },
+      "translucency": {
+        "enabled": true,
+        "value": 0.5
+      },
+      "blur-material": 0.6,
+      "refractivity": {
+        "enabled": true,
+        "strength": 0.8,
+        "depth": 0.4
+      }
+    },
+    {
+      "layers": [
+        {
+          "name": "l3",
+          "image-name": "l3.svg",
+          "glass": true
+        }
+      ],
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.5
+      },
+      "translucency": {
+        "enabled": true,
+        "value": 0.6
+      },
+      "blur-material": 0.6,
+      "refractivity": {
+        "enabled": true,
+        "strength": 0.8,
+        "depth": 0.4
+      }
+    },
+    {
+      "layers": [
+        {
+          "name": "l2",
+          "image-name": "l2.svg",
+          "glass": true
+        }
+      ],
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.5
+      },
+      "translucency": {
+        "enabled": true,
+        "value": 0.7
+      },
+      "blur-material": 0.6,
+      "refractivity": {
+        "enabled": true,
+        "strength": 0.8,
+        "depth": 0.4
+      }
+    },
+    {
+      "layers": [
+        {
+          "name": "l1",
+          "image-name": "l1.svg",
+          "glass": true
+        }
+      ],
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.5
+      },
+      "translucency": {
+        "enabled": true,
+        "value": 0.8
+      },
+      "blur-material": 0.6,
+      "refractivity": {
+        "enabled": true,
+        "strength": 0.8,
+        "depth": 0.4
+      }
+    }
+  ],
+  "supported-platforms": {
+    "squares": [
+      "macOS"
+    ]
+  },
+  "features": [
+    "refractivity"
+  ]
+}
