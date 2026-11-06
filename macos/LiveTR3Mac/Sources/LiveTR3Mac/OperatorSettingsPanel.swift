@@ -6,6 +6,7 @@ struct OperatorSettingsPanel: View {
     @ObservedObject var sessionManager: SessionManager
 
     @State private var customVocabText = ""
+    @AppStorage(ProfanityFilter.storageKey) private var filtersProfanity = true
 
     var body: some View {
         Form {
@@ -45,6 +46,11 @@ struct OperatorSettingsPanel: View {
             Toggle(isOn: polishBinding) {
                 Label("Polish Finals", systemImage: "wand.and.sparkles")
             }
+
+            Toggle(isOn: $filtersProfanity) {
+                Label("Hide Swear Words", systemImage: "hand.raised")
+            }
+            .help("Replaces swear words and slurs, including the n-word, with asterisks in English and Spanish captions.")
 
             LabeledContent {
                 Text("Silero")

@@ -36,8 +36,12 @@ final class TranscriptStore: ObservableObject {
     private var revisions: [RevisionKey: Revision] = [:]
     private var revisionTasks: [RevisionKey: Task<Void, Never>] = [:]
 
-    init(revisionDelayNanoseconds: UInt64 = 250_000_000, traceLabel: String = "operator") {
+    private let filtersProfanity: () -> Bool
+
+    init(revisionDelayNanoseconds: UInt64 = 250_000_000, traceLabel: String = "operator",
+         filtersProfanity: @escaping () -> Bool = { ProfanityFilter.isEnabled }) {
         self.traceLabel = traceLabel
+        self.filtersProfanity = filtersProfanity
         self.revisionDelayNanoseconds = revisionDelayNanoseconds
     }
 
@@ -55,7 +59,11 @@ final class TranscriptStore: ObservableObject {
             partialTickAt = Date()
         case .level:
             break
-        case .caption(let type, let utteranceID, let original, let translation):
+        case .caption(let type, let utteranceID, var original, var translation):
+            if filtersProfanity() {
+                original = ProfanityFilter.clean(original)
+                translation = ProfanityFilter.clean(translation)
+            }
             LatencyTrace.shared.record("store_caption", LocalEngineConnection.traceFields(message).merging(["surface": traceLabel]) { _, next in next })
             lastError = nil
             if type == .partial {
