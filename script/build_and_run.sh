@@ -8,11 +8,15 @@ BUNDLE="$ROOT/dist/$APP_NAME.app"
 APP_ICON="$PACKAGE_DIR/Resources/AppIcon.icns"
 
 verify=false
-if [[ "${1:-}" == "--verify" ]]; then
-  verify=true
-fi
+launch=true
+case "${1:-}" in
+  --verify) verify=true ;;
+  --no-launch) launch=false ;;  # build only: used to refresh /Applications (CLAUDE.md)
+esac
 
-pkill -x "$APP_NAME" >/dev/null 2>&1 || true
+if [[ "$launch" == true ]]; then
+  pkill -x "$APP_NAME" >/dev/null 2>&1 || true
+fi
 
 cd "$PACKAGE_DIR"
 swift build -c release
@@ -49,6 +53,10 @@ cat > "$BUNDLE/Contents/Info.plist" <<PLIST
 PLIST
 
 "$ROOT/script/package_engine.sh" "$BUNDLE"
+
+if [[ "$launch" == false ]]; then
+  exit 0
+fi
 
 /usr/bin/open -n "$BUNDLE"
 

@@ -73,3 +73,24 @@ Report these numbers in the PR or the final message. If a check was skipped, say
 Check the app's CPU and which bundle and engine are running (`ps eww` on
 `uds_host`) before touching engine tuning. Most "slow model" reports so far were the
 UI or a stale engine build.
+
+## Keep the installed app on main
+
+The user runs `/Applications/LiveTR3.app`. After any merge or push to `main`
+(including a PR merged from this session), update it in the same turn:
+
+1. If LiveTR3 is running (`pgrep -x LiveTR3`), don't quit it and don't touch
+   `dist/main-build`: its engine is running from there. Tell the user the update
+   is waiting, and do it when they say the app is closed.
+2. Check `git -C dist/main-build status`. If it has local changes, stop and ask.
+3. `git fetch origin && git -C dist/main-build checkout --detach origin/main`
+4. `dist/main-build/script/build_and_run.sh --no-launch`. If the build fails,
+   check out the previous commit there again and tell the user.
+5. `ditto dist/main-build/dist/LiveTR3.app /Applications/LiveTR3.app.new`,
+   then replace `/Applications/LiveTR3.app` with it.
+6. If `app/backend/pyproject.toml` or `uv.lock` changed, tell the user to run
+   `uv sync` in the main checkout's `app/backend` (main-build links its venv).
+
+The /Applications copy runs its engine from `dist/main-build/app/backend`, so
+never delete `dist/main-build`. Say in the final message which commit is now
+installed, or that the update is waiting.
