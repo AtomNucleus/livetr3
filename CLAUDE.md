@@ -87,7 +87,8 @@ UI or a stale engine build.
 
 ## Keep the installed app on main
 
-The user runs `/Applications/LiveTR3.app`. After any merge or push to `main`
+The user runs `/Applications/Herald.app` (named `LiveTR3.app` before the rename;
+the process is still `LiveTR3`). After any merge or push to `main`
 (including a PR merged from this session), update it in the same turn:
 
 1. If LiveTR3 is running (`pgrep -x LiveTR3`), don't quit it and don't touch
@@ -97,8 +98,10 @@ The user runs `/Applications/LiveTR3.app`. After any merge or push to `main`
 3. `git fetch origin && git -C dist/main-build checkout --detach origin/main`
 4. `dist/main-build/script/build_and_run.sh --no-launch`. If the build fails,
    check out the previous commit there again and tell the user.
-5. `ditto dist/main-build/dist/LiveTR3.app /Applications/LiveTR3.app.new`,
-   then replace `/Applications/LiveTR3.app` with it.
+5. `ditto dist/main-build/dist/Herald.app /Applications/Herald.app.new`,
+   then replace `/Applications/Herald.app` with it. If an old
+   `/Applications/LiveTR3.app` is still there, ask the user before moving it to
+   the Trash.
 6. If `app/backend/pyproject.toml` or `uv.lock` changed, tell the user to run
    `uv sync` in the main checkout's `app/backend` (main-build links its venv).
 

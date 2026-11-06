@@ -1,4 +1,4 @@
-# LiveTR3
+# Herald engine and caption path
 
 Native macOS live transcription and translation. SwiftUI renders the operator and
 projector windows, AVAudioEngine captures the microphone, and a local Python/MLX
@@ -17,7 +17,7 @@ cd ../..
 ./script/build_and_run.sh --verify
 ```
 
-This creates and opens `dist/LiveTR3.app` using a release Swift build. The default
+This creates and opens `dist/Herald.app` using a release Swift build. The default
 bundle contains the engine source and uses the repository's Python environment.
 It is a development app, not yet a relocatable standalone distribution.
 `script/package_engine.sh` supports a supplied standalone Python and wheelhouse

@@ -93,10 +93,10 @@ def main():
     clone_copy(binary_dir / 'LiveTR3', bundle / 'Contents/MacOS/LiveTR3')
     clone_copy(ROOT / 'macos/LiveTR3Mac/Resources/AppIcon.icns', resources / 'AppIcon.icns')
     info = dict(CFBundleExecutable='LiveTR3', CFBundleIdentifier='com.livetr3.share-mtp',
-                CFBundleName='LiveTR3', CFBundleDisplayName='LiveTR3', CFBundlePackageType='APPL',
+                CFBundleName='Herald', CFBundleDisplayName='Herald', CFBundlePackageType='APPL',
                 CFBundleIconFile='AppIcon', CFBundleShortVersionString='1.1', CFBundleVersion='11',
                 LSMinimumSystemVersion='14.0', LSArchitecturePriority=['arm64'],
-                NSMicrophoneUsageDescription='LiveTR3 captures speech for local transcription and translation.',
+                NSMicrophoneUsageDescription='Herald captures speech for local transcription and translation.',
                 NSPrincipalClass='NSApplication', LiveTR3BundledMTP=True)
     (bundle / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
     (engine / 'backend').mkdir(parents=True)

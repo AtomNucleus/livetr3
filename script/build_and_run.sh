@@ -2,9 +2,12 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The executable and bundle id keep the old LiveTR3 name so settings, sessions and
+# the process name used by the check scripts carry over. Users see DISPLAY_NAME.
 APP_NAME="LiveTR3"
+DISPLAY_NAME="Herald"
 PACKAGE_DIR="$ROOT/macos/LiveTR3Mac"
-BUNDLE="$ROOT/dist/$APP_NAME.app"
+BUNDLE="$ROOT/dist/$DISPLAY_NAME.app"
 APP_ICON="$PACKAGE_DIR/Resources/AppIcon.icon"
 
 verify=false
@@ -40,7 +43,9 @@ cat > "$BUNDLE/Contents/Info.plist" <<PLIST
   <key>CFBundleIdentifier</key>
   <string>com.livetr3.mac</string>
   <key>CFBundleName</key>
-  <string>$APP_NAME</string>
+  <string>$DISPLAY_NAME</string>
+  <key>CFBundleDisplayName</key>
+  <string>$DISPLAY_NAME</string>
   <key>CFBundleIconFile</key>
   <string>AppIcon</string>
   <key>CFBundleIconName</key>
@@ -50,7 +55,7 @@ cat > "$BUNDLE/Contents/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key>
   <string>14.0</string>
   <key>NSMicrophoneUsageDescription</key>
-  <string>LiveTR3 captures microphone audio for local transcription and translation.</string>
+  <string>Herald captures microphone audio for local transcription and translation.</string>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
 </dict>
@@ -68,5 +73,5 @@ fi
 if [[ "$verify" == true ]]; then
   sleep 2
   pgrep -x "$APP_NAME" >/dev/null
-  echo "$APP_NAME is running from $BUNDLE"
+  echo "$DISPLAY_NAME is running from $BUNDLE"
 fi
