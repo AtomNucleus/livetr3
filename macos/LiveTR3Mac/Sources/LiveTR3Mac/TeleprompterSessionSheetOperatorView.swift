@@ -159,18 +159,17 @@ struct TeleprompterSessionSheetOperatorView: View {
 
     // MARK: Transport
 
-    /// One pill that reads as a single obvious action when idle and splits into
-    /// labelled Pause, status and End once live; the language pair sits beside it.
+    /// One pill: a single obvious action when idle, labelled Pause, status and End
+    /// once live, and the language pair as a glass button at the end.
     private var transportBar: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 4) {
             transportPill
-                .padding(5)
-                .liveGlassCapsule()
-
-            languageChip
+            languageCodes
         }
+        .padding(5)
+        .liveGlassCapsule()
         .controlSize(.large)
-        .liveGlassGroup(spacing: 10)
+        .liveGlassGroup()
         .fixedSize()
         .animation(.smooth(duration: 0.3), value: session.status)
         .animation(.smooth(duration: 0.2), value: session.paused)
@@ -251,27 +250,24 @@ struct TeleprompterSessionSheetOperatorView: View {
         }
     }
 
-    private var languageChip: some View {
+    /// Codes keep the pill short and can't truncate; full names are in the tooltip and for VoiceOver.
+    private var languageCodes: some View {
         Button(action: swapLanguages) {
-            HStack(spacing: 8) {
-                Text(session.config.source_lang)
+            HStack(spacing: 6) {
+                Text(LiveTR3Language.shortCode(session.config.source_lang))
                 Image(systemName: "arrow.right")
                     .font(.caption.weight(.bold))
                     .foregroundStyle(.secondary)
-                Text(session.config.target_lang)
-                Image(systemName: "arrow.left.arrow.right")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .padding(.leading, 2)
+                Text(LiveTR3Language.shortCode(session.config.target_lang))
             }
-            .font(.callout.weight(.medium))
-            .padding(.horizontal, 16)
-            .padding(.vertical, 12)
-            .contentShape(Capsule())
+            .font(.callout.weight(.semibold).monospaced())
+            .lineLimit(1)
+            .fixedSize()
         }
-        .buttonStyle(.plain)
-        .liveGlassCapsule(interactive: true)
-        .help(session.status == .running ? "Swap languages from the next utterance" : "Swap languages")
+        .buttonBorderShape(.capsule)
+        .liveGlassButtonStyle()
+        .help("\(session.config.source_lang) to \(session.config.target_lang). "
+              + (session.status == .running ? "Click to swap from the next utterance." : "Click to swap."))
         .accessibilityLabel("\(session.config.source_lang) to \(session.config.target_lang)")
         .accessibilityHint("Swaps the languages")
     }
@@ -590,7 +586,6 @@ private struct SessionClockLabel: View {
             Text(Self.format(seconds))
                 .font(.callout.weight(.semibold).monospacedDigit())
                 .foregroundStyle(paused ? Color.orange : Color.primary)
-                .contentTransition(.numericText())
                 .accessibilityLabel(paused ? "Paused at \(Self.format(seconds))" : "Live for \(Self.format(seconds))")
         }
     }
