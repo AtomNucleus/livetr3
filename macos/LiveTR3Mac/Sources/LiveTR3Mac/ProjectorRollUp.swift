@@ -173,7 +173,6 @@ struct ProjectorRollUpStage: View {
     var body: some View {
         let rtl = isRtlLanguage(targetLanguage)
         VStack(alignment: rtl ? .trailing : .leading, spacing: 12) {
-            Text(targetLanguage).font(.system(size: 18, weight: .semibold)).foregroundStyle(.white.opacity(0.6))
             RollUpFlowLayout(wordSpacing: layout.fontSize * 0.27,
                              lineHeight: layout.fontSize * 1.22 + layout.lineSpacing,
                              paragraphSpacing: layout.fontSize * 0.5) {

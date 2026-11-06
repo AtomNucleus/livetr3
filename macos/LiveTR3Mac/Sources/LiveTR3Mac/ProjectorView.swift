@@ -99,7 +99,9 @@ struct ProjectorLiveCaptionStage: View {
         let fontSize = source ? layout.sourceFontSize : layout.fontSize
         let ordered = Self.orderedEntries(entries)
         return VStack(alignment: .leading, spacing: 12) {
-            Text(language).font(.system(size: 18, weight: .semibold)).foregroundStyle(.white.opacity(0.6))
+            if source {
+                Text(language).font(.system(size: 18, weight: .semibold)).foregroundStyle(.white.opacity(0.6))
+            }
             LiveCaptionScrollView {
                 LazyVStack(alignment: .leading, spacing: fontSize * 0.3) {
                     ForEach(ordered) { entry in
