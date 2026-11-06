@@ -59,9 +59,9 @@ Two levels. Don't run the slow one on every edit.
 `script/ui_guard.sh`, which fails if the branch touches an off-limits file above,
 then `swift test`. Backend tests run only if `app/backend` changed.
 
-**Once before a PR or merge:**
+**Once before a PR or merge** (about 3 minutes, unattended):
 
-1. `./script/validate.sh` passes.
+1. `./script/quick_check.sh` passes on the final diff.
 2. `./script/ui_perf_check.py` passes. It builds the branch, replays a recorded
    sermon clip through the full app path (no mic, no talking) into one shared
    engine, and runs the installed app (A, main) and the branch (B) back to back.
@@ -70,8 +70,8 @@ then `swift test`. Backend tests run only if `app/backend` changed.
    LiveTR3 quit first and refuses to run otherwise; ask the user, never quit it.
    If it fails on CPU, `sample LiveTR3 5` while B runs and fix the hot path. If the
    result is close, rerun with `--order ABBA`.
-3. If anything under `app/backend` or the tuning settings changed, also run the
-   replay scoreboard in ABBA order against main (`python3 -I script/scoreboard.py`)
+3. If anything under `app/backend` or the tuning settings changed, also run
+   `./script/validate.sh` (full backend tests) and the replay scoreboard in ABBA order against main (`python3 -I script/scoreboard.py`)
    and report WER and live-weighted latency next to the baseline.
 
 Report the A/B numbers in the PR or the final message. If a check was skipped,
