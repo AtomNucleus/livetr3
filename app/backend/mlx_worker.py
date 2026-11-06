@@ -127,6 +127,9 @@ class MLXWorker:
         self.model, self.processor = load(MODEL_PATH)
         self.config = self.model.config
         self._draft_model = None
+        # The previous decode's tokens, drafted (and verified) in the next one.
+        self._hint_draft = None
+        self._hint_tokens: list[int] = []
         self._generation_cancelled: Callable[[], bool] | None = None
         if CANCELLABLE_PREFILL_CHUNK:
             _install_cancel_hook(self.model, lambda: self._generation_cancelled)
@@ -146,6 +149,8 @@ class MLXWorker:
                 validate_drafter_compatibility(self.model, draft, kind)
                 self._draft_model = draft
                 trace("mtp_loaded", kind=kind)
+                import hint_draft
+                self._hint_draft = hint_draft if hint_draft.install() else None
             except Exception as error:
                 logger.exception("MTP unavailable; retaining ordinary Gemma decoding")
                 trace("mtp_fallback", phase="load", error=type(error).__name__)
@@ -231,6 +236,10 @@ class MLXWorker:
                 draft = getattr(self, "_draft_model", None)
                 draft_kwargs = {}
                 counters_before = (0, 0, 0)
+                hint = getattr(self, "_hint_draft", None) if draft is not None else None
+                hint_before = dict(hint.stats) if hint is not None else {}
+                if hint is not None:
+                    hint.set_hint(getattr(self, "_hint_tokens", ()))
                 if draft is not None:
                     draft_kwargs = dict(draft_model=draft, draft_kind="mtp", draft_block_size=MTP_BLOCK_SIZE)
                     counters_before = _mtp_counters(draft)
@@ -293,6 +302,7 @@ class MLXWorker:
                         raise MTPGenerationError from error
                 stream = guarded_responses()
                 pieces: list[str] = []
+                tokens: list[int] = []
                 latest_response: object | None = None
                 last_progress_text = ""
                 self._generation_cancelled = cancelled
@@ -306,6 +316,9 @@ class MLXWorker:
                         piece = getattr(response, "text", None)
                         if isinstance(piece, str):
                             pieces.append(piece)
+                        token = getattr(response, "token", None)
+                        if isinstance(token, int):
+                            tokens.append(token)
                         output = "".join(pieces)
                         if output and on_progress is not None:
                             progress_text = _streaming_ast_progress_text(output, tgt, src)
@@ -316,6 +329,12 @@ class MLXWorker:
                     return None
                 finally:
                     self._generation_cancelled = None
+                    if hint is not None:
+                        hint.set_hint(())
+                    hint_counts = (
+                        {f"hint_{key}": hint.stats[key] - hint_before[key] for key in hint_before}
+                        if hint is not None else {}
+                    )
                     elapsed = time.monotonic() - started
                     after = _mtp_counters(draft) if draft is not None else counters_before
                     trace("ast_decode", mtp=draft is not None, priority=priority,
@@ -329,12 +348,15 @@ class MLXWorker:
                           generation_tps=getattr(latest_response, "generation_tps", None),
                           finish_reason=getattr(latest_response, "finish_reason", None),
                           rounds=after[0]-counters_before[0],
-                          accepted=after[1]-counters_before[1], drafted=after[2]-counters_before[2])
+                          accepted=after[1]-counters_before[1], drafted=after[2]-counters_before[2],
+                          **hint_counts)
                     close = getattr(stream, "close", None)
                     if callable(close):
                         close()
 
                 output = "".join(pieces)
+                if tokens:
+                    self._hint_tokens = tokens
                 original, translation = _parse_ast_response(output, tgt, src)
                 truncated = _generation_was_truncated(latest_response, token_budget)
                 complete = bool(original and translation and not truncated)
