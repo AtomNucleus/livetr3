@@ -14,15 +14,28 @@ struct ProjectorRollUpFeed {
 
     /// Reading pace when little is waiting; a larger backlog drains with this time constant.
     static let baseWordsPerSecond = 3.0
-    static let catchUpSeconds = 1.5
+    static let catchUpSeconds = 1.0
     /// A pause this long between captions starts a new paragraph.
     static let paragraphPause: TimeInterval = 2.0
-    /// Only the newest words are kept; older ones have long scrolled out of view.
-    static let maxWords = 120
+    /// Non-stop speech still breaks into paragraphs at a caption boundary, so old
+    /// text can be dropped a whole paragraph at a time: after a sentence once a
+    /// paragraph has this many words, and after any caption at the hard limit.
+    static let paragraphWords = 40
+    static let paragraphHardWords = 80
+    /// Older words have long scrolled out of view. They are dropped only a whole
+    /// paragraph at a time: each paragraph starts on a fresh line, so the lines
+    /// below keep their breaks. Dropping single words re-wrapped every line.
+    static let maxWords = 300
 
     private(set) var words: [Word] = []
     private var entries: [TranscriptUtterance] = []
     private var revealed: [Int: Int] = [:]
+    /// The draft words each caption is showing; a shorter restarted decode waits here.
+    private var shown: [Int: [String]] = [:]
+    /// Fixed when a caption's first word appears, so later finals never move it.
+    private var paragraphStarts: [Int: Bool] = [:]
+    /// Captions before this one were dropped off the top for good.
+    private var firstKept = Int.min
     private var credit = 0.0
     private var idle = true
     private var lastTick: TimeInterval?
@@ -38,7 +51,19 @@ struct ProjectorRollUpFeed {
     mutating func tick(at now: TimeInterval) {
         let elapsed = lastTick.map { min(1, max(0, now - $0)) } ?? 0
         lastTick = now
-        let available = entries.map(Self.availableWords)
+        let available = entries.map { entry in
+            if entry.id < firstKept { return shown[entry.id] ?? [] }
+            let candidate = Self.availableWords(entry)
+            // A restarted decode streams its hypothesis from the first word again.
+            // Keep the words on screen until it catches up, instead of hiding them
+            // and revealing them a second time.
+            if entry.state == .partial, let current = shown[entry.id],
+               candidate.count < min(current.count, revealed[entry.id] ?? 0) {
+                return current
+            }
+            shown[entry.id] = candidate
+            return candidate
+        }
         for (entry, words) in zip(entries, available) where (revealed[entry.id] ?? 0) > words.count {
             // A shorter rewrite keeps its place; it never un-shows a later caption.
             revealed[entry.id] = words.count
@@ -71,23 +96,49 @@ struct ProjectorRollUpFeed {
     private mutating func rebuild(_ available: [[String]]) {
         var next: [Word] = []
         var previous: TranscriptUtterance?
-        for (entry, words) in zip(entries, available) {
+        var paragraphLength = 0
+        var paragraphOwners: [Int: Int] = [:]
+        for (entry, words) in zip(entries, available) where entry.id >= firstKept {
             let count = min(revealed[entry.id] ?? 0, words.count)
-            let pause = previous.flatMap { prior in
-                prior.endedAt.map { entry.startedAt.timeIntervalSince($0) }
-            } ?? 0
+            guard count > 0 else { continue }
+            let startsParagraph = paragraphStarts[entry.id] ?? {
+                let pause = previous.flatMap { prior in
+                    prior.endedAt.map { entry.startedAt.timeIntervalSince($0) }
+                } ?? 0
+                let endsSentence = next.last.map { Self.endsSentence($0.text) } ?? false
+                return !next.isEmpty && (pause >= Self.paragraphPause
+                    || (paragraphLength >= Self.paragraphWords && endsSentence)
+                    || paragraphLength >= Self.paragraphHardWords)
+            }()
+            paragraphStarts[entry.id] = startsParagraph
+            if startsParagraph && !next.isEmpty {
+                paragraphLength = 0
+                paragraphOwners[next.count] = entry.id
+            }
             for index in 0..<count {
                 next.append(Word(id: "\(entry.id)-\(index)", text: words[index],
                                  isDraft: entry.state == .partial,
-                                 startsParagraph: index == 0 && !next.isEmpty && pause >= Self.paragraphPause))
+                                 startsParagraph: index == 0 && startsParagraph && !next.isEmpty))
             }
-            if count > 0 { previous = entry }
+            paragraphLength += count
+            previous = entry
         }
         if next.count > Self.maxWords {
-            next.removeFirst(next.count - Self.maxWords)
-            next[0].startsParagraph = false
+            let excess = next.count - Self.maxWords
+            let cut = next.indices.first { $0 >= excess && next[$0].startsParagraph }
+                ?? next.indices.last { $0 > 0 && next[$0].startsParagraph }
+            if let cut, let owner = paragraphOwners[cut] {
+                firstKept = owner
+                next.removeFirst(cut)
+                next[0].startsParagraph = false
+            }
         }
         words = next
+    }
+
+    static func endsSentence(_ word: String) -> Bool {
+        let trimmed = word.trimmingCharacters(in: CharacterSet(charactersIn: "\"'”’»)"))
+        return trimmed.last.map { ".!?…".contains($0) } ?? false
     }
 
     /// A streaming draft's last word may still be growing, so it waits for the next one.

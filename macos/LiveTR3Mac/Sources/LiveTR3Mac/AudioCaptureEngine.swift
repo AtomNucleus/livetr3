@@ -68,11 +68,13 @@ final class AudioCaptureEngine {
         }
     }
 
-    func setPaused(_ paused: Bool) {
+    /// `then` runs after the last frame captured before the change was sent.
+    func setPaused(_ paused: Bool, then: (@Sendable () -> Void)? = nil) {
         processingQueue.async { [weak self] in
             self?.isPaused = paused
             self?.pendingSamples.removeAll(keepingCapacity: true)
             self?.converter?.reset()
+            then?()
         }
     }
 

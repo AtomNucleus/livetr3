@@ -299,6 +299,37 @@ def test_service_forwards_streamed_ast_progress_before_final_result():
     asyncio.run(run())
 
 
+def test_slow_progress_publishing_does_not_time_out_the_decode():
+    class ResponseQueue:
+        responses = iter(
+            [
+                {"type": "progress", "job_id": 12, "text": "We cannot"},
+                {"type": "progress", "job_id": 12, "text": "We cannot go"},
+                {"type": "result", "job_id": 12, "result": "complete"},
+            ]
+        )
+
+        def get(self, *args, **kwargs):
+            return next(self.responses)
+
+    async def run():
+        worker = MLXWorkerService()
+        worker._response_queue = ResponseQueue()
+        worker._process = SimpleNamespace(is_alive=lambda: True)
+
+        async def stalled_client(text):
+            # The app stopped reading its socket for longer than the timeout.
+            await asyncio.sleep(0.3)
+
+        response = await worker._wait_for_worker_response(
+            SimpleNamespace(sequence=12, on_progress=stalled_client),
+            timeout_seconds=0.2,
+        )
+        assert response == {"type": "result", "job_id": 12, "result": "complete"}
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("label", ["Spanish:", "- Spanish:", "**Translation (Spanish):**"])
 def test_ast_stream_progress_does_not_publish_partial_target_label_prefixes(
     monkeypatch, tmp_path, label

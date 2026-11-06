@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 @MainActor
@@ -41,6 +42,14 @@ final class LiveTR3Runtime: ObservableObject {
     init() {
         self.repoRoot = Self.findRepoRoot()
         self.logDirectory = Self.bundledConfiguration?.logs ?? Self.findRepoRoot().appending(path: Bundle.main.bundleIdentifier == "com.livetr3.native-diagnostic" ? "dist/logs/native-diagnostic-runtime" : "dist/logs")
+        // The engine holds the loaded model, so it lives as long as the app,
+        // not as long as any one window: closing and reopening the operator
+        // window must not cost a model reload in the middle of a service.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.stop() }
+        }
     }
 
     func start() async {

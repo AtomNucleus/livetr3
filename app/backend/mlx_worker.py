@@ -933,7 +933,12 @@ class MLXWorkerService:
                 )
                 if response.get("type") == "progress" and response.get("job_id") == job.sequence:
                     if job.on_progress is not None:
+                        # Publishing waits on the app reading its socket. A busy
+                        # app is not a stuck model: don't charge that wait to the
+                        # decode, or it times out and forces a full model reload.
+                        published_at = time.monotonic()
                         await job.on_progress(response["text"])
+                        deadline += time.monotonic() - published_at
                     continue
                 return response
             except queue.Empty:
