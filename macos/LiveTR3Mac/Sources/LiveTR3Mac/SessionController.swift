@@ -24,6 +24,7 @@ final class SessionController: ObservableObject {
     private let engine: CaptionEngine
     private let audio = AudioCaptureEngine()
     private let captureActivity = CaptureActivity()
+    private var recorder: SessionAudioRecorder?
 
     private var manualStop = false
     private var reconnectAttempt = 0
@@ -169,7 +170,11 @@ final class SessionController: ObservableObject {
             engine.sendJSON(["type": "start"])
             let directSender = ProcessInfo.processInfo.environment["LIVETR3_AUDIO_MAIN_ACTOR"] == "1"
                 ? nil : engine.audioSender()
+            let recorder = SessionAudioRecorder.isEnabled
+                ? try? SessionAudioRecorder(directory: SessionAudioRecorder.directory) : nil
+            self.recorder = recorder
             let onFrame: (Data) -> Void = { [weak self] data in
+                recorder?.append(data)
                 if let directSender { directSender(data) }
                 else {
                     Task { @MainActor in
@@ -215,6 +220,8 @@ final class SessionController: ObservableObject {
         engine.sendJSON(["type": "stop"])
         engine.disconnect()
         audio.stop()
+        recorder?.finish()
+        recorder = nil
         captureActivity.end()
         paused = false
         status = .idle

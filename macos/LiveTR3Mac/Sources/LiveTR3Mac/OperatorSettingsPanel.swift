@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// Session settings shown in the operator window's inspector.
@@ -7,6 +8,7 @@ struct OperatorSettingsPanel: View {
 
     @State private var customVocabText = ""
     @AppStorage(ProfanityFilter.storageKey) private var filtersProfanity = true
+    @AppStorage(SessionAudioRecorder.enabledKey) private var recordsSessionAudio = false
 
     var body: some View {
         Form {
@@ -51,6 +53,21 @@ struct OperatorSettingsPanel: View {
                 Label("Hide Swear Words", systemImage: "hand.raised")
             }
             .help("Replaces swear words and slurs, including the n-word, with asterisks in English and Spanish captions.")
+
+            Toggle(isOn: $recordsSessionAudio) {
+                Label("Record Session Audio", systemImage: "record.circle")
+            }
+            .help("Saves what the engine hears as a WAV (about 115 MB an hour) beside the session archives, so script/compare_session.py can check the captions against it. Takes effect at the next Start.")
+
+            if recordsSessionAudio {
+                Button {
+                    let directory = SessionAudioRecorder.directory
+                    try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                    NSWorkspace.shared.open(directory)
+                } label: {
+                    Label("Show Recordings", systemImage: "folder")
+                }
+            }
 
             LabeledContent {
                 Text("Silero")
