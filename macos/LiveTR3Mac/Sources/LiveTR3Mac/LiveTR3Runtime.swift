@@ -20,6 +20,15 @@ final class LiveTR3Runtime: ObservableObject {
         return BundledEngineConfiguration(resources: resources, applicationSupport: support)
     }
 
+    /// Where the engine writes session archives (the backend's ARCHIVE_ROOT).
+    nonisolated static var archiveRoot: URL {
+        if let path = engineEnvironment(backend: URL(fileURLWithPath: "/"))["LIVETR3_ARCHIVE_ROOT"], !path.isEmpty {
+            return URL(fileURLWithPath: path)
+        }
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        return support.appending(path: "LiveTR3/sessions")
+    }
+
     nonisolated static var engineSocketPath: URL {
         if let configuredPath = ProcessInfo.processInfo.environment["LIVETR3_ENGINE_SOCKET"],
            !configuredPath.isEmpty {
@@ -181,7 +190,7 @@ final class LiveTR3Runtime: ObservableObject {
         throw RuntimeError(message: timeoutMessage)
     }
 
-    private static func findRepoRoot() -> URL {
+    nonisolated private static func findRepoRoot() -> URL {
         let bundleParent = Bundle.main.bundleURL.deletingLastPathComponent()
         if bundleParent.lastPathComponent == "dist" {
             return bundleParent.deletingLastPathComponent()
@@ -194,7 +203,7 @@ final class LiveTR3Runtime: ObservableObject {
         return sourceURL
     }
 
-    private static func engineEnvironment(backend: URL) -> [String: String] {
+    nonisolated private static func engineEnvironment(backend: URL) -> [String: String] {
         var environment = Self.bundledConfiguration?.environment(inheriting: ProcessInfo.processInfo.environment)
             ?? ProcessInfo.processInfo.environment
         environment["LIVETR3_ENGINE_SOCKET"] = engineSocketPath.path
